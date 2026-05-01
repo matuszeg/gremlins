@@ -37,14 +37,16 @@ import (
 // ExprMutator uses the same file locking mechanism as TokenMutator to
 // ensure safe concurrent mutations.
 type ExprMutator struct {
-	pkg        string
-	fs         *token.FileSet
-	file       *ast.File
-	exprNode   *NodeExpr
-	workDir    string
-	origFile   []byte
-	status     mutator.Status
-	mutantType mutator.Type
+	pkg            string
+	fs             *token.FileSet
+	file           *ast.File
+	exprNode       *NodeExpr
+	workDir        string
+	origFile       []byte
+	origSnippet    []byte
+	mutatedSnippet []byte
+	status         mutator.Status
+	mutantType     mutator.Type
 
 	// origExpr stores a reference to the original expression for AST restoration
 	origExpr ast.Expr
@@ -134,6 +136,8 @@ func (m *ExprMutator) Apply() error {
 		return err
 	}
 
+	m.origSnippet = extractSnippet(m.origFile, m.Position().Line, 3)
+
 	// Get the mutated expression based on mutation type
 	mutatedExpr, err := m.getMutatedExpr()
 	if err != nil {
@@ -198,10 +202,14 @@ func (m *ExprMutator) writeMutatedFile(filename string) error {
 		return err
 	}
 
-	err = os.WriteFile(filename, w.Bytes(), 0600)
+	payload := w.Bytes()
+
+	err = os.WriteFile(filename, payload, 0o600)
 	if err != nil {
 		return err
 	}
+
+	m.mutatedSnippet = extractSnippet(payload, m.Position().Line, 3)
 
 	return nil
 }
@@ -212,7 +220,17 @@ func (m *ExprMutator) Rollback() error {
 	defer m.resetOrigFile()
 	filename := filepath.Join(m.workDir, m.Position().Filename)
 
-	return os.WriteFile(filename, m.origFile, 0600)
+	return os.WriteFile(filename, m.origFile, 0o600)
+}
+
+// OrigSnippet returns the original code snippet around the mutation point.
+func (m *ExprMutator) OrigSnippet() []byte {
+	return m.origSnippet
+}
+
+// MutatedSnippet returns the mutated code snippet around the mutation point.
+func (m *ExprMutator) MutatedSnippet() []byte {
+	return m.mutatedSnippet
 }
 
 // SetWorkdir sets the base path on which to Apply and Rollback operations.
