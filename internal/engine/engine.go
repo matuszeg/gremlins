@@ -138,7 +138,7 @@ func (mu *Engine) runOnFile(fileName string) {
 }
 
 func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.File, node *NodeToken) {
-	mutantTypes, ok := TokenMutantType[node.Tok()]
+	mutantTypes, ok := MutantTypesFor(node)
 	if !ok {
 		return
 	}
