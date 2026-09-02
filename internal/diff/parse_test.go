@@ -37,7 +37,12 @@ func TestNewWithCmd(t *testing.T) {
 			t.Fatal("cmd not called")
 		}
 
-		expectedArgs := []string{"diff", "--merge-base", "test"}
+		// --relative is load-bearing, not cosmetic: without it git
+		// reports paths relative to the repository root while gremlins
+		// reports mutant positions relative to the module, so for a
+		// module in a subdirectory every lookup in Diff.IsChanged
+		// misses and every mutant is SKIPPED. That reads as a pass.
+		expectedArgs := []string{"diff", "--relative", "--merge-base", "test"}
 
 		if m.callName != "git" || !reflect.DeepEqual(m.callArgs, expectedArgs) {
 			t.Log("name", m.callName)
