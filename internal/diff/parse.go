@@ -30,7 +30,25 @@ func NewWithCmd[T execCmd](cmdContext func(name string, args ...string) T) (Diff
 
 	log.Infoln("Gathering files diff...")
 
-	cmd := cmdContext("git", "diff", "--merge-base", diffRef)
+	// --relative, because gremlins reports a mutant's position relative
+	// to the module it is mutating while git reports a diff relative to
+	// the repository root. Those coincide only when the module IS the
+	// repository root. For a module in a subdirectory — a monorepo, a
+	// Go workspace — every path in the diff carries a prefix the mutant
+	// positions do not have, so the lookup in Diff.IsChanged misses on
+	// every file.
+	//
+	// The failure is silent and it fails GREEN in the sense that
+	// matters: every mutant is reported SKIPPED, the run finds nothing
+	// on the changed lines, and a --diff gate passes having tested
+	// nothing. Measured against a backend module one directory below
+	// its repository root: 72 mutants, 72 SKIPPED, including the line
+	// the diff had just changed.
+	//
+	// --relative makes git emit paths relative to the working directory
+	// instead, which is the directory gremlins was invoked in and the
+	// one its positions are relative to.
+	cmd := cmdContext("git", "diff", "--relative", "--merge-base", diffRef)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {
