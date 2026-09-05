@@ -120,21 +120,64 @@ func TestParseTestNames(t *testing.T) {
 func TestTestMapCoverPkg(t *testing.T) {
 	t.Parallel()
 
-	t.Run("defaults to the whole module, which is what makes the map cross-package", func(t *testing.T) {
+	const pkg = "example.com/internal/vm"
+
+	// Without --cross-package a test is only ever asked about its own package's
+	// code, so instrumenting the rest of the module would record coverage that
+	// nothing reads.
+	t.Run("covers only the package being mapped", func(t *testing.T) {
 		t.Parallel()
 
 		c := &Coverage{}
-		if got := c.testMapCoverPkg(); got != wholeModule {
+		if got := c.testMapCoverPkg(pkg); got != pkg {
+			t.Errorf("want %s, got %s", pkg, got)
+		}
+	})
+
+	// With it, the point is to see a test in one package executing a line in
+	// another, which only whole-module instrumentation records.
+	t.Run("covers the whole module for cross-package", func(t *testing.T) {
+		t.Parallel()
+
+		c := &Coverage{crossPackage: true}
+		if got := c.testMapCoverPkg(pkg); got != wholeModule {
 			t.Errorf("want %s, got %s", wholeModule, got)
 		}
 	})
 
-	t.Run("honours a configured cover-pkg", func(t *testing.T) {
+	t.Run("honours a configured cover-pkg either way", func(t *testing.T) {
 		t.Parallel()
 
-		c := &Coverage{coverPkg: "./internal/..."}
-		if got := c.testMapCoverPkg(); got != "./internal/..." {
-			t.Errorf("want ./internal/..., got %s", got)
+		for _, c := range []*Coverage{{coverPkg: "./internal/..."}, {coverPkg: "./internal/...", crossPackage: true}} {
+			if got := c.testMapCoverPkg(pkg); got != "./internal/..." {
+				t.Errorf("want ./internal/..., got %s", got)
+			}
+		}
+	})
+}
+
+func TestMapScope(t *testing.T) {
+	t.Parallel()
+
+	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "internal/vm"}
+
+	t.Run("maps only the scanned path when mutants stay in their package", func(t *testing.T) {
+		t.Parallel()
+
+		c := &Coverage{mod: mod}
+		if got := c.mapScope(); got != "./internal/vm/..." {
+			t.Errorf("want ./internal/vm/..., got %s", got)
+		}
+	})
+
+	// A test that kills a cross-package mutant can be anywhere, so a listing
+	// narrowed to the scanned path could not see it.
+	t.Run("maps the whole module for cross-package", func(t *testing.T) {
+		t.Parallel()
+
+		c := &Coverage{mod: mod, crossPackage: true}
+		if got := c.mapScope(); got != wholeModule {
+			t.Errorf("want %s, got %s", wholeModule, got)
 		}
 	})
 }

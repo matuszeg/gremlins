@@ -154,7 +154,7 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		return nil, err
 	}
 
-	key := cacheKey(c.testMapCoverPkg(), c.buildTags)
+	key := cacheKey(c.mapScope(), c.buildTags)
 	path, pathErr := c.cachePath()
 	cache := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
 	if pathErr == nil {
@@ -279,18 +279,28 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cache, next *mapCac
 	return mapResult{tests: len(names), mapped: true}
 }
 
-// wholeModule is the path the map is always built over, even when the run
-// itself is scoped to one package. The tests that kill a mutant are not
-// necessarily in the package that holds it — that is the whole point — and a
-// listing narrowed to the scanned path could not see them.
 const wholeModule = "./..."
+
+// mapScope is how much of the module the map has to cover.
+//
+// Without --cross-package a mutant is only ever judged by its own package's
+// tests, so mapping anything outside the scanned path would be work nobody
+// reads. With it, a test that kills a mutant can be anywhere, and a listing
+// narrowed to the scanned path could not see it.
+func (c *Coverage) mapScope() string {
+	if c.crossPackage {
+		return wholeModule
+	}
+
+	return c.scanPath()
+}
 
 // goListFormat asks for what the builder needs about every package: where it
 // is, and whether it has tests of either kind.
 const goListFormat = `{{.ImportPath}}	{{.Dir}}	{{len .TestGoFiles}}	{{len .XTestGoFiles}}`
 
 func (c *Coverage) listPackages() ([]testPackage, error) {
-	out, err := c.cmdContext("go", "list", "-f", goListFormat, wholeModule).CombinedOutput()
+	out, err := c.cmdContext("go", "list", "-f", goListFormat, c.mapScope()).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("impossible to list the packages of the module: %w\n%s", err, out)
 	}
@@ -336,7 +346,7 @@ func (c *Coverage) compileTests(importPath string) (string, error) {
 	if c.buildTags != "" {
 		args = append(args, "-tags", c.buildTags)
 	}
-	args = append(args, "-coverpkg", c.testMapCoverPkg(), importPath)
+	args = append(args, "-coverpkg", c.testMapCoverPkg(importPath), importPath)
 
 	if out, err := c.cmdContext("go", args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%w\n%s", err, out)
@@ -408,13 +418,19 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string) (Profile, error
 	return c.parse(f)
 }
 
-// testMapCoverPkg is what makes the map see across packages. Without it the
-// profile of a test records only the package that test lives in, which is the
-// package scoping the map exists to replace.
-func (c *Coverage) testMapCoverPkg() string {
+// testMapCoverPkg is the coverage scope a package's tests are mapped under.
+//
+// With --cross-package it must be the whole module: the point is to see a test
+// in one package executing a line in another. Without it, a test is only ever
+// asked about its own package's code, and instrumenting the rest of the module
+// would cost time to record coverage nothing will read.
+func (c *Coverage) testMapCoverPkg(importPath string) string {
 	if c.coverPkg != "" {
 		return c.coverPkg
 	}
+	if c.crossPackage {
+		return wholeModule
+	}
 
-	return wholeModule
+	return importPath
 }
