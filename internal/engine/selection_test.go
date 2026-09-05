@@ -83,9 +83,22 @@ func recordingExec(h *commandsHolder) func(ctx context.Context, command string, 
 func runWithSelector(t *testing.T, sel engine.TestSelector, intMode bool) (*commandsHolder, mutator.Mutator) {
 	t.Helper()
 
+	return runWith(t, sel, intMode, false)
+}
+
+func runCrossPackage(t *testing.T, sel engine.TestSelector) (*commandsHolder, mutator.Mutator) {
+	t.Helper()
+
+	return runWith(t, sel, false, true)
+}
+
+func runWith(t *testing.T, sel engine.TestSelector, intMode, crossPkg bool) (*commandsHolder, mutator.Mutator) {
+	t.Helper()
+
 	viperSet(map[string]any{
-		configuration.UnleashDryRunKey:       false,
-		configuration.UnleashIntegrationMode: intMode,
+		configuration.UnleashDryRunKey:             false,
+		configuration.UnleashIntegrationMode:       intMode,
+		configuration.UnleashTestSelectionCrossKey: crossPkg,
 	})
 	t.Cleanup(viperReset)
 
@@ -145,7 +158,7 @@ func TestSelectionRunsCoveringTestsFromOtherPackages(t *testing.T) {
 		},
 	}
 
-	holder, mut := runWithSelector(t, sel, false)
+	holder, mut := runCrossPackage(t, sel)
 
 	// One invocation listing both packages, not one per package: the build is
 	// most of what a mutant costs, and `go test` builds them together.
@@ -177,7 +190,7 @@ func TestSelectionNamesEachTestOnceAcrossPackages(t *testing.T) {
 		},
 	}
 
-	holder, mut := runWithSelector(t, sel, false)
+	holder, mut := runCrossPackage(t, sel)
 
 	want := []string{
 		"go test -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
@@ -189,6 +202,51 @@ func TestSelectionNamesEachTestOnceAcrossPackages(t *testing.T) {
 	wantTests := []string{"example.com.TestSize", "example.com/vm.TestSize"}
 	if diff := cmp.Diff(wantTests, mut.TestsRun()); diff != "" {
 		t.Errorf("TestsRun() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// By default a mutant is judged by its own package's covering tests only. Those
+// tests were going to be built and their fixture paid for anyway, so running a
+// subset of them cannot cost more than running all of them — which is what
+// makes selection safe to leave on.
+func TestSelectionKeepsToTheMutatedPackageByDefault(t *testing.T) {
+	sel := selectorStub{
+		mapped: map[string]bool{"example.com/vm": true, "example.com": true},
+		tests: []coverage.TestID{
+			{Pkg: "example.com", Name: "TestRangeDescending"},
+			{Pkg: "example.com/vm", Name: "TestSize"},
+		},
+	}
+
+	holder, mut := runWithSelector(t, sel, false)
+
+	want := []string{
+		"go test -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
+	}
+	if diff := cmp.Diff(want, holder.commands()); diff != "" {
+		t.Errorf("commands mismatch (-want +got):\n%s", diff)
+	}
+	if diff := cmp.Diff([]string{"example.com/vm.TestSize"}, mut.TestsRun()); diff != "" {
+		t.Errorf("TestsRun() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// With no covering test in the mutated package there is nothing to narrow to,
+// and reaching into other packages is not this mode's job.
+func TestSelectionFallsBackWhenOnlyOtherPackagesCover(t *testing.T) {
+	sel := selectorStub{
+		mapped: map[string]bool{"example.com/vm": true, "example.com": true},
+		tests:  []coverage.TestID{{Pkg: "example.com", Name: "TestRangeDescending"}},
+	}
+
+	holder, mut := runWithSelector(t, sel, false)
+
+	want := []string{"go test -timeout " + wantTimeout + " -failfast example.com/vm"}
+	if diff := cmp.Diff(want, holder.commands()); diff != "" {
+		t.Errorf("commands mismatch (-want +got):\n%s", diff)
+	}
+	if got := mut.TestsRun(); len(got) != 0 {
+		t.Errorf("want no recorded tests when the whole suite ran, got %v", got)
 	}
 }
 
