@@ -22,6 +22,7 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -40,14 +41,34 @@ const (
 	uncoveredLine = 20
 )
 
-func newTestMap(t *testing.T) *coverage.TestMap {
+// pkgDirsEnv carries the fixture's package directories to the helper process,
+// which has to name them in the `go list` output it fakes. The directories have
+// to exist: the builder runs each test binary in its package's directory, the
+// way `go test` does.
+const pkgDirsEnv = "GREMLINS_TEST_PKG_ROOT"
+
+func fixtureRoot(t *testing.T) string {
+	t.Helper()
+
+	root := t.TempDir()
+	for _, d := range []string{"root", "vm", "empty"} {
+		if err := os.MkdirAll(filepath.Join(root, d), 0o750); err != nil {
+			t.Fatalf("cannot create the fixture directory: %v", err)
+		}
+	}
+
+	return root
+}
+
+func buildMap(t *testing.T, helper string) *coverage.TestMap {
 	t.Helper()
 
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	t.Cleanup(log.Reset)
 
+	root := fixtureRoot(t)
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
-	cov := coverage.NewWithCmd(fakeTestMapCommand, t.TempDir(), mod)
+	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod)
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {
@@ -58,7 +79,7 @@ func newTestMap(t *testing.T) *coverage.TestMap {
 }
 
 func TestBuildTestMap(t *testing.T) {
-	tm := newTestMap(t)
+	tm := buildMap(t, "TestTestMapHelperProcess")
 
 	t.Run("maps every test of every package", func(t *testing.T) {
 		if got := tm.Len(); got != 3 {
@@ -100,6 +121,14 @@ func TestBuildTestMap(t *testing.T) {
 		}
 	})
 
+	// Nothing to map is a complete answer, not a missing one — and saying so is
+	// what lets a mutant there be judged by covering tests in other packages.
+	t.Run("a package with no test files is mapped by having no tests", func(t *testing.T) {
+		if !tm.Mapped("example.com/empty") {
+			t.Error("expected a package with no test files to report as mapped")
+		}
+	})
+
 	t.Run("a package that was never listed is not mapped", func(t *testing.T) {
 		if tm.Mapped("example.com/absent") {
 			t.Error("expected an unknown package to report as unmapped")
@@ -108,16 +137,7 @@ func TestBuildTestMap(t *testing.T) {
 }
 
 func TestBuildTestMapLeavesAPackageUnmappedWhenATestCannotBeRun(t *testing.T) {
-	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
-	defer log.Reset()
-
-	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
-	cov := coverage.NewWithCmd(fakeTestMapCommandWithFailure, t.TempDir(), mod)
-
-	tm, err := cov.BuildTestMap()
-	if err != nil {
-		t.Fatalf("BuildTestMap() error: %v", err)
-	}
+	tm := buildMap(t, "TestTestMapHelperProcessFailingTest")
 
 	// Half a package is worse than none of it: what is missing from the map is
 	// exactly what selection would silently skip, so the package must fall back
@@ -128,29 +148,36 @@ func TestBuildTestMapLeavesAPackageUnmappedWhenATestCannotBeRun(t *testing.T) {
 	if !tm.Mapped("example.com/vm") {
 		t.Error("expected the other package to still be mapped")
 	}
-	// Its mappable tests are discarded with it: a half-recorded package would
-	// make "no test covers this line" indistinguishable from "we did not look".
 	if got := tm.Len(); got != 1 {
 		t.Errorf("want only the mapped package's single test, got %d", got)
 	}
 }
 
-func TestBuildTestMapFailsWhenTheModuleCannotBeListed(t *testing.T) {
+func TestBuildTestMapLeavesAPackageUnmappedWhenItsTestsCannotCompile(t *testing.T) {
+	tm := buildMap(t, "TestTestMapHelperProcessCompileFailure")
+
+	if tm.Mapped("example.com") {
+		t.Error("expected the package whose tests do not compile to be unmapped")
+	}
+	if !tm.Mapped("example.com/vm") {
+		t.Error("expected the other package to still be mapped")
+	}
+}
+
+func TestBuildTestMapFailsWhenThePackagesCannotBeListed(t *testing.T) {
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	defer log.Reset()
 
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
-	cov := coverage.NewWithCmd(fakeTestMapCommandListFailure, t.TempDir(), mod)
+	cov := coverage.NewWithCmd(
+		fakeGoCommand("TestTestMapHelperProcessListFailure", fixtureRoot(t)), t.TempDir(), mod)
 
 	if _, err := cov.BuildTestMap(); err == nil {
-		t.Error("expected an error when the tests cannot be listed")
+		t.Error("expected an error when the packages cannot be listed")
 	}
 }
 
 const (
-	testMapListing = "TestRangeDescending\nTestRangeAscending\nok  \texample.com\t0.004s\n" +
-		"TestSizeAscending\nok  \texample.com/vm\t0.005s\n"
-
 	// TestRangeDescending is the only test that reaches the clamp.
 	profileRangeDescending = "mode: set\n" +
 		"example.com/root.go:6.26,6.50 1 1\n" +
@@ -163,69 +190,92 @@ const (
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 )
 
-func fakeTestMapCommand(command string, args ...string) *exec.Cmd {
-	return testMapHelper("TestTestMapHelperProcess", command, args...)
+func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
+	return func(command string, args ...string) *exec.Cmd {
+		cs := []string{"-test.run=" + helper, "--", command}
+		cs = append(cs, args...)
+		// #nosec G204 G702 - We are in tests, we don't care
+		cmd := exec.Command(os.Args[0], cs...)
+		cmd.Env = []string{"GO_TEST_PROCESS=1", pkgDirsEnv + "=" + pkgRoot}
+
+		return cmd
+	}
 }
 
-func fakeTestMapCommandWithFailure(command string, args ...string) *exec.Cmd {
-	return testMapHelper("TestTestMapHelperProcessFailingTest", command, args...)
-}
-
-func fakeTestMapCommandListFailure(command string, args ...string) *exec.Cmd {
-	return testMapHelper("TestTestMapHelperProcessListFailure", command, args...)
-}
-
-func testMapHelper(run, command string, args ...string) *exec.Cmd {
-	cs := []string{"-test.run=" + run, "--", command}
-	cs = append(cs, args...)
-	// #nosec G204 G702 - We are in tests, we don't care
-	cmd := exec.Command(os.Args[0], cs...)
-	cmd.Env = []string{"GO_TEST_PROCESS=1"}
-
-	return cmd
-}
-
-// TestTestMapHelperProcess stands in for the go command: it answers -list with a
-// canned listing, and writes the profile a per-test coverage run would produce.
+// TestTestMapHelperProcess stands in for the go command and for the test
+// binaries it compiles: it answers `go list`, pretends to compile, lists the
+// tests of the binary it is impersonating, and writes the profile a per-test
+// coverage run would produce.
 func TestTestMapHelperProcess(t *testing.T) {
 	if os.Getenv("GO_TEST_PROCESS") != "1" {
 		return
 	}
-	respondAsGo(t, "")
+	respondAsGo(t, "", "")
 }
 
 func TestTestMapHelperProcessFailingTest(t *testing.T) {
 	if os.Getenv("GO_TEST_PROCESS") != "1" {
 		return
 	}
-	respondAsGo(t, "TestRangeAscending")
+	respondAsGo(t, "TestRangeAscending", "")
+}
+
+func TestTestMapHelperProcessCompileFailure(t *testing.T) {
+	if os.Getenv("GO_TEST_PROCESS") != "1" {
+		return
+	}
+	respondAsGo(t, "", "example.com")
 }
 
 func TestTestMapHelperProcessListFailure(t *testing.T) {
 	if os.Getenv("GO_TEST_PROCESS") != "1" {
 		return
 	}
-	if hasFlag(os.Args, "-list") {
+	if command(os.Args) == "go" && hasFlag(os.Args, "list") {
 		fmt.Fprintln(os.Stderr, "cannot load package")
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-	respondAsGo(t, "")
+	respondAsGo(t, "", "")
 }
 
-func respondAsGo(t *testing.T, failing string) {
+//nolint:cyclop // it stands in for three different commands; splitting it hides the shape
+func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	t.Helper()
 
-	if hasFlag(os.Args, "-list") {
-		fmt.Fprint(os.Stdout, testMapListing)
+	cmd := command(os.Args)
+	root := os.Getenv(pkgDirsEnv)
+
+	if cmd == "go" && hasFlag(os.Args, "list") {
+		fmt.Fprintf(os.Stdout, "example.com\t%s\t2\t0\n", filepath.Join(root, "root"))
+		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\t1\t0\n", filepath.Join(root, "vm"))
+		fmt.Fprintf(os.Stdout, "example.com/empty\t%s\t0\t0\n", filepath.Join(root, "empty"))
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
-	run := strings.Trim(flagValue(os.Args, "-run"), "^$")
-	if run == failing {
+	if cmd == "go" && hasFlag(os.Args, "-c") {
+		out := flagValue(os.Args, "-o")
+		if uncompilablePkg != "" && strings.HasSuffix(out, binaryName(uncompilablePkg)) {
+			fmt.Fprintln(os.Stderr, "build failed")
+			os.Exit(1) // skipcq: RVV-A0003
+		}
+		writeOrDie(out, "#!/bin/false\n")
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
+	if hasFlag(os.Args, "-test.list") {
+		if strings.HasSuffix(cmd, binaryName("example.com/vm")) {
+			fmt.Fprint(os.Stdout, "TestSizeAscending\nwarning: GOCOVERDIR not set, no coverage data emitted\n")
+		} else {
+			fmt.Fprint(os.Stdout, "TestRangeDescending\nTestRangeAscending\n")
+		}
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
+	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
+	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-
 	profiles := map[string]string{
 		"TestRangeDescending": profileRangeDescending,
 		"TestRangeAscending":  profileRangeAscending,
@@ -233,15 +283,36 @@ func respondAsGo(t *testing.T, failing string) {
 	}
 	profile, ok := profiles[run]
 	if !ok {
-		fmt.Fprintln(os.Stderr, "unexpected -run "+run)
+		fmt.Fprintln(os.Stderr, "unexpected -test.run "+run)
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-	// #nosec G703 - the path comes from the arguments this test process gave itself
-	if err := os.WriteFile(flagValue(os.Args, "-coverprofile"), []byte(profile), 0o600); err != nil {
+	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
+	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// binaryName mirrors the name the builder gives a package's test binary.
+func binaryName(importPath string) string {
+	return strings.NewReplacer("/", "_", ".", "_").Replace(importPath) + ".test"
+}
+
+func writeOrDie(path, content string) {
+	// #nosec G306 G703 - the path comes from the arguments this test process gave itself
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// command returns what the process under test was asked to run, which is the
+// argument right after the "--" separator.
+func command(args []string) string {
+	for i, a := range args {
+		if a == "--" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+
+	return ""
 }
 
 func hasFlag(args []string, flag string) bool {
