@@ -114,8 +114,8 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	// Zero means unset, which leaves the previous behaviour exactly as
 	// it was.
 	timeout := baseTime * time.Duration(coefficient)
-	if min := configuration.GetDuration(configuration.UnleashTimeoutMinKey); timeout < min {
-		timeout = min
+	if floor := configuration.GetDuration(configuration.UnleashTimeoutMinKey); timeout < floor {
+		timeout = floor
 	}
 
 	jd := MutantExecutorDealer{
