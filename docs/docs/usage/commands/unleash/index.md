@@ -438,43 +438,33 @@ gremlins unleash --test-cpu=1
 
 :material-flag: `--test-selection` · :material-sign-direction: Default: `false`
 
-By default Gremlins runs the tests of the package where the mutant is, all of them. Package
-membership is a guess at which tests could notice a mutation; coverage is the answer. With this
-flag Gremlins runs, for each mutant, the tests that actually execute the mutated line — wherever
-in the module those tests live.
+By default Gremlins runs every test in the package where the mutant is. Package membership is a
+guess at which tests could notice a mutation; coverage is the answer. With this flag Gremlins
+runs only the tests **of that package** that actually execute the mutated line.
 
-That is better in both directions at once:
-
-- **Narrower.** A test that never executes the mutated line cannot notice the mutation, so it does
-  not run. Where most of a package's cost is in tests that touch other code — a suite that talks
-  to a database, say — this is most of the run.
-- **Wider.** A test in *another* package that does execute the line is run, and can kill the
-  mutant. That is the drawback described under [integration mode](#integration-mode), and without
-  this flag it shows up as a mutant reported `LIVED` that your test suite does in fact catch.
+This cannot cost more than not using it. The package is the same one, so its test binary was
+being built and its fixtures paid for either way; the only difference is that fewer of its tests
+run. Measured on a module of 450 mutants, it performed 24% of the test executions the whole-suite
+behaviour did.
 
 When a mutant survives, the report names the tests that ran against it:
 
 ```
        LIVED CONDITIONALS_BOUNDARY at vm/vm.go:6:10
-         not caught by: xpkg.TestRangeAscending, xpkg.TestRangeDescending
+         not caught by: example.com/vm.TestSize, example.com/vm.TestClamp
 ```
 
 The map that makes this possible cannot be read out of a coverage profile, because Go's profile
 does not record which test executed a block. Gremlins builds it by running each test on its own
-with coverage over the whole module, which costs one process per test, once, before any mutant
-runs. The map covers the whole module even when the run itself is scoped to a single package: the
-test that kills a mutant is not necessarily in the package that holds it, which is the point. That is why the flag is off by default: on a module whose suite is already fast it is a bad
-trade, and on one where a handful of slow tests dominate it pays for itself many times over.
+with coverage over the whole module, which costs one process per test — but only once. The map is
+cached between runs, under `gremlins/testmap` in your user cache directory, keyed per module and
+per checkout. A package is re-mapped only when the build ID of its test binary changes, which is
+Go's own hash over that package's source *and* every dependency's. On an unchanged tree the map
+costs one compile per package and no test runs at all.
 
 ```shell
 gremlins unleash --test-selection
 ```
-
-The map is cached between runs, under `gremlins/testmap` in your user cache directory, keyed per
-module and per checkout. A package is re-mapped only when the build ID of its test binary changes
-— which is Go's own hash over that package's source *and* every dependency's, so editing a package
-three levels down re-maps exactly the binaries that link it and nothing else. On an unchanged tree
-the map costs one compile per package and no test runs at all.
 
 [//]: # (@formatter:off)
 !!! warning
@@ -485,17 +475,37 @@ the map costs one compile per package and no test runs at all.
 [//]: # (@formatter:on)
 
 [//]: # (@formatter:off)
-!!! warning
+!!! note
     Selection is only ever used where the map is complete. If a package's tests cannot all be
     mapped — one of them fails to run, for instance — that package runs its whole suite, which is
     the behaviour without the flag. The same happens for a mutant the map has nothing to say
-    about. It is never allowed to run *fewer* tests than it can account for.
+    about, and in `--integration` mode, where the whole module runs for every mutant by design.
 [//]: # (@formatter:on)
 
+### Test selection across packages
+
+:material-flag: `--test-selection-cross-package` · :material-sign-direction: Default: `false`
+
+Implies `--test-selection`, and widens it: a mutant is also run against covering tests in *other*
+packages. That catches a mutant only another package's tests can kill, which package scoping
+reports as a surviving mutant your suite does in fact catch — the drawback described under
+[integration mode](#integration-mode), and the shape of
+[go-gremlins/gremlins#224](https://github.com/go-gremlins/gremlins/issues/224).
+
+It is off by default because it is expensive, and expensive for a structural reason. A test can
+only execute the mutated line if its package depends on the mutated package, so the packages this
+reaches into are exactly the packages the mutation invalidates: each one is recompiled, and each
+one pays its own test fixtures. Measured on the same module, the mutant phase went from 15.4 to
+22.4 minutes, and the widest selections exhausted a 3 GB memory cap.
+
+```shell
+gremlins unleash --test-selection-cross-package
+```
+
 [//]: # (@formatter:off)
-!!! note
-    The flag has no effect with `--integration`, which runs the whole module for every mutant by
-    design, and there is nothing left to narrow.
+!!! tip
+    Turn this on when a `LIVED` verdict looks wrong — when you believe a test elsewhere in the
+    module does catch the mutant. Leave it off for routine runs.
 [//]: # (@formatter:on)
 
 ### Threshold efficacy

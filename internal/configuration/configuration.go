@@ -50,6 +50,7 @@ const (
 	UnleashTimeoutMinKey         = "unleash.timeout-min"
 	UnleashIntegrationMode       = "unleash.integration"
 	UnleashTestSelectionKey      = "unleash.test-selection"
+	UnleashTestSelectionCrossKey = "unleash.test-selection-cross-package"
 	UnleashExcludeFiles          = "unleash.exclude-files"
 	UnleashDiffRef               = "unleash.diff"
 	UnleashThresholdEfficacyKey  = "unleash.threshold.efficacy"

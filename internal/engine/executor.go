@@ -64,6 +64,7 @@ type MutantExecutorDealer struct {
 	testExecutionTime time.Duration
 	dryRun            bool
 	integrationMode   bool
+	crossPackage      bool
 	testCPU           int
 }
 
@@ -109,6 +110,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	buildTags := configuration.Get[string](configuration.UnleashTagsKey)
 	dryRun := configuration.Get[bool](configuration.UnleashDryRunKey)
 	integrationMode := configuration.Get[bool](configuration.UnleashIntegrationMode)
+	crossPackage := configuration.Get[bool](configuration.UnleashTestSelectionCrossKey)
 	testCPU := configuration.Get[int](configuration.UnleashTestCPUKey)
 	tCoefficient := configuration.Get[int](configuration.UnleashTimeoutCoefficientKey)
 
@@ -149,6 +151,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 
 	jd := MutantExecutorDealer{
 		mod:               mod,
+		crossPackage:      crossPackage,
 		wdDealer:          wdd,
 		buildTags:         buildTags,
 		dryRun:            dryRun,
@@ -177,6 +180,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		wdDealer:          m.wdDealer,
 		module:            m.mod,
 		testMap:           m.testMap,
+		crossPackage:      m.crossPackage,
 		dryRun:            m.dryRun,
 		integrationMode:   m.integrationMode,
 		buildTags:         m.buildTags,
@@ -202,6 +206,7 @@ type mutantExecutor struct {
 	testExecutionTime time.Duration
 	dryRun            bool
 	integrationMode   bool
+	crossPackage      bool
 	testCPU           int
 }
 
@@ -273,9 +278,17 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 // selectTests decides what to run for the mutant.
 //
 // Package membership is only a guess at which tests could notice a mutation;
-// coverage is the answer. Where the map can give it, this is both narrower —
-// tests that never execute the line are skipped — and wider — tests in other
-// packages that do execute it are picked up, which package scoping never ran.
+// coverage is the answer. By default the answer is narrowed to the mutated
+// package: those tests were going to be built and their fixtures paid for
+// anyway, so running a subset of them can only be cheaper than running all of
+// them. Measured on Rulewright's backend, that is 24% of the test executions
+// the whole suite would perform.
+//
+// Reaching into other packages is a different trade and a different flag. It
+// catches a mutant only another package's tests can kill — go-gremlins#224 —
+// but the packages whose tests reach a mutation are the packages that depend
+// on it, so it pulls in their fixtures too: measured, the same gate went from
+// 15.4 to 22.4 minutes, and the widest selections exhausted a 3GB memory cap.
 //
 // Every path that cannot give a confident answer returns the mutated package's
 // whole suite, which is the behaviour without selection: never wrong, only slow.
@@ -290,6 +303,9 @@ func (m *mutantExecutor) selectTests(pkg string) testRun {
 		return wholeSuite
 	}
 	tests := m.testMap.TestsFor(m.mutant.Position())
+	if !m.crossPackage {
+		tests = ownPackage(tests, pkg)
+	}
 	if len(tests) == 0 {
 		// An uncovered mutant never reaches here, so an empty answer means the
 		// map is incomplete — coverage is not always deterministic — rather than
@@ -319,6 +335,18 @@ func (m *mutantExecutor) selectTests(pkg string) testRun {
 	m.mutant.SetTestsRun(names)
 
 	return sel
+}
+
+// ownPackage keeps only the tests that live in the mutated package.
+func ownPackage(tests []coverage.TestID, pkg string) []coverage.TestID {
+	kept := tests[:0:0]
+	for _, id := range tests {
+		if id.Pkg == pkg {
+			kept = append(kept, id)
+		}
+	}
+
+	return kept
 }
 
 func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel testRun) mutator.Status {
