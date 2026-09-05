@@ -95,11 +95,16 @@ type ExecutorDealer interface {
 // rollback. These can be overridden with nop functions in tests. Not an
 // ideal setup. In the future we can think of a better way to handle this.
 type MutantExecutorDealer struct {
-	wdDealer          workdir.Dealer
-	execContext       execContext
-	testMap           TestSelector
-	dependents        DependentFinder
-	runCtx            context.Context
+	wdDealer    workdir.Dealer
+	execContext execContext
+	testMap     TestSelector
+	dependents  DependentFinder
+	// The context is held rather than passed because the dealer outlives every
+	// call that would carry one: it is built once and each worker asks it for a
+	// mutant's bounds later. SetRunCtx is how the engine's run context reaches
+	// them, and it is what lets a cancelled run be told from a mutant that ran
+	// long.
+	runCtx            context.Context //nolint:containedctx
 	mod               gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -264,13 +269,13 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 // rather than silently treated as "no cap", because a safety ceiling that
 // quietly does nothing is worse than one that was never configured.
 func cappedExecutionTime(d time.Duration) time.Duration {
-	max, ok := positiveDuration(configuration.UnleashTimeoutMaxKey, "running without a timeout ceiling")
+	ceiling, ok := positiveDuration(configuration.UnleashTimeoutMaxKey, "running without a timeout ceiling")
 	if !ok {
 		return d
 	}
 
-	if d > max {
-		return max
+	if d > ceiling {
+		return ceiling
 	}
 
 	return d
@@ -351,14 +356,18 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 type execContext = func(ctx context.Context, name string, args ...string) *exec.Cmd
 
 type mutantExecutor struct {
-	mutant            mutator.Mutator
-	testMap           TestSelector
-	dependents        DependentFinder
-	wdDealer          workdir.Dealer
-	outCh             chan<- mutator.Mutator
-	wg                *sync.WaitGroup
-	execContext       execContext
-	runCtx            context.Context
+	mutant      mutator.Mutator
+	testMap     TestSelector
+	dependents  DependentFinder
+	wdDealer    workdir.Dealer
+	outCh       chan<- mutator.Mutator
+	wg          *sync.WaitGroup
+	execContext execContext
+	// Carried for the same reason the dealer carries it: the executor is
+	// constructed before the run it belongs to reaches runTests, and telling a
+	// cancelled run from a long one needs the run's own context, not the
+	// per-mutant one derived from it.
+	runCtx            context.Context //nolint:containedctx
 	module            gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -449,6 +458,16 @@ type testRun struct {
 // value would record a timed-out mutant as KILLED, crediting a detection that
 // never happened, and a mutant that does not compile as KILLED too. So the
 // child's output is scanned for the markers that tell the three apart.
+//
+// The two bounds also produce two DIFFERENT timeout verdicts, and the ordering
+// below is what keeps them apart. mutator.RunTimedOut is the only branch here
+// backed by a positive observation: the test binary printed, in its own output,
+// that the suite it was running overran the leash `go test -timeout` gave it.
+// Every other branch infers from an absence — a deadline that expired, a context
+// that was cancelled, an exit status that says nothing about which phase
+// produced it. mutator.TimedOut is that absence, and it must stay separate
+// precisely because a compile that hung reaches it identically to a run that
+// did.
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+m.compileAllowance)
 	defer cancel()
@@ -559,6 +578,27 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 
 	err := run(ctx, cmd)
 
+	// The run-phase watchdog is read before either deadline, because it is
+	// evidence and they are the lack of it. Two things follow from that order.
+	//
+	// A goroutine dump from a runaway mutant can be large, and the backstop can
+	// expire while it is still draining; reading the backstop first would relabel
+	// the one mutant that DID report a verdict as one that did not. And a mutant
+	// that printed the marker before the runner's SIGTERM arrived was adjudicated
+	// by its own test binary before the shutdown, so the shutdown status would
+	// discard a verdict already reached.
+	//
+	// `err != nil` guards the marker: a package whose tests all pass exits 0, and
+	// a test that merely PRINTS this string while passing must not be read as one
+	// that overran. A binary the watchdog actually fired on always exits non-zero,
+	// and a deadline-killed child returns the context's error, so no real timeout
+	// is lost to the guard.
+	if err != nil && scanner.sawTestTimeout() {
+		return mutator.RunTimedOut
+	}
+	// The backstop bounds compile AND run together, so when it is what fired we
+	// do not know which phase spent it. Unadjudicated: it stays in the efficacy
+	// denominator and credits nobody.
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return mutator.TimedOut
 	}
@@ -572,16 +612,12 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		// The timeout marker is checked first. A mutant that does not compile
-		// never runs a test binary, so it cannot print the timeout panic, and
-		// the orders only differ for a multi-package run where one package
-		// failed to build and another timed out. TIMED OUT is the safe verdict
-		// there: it stays in the efficacy denominator and credits nobody,
-		// whereas NOT VIABLE would drop the mutant out of the denominator
-		// altogether.
-		if scanner.sawTestTimeout() {
-			return mutator.TimedOut
-		}
+		// A mutant that does not compile never runs a test binary, so it cannot
+		// print the timeout panic and cannot have been claimed by the branch
+		// above; the two markers only compete for a multi-package run where one
+		// package failed to build and another timed out. RUN TIMED OUT is the
+		// safe verdict there, because NOT VIABLE would drop the mutant out of
+		// the denominator altogether.
 		if scanner.sawBuildFailure() {
 			return mutator.NotViable
 		}
@@ -712,6 +748,7 @@ func shutdownStatus() mutator.Status {
 	if s, ok := mutator.ParseShutdownStatus(v); ok {
 		return s
 	}
+
 	return mutator.NotCovered
 }
 

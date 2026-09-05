@@ -65,6 +65,11 @@ func TestStatusString(t *testing.T) {
 			expected:       "ERRORED",
 			mutationStatus: mutator.Errored,
 		},
+		{
+			name:           "RunTimedOut",
+			expected:       "RUN TIMED OUT",
+			mutationStatus: mutator.RunTimedOut,
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
@@ -89,6 +94,10 @@ func TestParseShutdownStatus(t *testing.T) {
 		{in: "timedout", want: mutator.TimedOut, wantOK: true},
 		{in: "timeout", want: mutator.TimedOut, wantOK: true},
 		{in: "lived", want: mutator.Lived, wantOK: true},
+		// Deliberately absent: nothing maps to RunTimedOut. A mutant the runner
+		// cancelled was adjudicated by nothing, and RunTimedOut asserts that a
+		// test binary reported the overrun itself.
+		{in: "run-timed-out", wantOK: false},
 		{in: "garbage", wantOK: false},
 		{in: "KILLED", wantOK: false},
 	}

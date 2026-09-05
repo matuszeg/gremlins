@@ -159,6 +159,18 @@ func TestMutatorTestExecution(t *testing.T) {
 			mutantStatus:  mutator.Runnable,
 			wantMutStatus: mutator.Errored,
 		},
+		{
+			// The run-phase timeout marker is evidence only alongside a child
+			// that FAILED. A child that printed it and then exited 0 adjudicated
+			// the mutant, whatever it said on the way, and reading its output
+			// alone would move a survivor out of the LIVED column and into a
+			// timeout one — where a consumer that credits run-phase timeouts
+			// would then pay the suite for it.
+			name:          "if the child prints the timeout marker and still succeeds, mutation is LIVED",
+			testResult:    fakeExecCommandMarkerThenSuccess,
+			mutantStatus:  mutator.Runnable,
+			wantMutStatus: mutator.Lived,
+		},
 	}
 	for _, tc := range testCases {
 		tc := tc
@@ -590,6 +602,16 @@ func TestProcessTestsFailure(_ *testing.T) {
 	os.Exit(1) // skipcq: RVV-A0003
 }
 
+// TestProcessMarkerThenSuccess is the child-process entry point that prints the
+// bytes a timed-out test binary prints and then exits 0.
+func TestProcessMarkerThenSuccess(_ *testing.T) {
+	if os.Getenv("GO_TEST_PROCESS") != "1" {
+		return
+	}
+	fmt.Fprintln(os.Stdout, "panic: test timed out after 10m0s")
+	os.Exit(0) // skipcq: RVV-A0003
+}
+
 func TestProcessBuildFailure(_ *testing.T) {
 	if os.Getenv("GO_TEST_PROCESS") != "1" {
 		return
@@ -621,6 +643,7 @@ func TestProcessSleep(_ *testing.T) {
 func fakeExecCommandSleep(ctx context.Context, command string, args ...string) *exec.Cmd {
 	cs := []string{"-test.run=TestProcessSleep", "--", command}
 	cs = append(cs, args...)
+
 	return getCmd(ctx, cs)
 }
 
@@ -827,6 +850,13 @@ func fakeExecCommandTestsFailure(ctx context.Context, command string, args ...st
 
 func fakeExecCommandSignalledTestBinary(ctx context.Context, command string, args ...string) *exec.Cmd {
 	cs := []string{"-test.run=TestProcessSignalledTestBinary", "--", command}
+	cs = append(cs, args...)
+
+	return getCmd(ctx, cs)
+}
+
+func fakeExecCommandMarkerThenSuccess(ctx context.Context, command string, args ...string) *exec.Cmd {
+	cs := []string{"-test.run=TestProcessMarkerThenSuccess", "--", command}
 	cs = append(cs, args...)
 
 	return getCmd(ctx, cs)
