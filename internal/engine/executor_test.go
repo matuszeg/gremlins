@@ -450,7 +450,7 @@ func TestMutatorRun(t *testing.T) {
 			if tc.wantExecutionTime != 0 {
 				wantRunBound = tc.wantExecutionTime
 			}
-			want := fmt.Sprintf("go test -count=1 -tags %s -timeout %s -failfast %s", tc.tags, wantRunBound, tc.wantPath)
+			want := fmt.Sprintf("go test -count=1 -vet=off -tags %s -timeout %s -failfast %s", tc.tags, wantRunBound, tc.wantPath)
 			got := fmt.Sprintf("go %v", strings.Join(holder.args, " "))
 
 			if !cmp.Equal(got, want) {

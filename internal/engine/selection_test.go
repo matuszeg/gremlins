@@ -151,7 +151,7 @@ func TestSelectionRunsOnlyTheTestsThatExecuteTheMutatedLine(t *testing.T) {
 
 	holder, _ := runWithSelector(t, sel, false)
 
-	want := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize|TestClamp)$ example.com/vm"}
+	want := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize|TestClamp)$ example.com/vm"}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
 	}
@@ -174,7 +174,7 @@ func TestSelectionRunsCoveringTestsFromOtherPackages(t *testing.T) {
 	// One invocation listing both packages, not one per package: the build is
 	// most of what a mutant costs, and `go test` builds them together.
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout +
+		"go test -count=1 -vet=off -timeout " + wantTimeout +
 			" -failfast -run ^(TestRangeDescending|TestSize)$ example.com example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
@@ -204,7 +204,7 @@ func TestSelectionNamesEachTestOnceAcrossPackages(t *testing.T) {
 	holder, mut := runCrossPackage(t, sel)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -232,7 +232,7 @@ func TestSelectionKeepsToTheMutatedPackageByDefault(t *testing.T) {
 	holder, mut := runWithSelector(t, sel, false)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -252,7 +252,7 @@ func TestSelectionFallsBackWhenOnlyOtherPackagesCover(t *testing.T) {
 
 	holder, mut := runWithSelector(t, sel, false)
 
-	want := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm"}
+	want := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm"}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
 	}
@@ -268,7 +268,7 @@ func TestCrossPackageWithoutSelectionRunsWholeSuitesOfTheDependents(t *testing.T
 	holder, mut := runCrossPackage(t, nil)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm example.com",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm example.com",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -279,7 +279,7 @@ func TestCrossPackageWithoutSelectionRunsWholeSuitesOfTheDependents(t *testing.T
 }
 
 func TestSelectionFallsBackToTheWholeSuite(t *testing.T) {
-	wholeSuite := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm"}
+	wholeSuite := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm"}
 
 	testCases := map[string]struct {
 		sel     engine.TestSelector
@@ -316,7 +316,7 @@ func TestSelectionFallsBackToTheWholeSuite(t *testing.T) {
 
 			want := wholeSuite
 			if tc.intMode {
-				want = []string{"go test -count=1 -timeout " + wantTimeout + " -failfast ./..."}
+				want = []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast ./..."}
 			}
 			if diff := cmp.Diff(want, holder.commands()); diff != "" {
 				t.Errorf("commands mismatch (-want +got):\n%s", diff)
