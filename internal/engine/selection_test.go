@@ -147,9 +147,11 @@ func TestSelectionRunsCoveringTestsFromOtherPackages(t *testing.T) {
 
 	holder, mut := runWithSelector(t, sel, false)
 
+	// One invocation listing both packages, not one per package: the build is
+	// most of what a mutant costs, and `go test` builds them together.
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestRangeDescending)$ example.com",
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
+		"go test -count=1 -timeout " + wantTimeout +
+			" -failfast -run ^(TestRangeDescending|TestSize)$ example.com example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -158,6 +160,33 @@ func TestSelectionRunsCoveringTestsFromOtherPackages(t *testing.T) {
 	// A surviving mutant has to say what it survived, or the report repeats the
 	// mistake package scoping made: a verdict with no account of what produced it.
 	wantTests := []string{"example.com.TestRangeDescending", "example.com/vm.TestSize"}
+	if diff := cmp.Diff(wantTests, mut.TestsRun()); diff != "" {
+		t.Errorf("TestsRun() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// A name shared by two packages appears once in the pattern. -run applies to
+// every package listed, so it runs in both regardless; repeating it would only
+// make the command longer.
+func TestSelectionNamesEachTestOnceAcrossPackages(t *testing.T) {
+	sel := selectorStub{
+		mapped: map[string]bool{"example.com/vm": true, "example.com": true},
+		tests: []coverage.TestID{
+			{Pkg: "example.com", Name: "TestSize"},
+			{Pkg: "example.com/vm", Name: "TestSize"},
+		},
+	}
+
+	holder, mut := runWithSelector(t, sel, false)
+
+	want := []string{
+		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
+	}
+	if diff := cmp.Diff(want, holder.commands()); diff != "" {
+		t.Errorf("commands mismatch (-want +got):\n%s", diff)
+	}
+	// The report still names both, because both were run against the mutant.
+	wantTests := []string{"example.com.TestSize", "example.com/vm.TestSize"}
 	if diff := cmp.Diff(wantTests, mut.TestsRun()); diff != "" {
 		t.Errorf("TestsRun() mismatch (-want +got):\n%s", diff)
 	}

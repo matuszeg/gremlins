@@ -111,7 +111,7 @@ func TestGetTestArgs(t *testing.T) {
 				integrationMode:   tc.integrationMode,
 			}
 
-			sel := testRun{pkg: tc.pkg, tests: tc.tests}
+			sel := testRun{pkgs: []string{tc.pkg}, tests: tc.tests}
 			if diff := cmp.Diff(tc.want, sut.getTestArgs(sel)); diff != "" {
 				t.Errorf("getTestArgs() mismatch (-want +got):\n%s", diff)
 			}

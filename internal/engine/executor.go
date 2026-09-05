@@ -249,11 +249,17 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 	m.outCh <- m.mutant
 }
 
-// testRun is one `go test` invocation: a package, and which of its tests to run.
-// An empty tests slice means the package's whole suite, which is what runs when
-// there is no test selection.
+// testRun is the single `go test` invocation a mutant is judged by: the
+// packages to run, and which tests within them. An empty tests slice means
+// whole suites, which is what runs when there is no test selection.
+//
+// It is one invocation and not one per package on purpose. `go test` takes many
+// packages with one -run, builds them together, and most of what a mutant costs
+// is that build: measured on four packages of Rulewright's backend with a -run
+// matching nothing at all, four invocations took 4147ms against 2115ms for one.
+// The tests were never the expense; the invocations were.
 type testRun struct {
-	pkg   string
+	pkgs  []string
 	tests []string
 }
 
@@ -261,15 +267,7 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	ctx, cancel := context.WithTimeout(context.Background(), m.testExecutionTime)
 	defer cancel()
 
-	// One context for the whole mutant, not one per command: the bound is on how
-	// long this mutant may take, and selection can split that across packages.
-	for _, sel := range m.selectTests(pkg) {
-		if status := m.runTestCommand(ctx, rootDir, sel); status != mutator.Lived {
-			return status
-		}
-	}
-
-	return mutator.Lived
+	return m.runTestCommand(ctx, rootDir, m.selectTests(pkg))
 }
 
 // selectTests decides what to run for the mutant.
@@ -281,8 +279,8 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 //
 // Every path that cannot give a confident answer returns the mutated package's
 // whole suite, which is the behaviour without selection: never wrong, only slow.
-func (m *mutantExecutor) selectTests(pkg string) []testRun {
-	wholeSuite := []testRun{{pkg: pkg}}
+func (m *mutantExecutor) selectTests(pkg string) testRun {
+	wholeSuite := testRun{pkgs: []string{pkg}}
 	if m.testMap == nil || m.integrationMode {
 		return wholeSuite
 	}
@@ -299,24 +297,28 @@ func (m *mutantExecutor) selectTests(pkg string) []testRun {
 		return wholeSuite
 	}
 
-	var order []string
-	byPkg := make(map[string][]string)
+	var sel testRun
+	seenPkg := make(map[string]struct{}, len(tests))
+	seenName := make(map[string]struct{}, len(tests))
 	names := make([]string, 0, len(tests))
 	for _, id := range tests {
-		if _, seen := byPkg[id.Pkg]; !seen {
-			order = append(order, id.Pkg)
+		if _, ok := seenPkg[id.Pkg]; !ok {
+			seenPkg[id.Pkg] = struct{}{}
+			sel.pkgs = append(sel.pkgs, id.Pkg)
 		}
-		byPkg[id.Pkg] = append(byPkg[id.Pkg], id.Name)
+		// The -run pattern applies to every package listed, so a name shared by
+		// two packages runs in both even where only one covers the line. That
+		// runs more tests than strictly needed, never fewer, so it can only cost
+		// time — and it saves an invocation per package, which costs more.
+		if _, ok := seenName[id.Name]; !ok {
+			seenName[id.Name] = struct{}{}
+			sel.tests = append(sel.tests, id.Name)
+		}
 		names = append(names, id.String())
 	}
 	m.mutant.SetTestsRun(names)
 
-	runs := make([]testRun, 0, len(order))
-	for _, p := range order {
-		runs = append(runs, testRun{pkg: p, tests: byPkg[p]})
-	}
-
-	return runs
+	return sel
 }
 
 func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel testRun) mutator.Status {
@@ -442,13 +444,11 @@ func (m *mutantExecutor) getTestArgs(sel testRun) []string {
 		args = append(args, "-run", "^("+strings.Join(sel.tests, "|")+")$")
 	}
 
-	path := sel.pkg
 	if m.integrationMode {
-		path = "./..."
+		return append(args, "./...")
 	}
-	args = append(args, path)
 
-	return args
+	return append(args, sel.pkgs...)
 }
 
 func run(ctx context.Context, cmd *exec.Cmd) error {
