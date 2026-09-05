@@ -48,6 +48,7 @@ const (
 	// UnleashTimeoutMinKey is the floor under the per-mutant timeout.
 	UnleashTimeoutMinKey         = "unleash.timeout-min"
 	UnleashIntegrationMode       = "unleash.integration"
+	UnleashTestSelectionKey      = "unleash.test-selection"
 	UnleashExcludeFiles          = "unleash.exclude-files"
 	UnleashDiffRef               = "unleash.diff"
 	UnleashThresholdEfficacyKey  = "unleash.threshold.efficacy"

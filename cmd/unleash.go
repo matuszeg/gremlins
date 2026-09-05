@@ -64,6 +64,7 @@ const (
 	paramWorkers            = "workers"
 	paramTimeoutCoefficient = "timeout-coefficient"
 	paramTimeoutMin         = "timeout-min"
+	paramTestSelection      = "test-selection"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -181,13 +182,29 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 		return report.Results{}, fmt.Errorf("failed to gather coverage: %w", err)
 	}
 
+	covered := cProfile.Profile
+	var opts []engine.ExecutorDealerOption
+	if testSelectionRequested() {
+		testMap, err := c.BuildTestMap()
+		if err != nil {
+			return report.Results{}, fmt.Errorf("failed to map tests to the code they execute: %w", err)
+		}
+		opts = append(opts, engine.WithTestSelection(testMap))
+		// The map is gathered across the whole module, so it sees a line executed
+		// only by another package's tests — which a plain coverage run attributes
+		// to nobody, leaving the mutants on it untested. Widen the profile with
+		// it rather than replacing it: a package the map could not see whole is
+		// missing from the union, and its mutants must stay runnable.
+		covered = coverage.Merge(cProfile.Profile, testMap.Union())
+	}
+
 	wdDealer := workdir.NewCachedDealer(workDir, mod.Root)
 	defer wdDealer.Clean()
 
-	jDealer := engine.NewExecutorDealer(mod, wdDealer, cProfile.Elapsed)
+	jDealer := engine.NewExecutorDealer(mod, wdDealer, cProfile.Elapsed, opts...)
 
 	codeData := engine.CodeData{
-		Cov:       cProfile.Profile,
+		Cov:       covered,
 		Diff:      fDiff,
 		Exclusion: exclude,
 	}
@@ -196,6 +213,23 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	results := mut.Run(ctx)
 
 	return results, nil
+}
+
+// testSelectionRequested reports whether to build the test map.
+//
+// Integration mode runs the whole module for every mutant by design, so there is
+// nothing for selection to narrow and the map would be paid for nothing.
+func testSelectionRequested() bool {
+	if !configuration.Get[bool](configuration.UnleashTestSelectionKey) {
+		return false
+	}
+	if configuration.Get[bool](configuration.UnleashIntegrationMode) {
+		log.Infoln("test-selection has no effect in integration mode: every mutant runs the whole module")
+
+		return false
+	}
+
+	return true
 }
 
 func setFlagsOnCmd(cmd *cobra.Command) error {
@@ -228,6 +262,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramTestCPU, CfgKey: configuration.UnleashTestCPUKey, DefaultV: 0, Usage: "the number of CPUs to allow each test run to use"},
 		{Name: paramTimeoutCoefficient, CfgKey: configuration.UnleashTimeoutCoefficientKey, DefaultV: 0, Usage: "the coefficient by which the timeout is increased"},
 		{Name: paramTimeoutMin, CfgKey: configuration.UnleashTimeoutMinKey, DefaultV: time.Duration(0), Usage: "the floor under each mutant's timeout, regardless of how fast the test suite is"},
+		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests that execute the mutated line, wherever they live"},
 	}
 
 	for _, f := range fls {
