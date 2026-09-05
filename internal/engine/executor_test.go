@@ -242,10 +242,13 @@ func TestMutatorRun(t *testing.T) {
 		callDir            string
 		tags               string
 		wantPath           string
+		timeoutMax         string
 		timeoutCoefficient int
 		timeoutMin         time.Duration
-		wantTimeoutMin     time.Duration
-		intMode            bool
+		// wantExecutionTime, when non-zero, is the per-mutant timeout the run
+		// must end up with, overriding the coefficient-derived expectation.
+		wantExecutionTime time.Duration
+		intMode           bool
 	}{
 		{
 			name:     "normal mode",
@@ -279,7 +282,7 @@ func TestMutatorRun(t *testing.T) {
 			name:               "a timeout-min raises a bound the coefficient made too tight",
 			timeoutCoefficient: 1,
 			timeoutMin:         90 * time.Second,
-			wantTimeoutMin:     90 * time.Second,
+			wantExecutionTime:  90 * time.Second,
 			pkg:                "example.com/my/package",
 			callDir:            "test/dir",
 			tags:               "tag1,t1g2",
@@ -291,6 +294,68 @@ func TestMutatorRun(t *testing.T) {
 			name:               "a timeout-min below the coefficient's bound changes nothing",
 			timeoutCoefficient: 4,
 			timeoutMin:         time.Nanosecond,
+			pkg:                "example.com/my/package",
+			callDir:            "test/dir",
+			tags:               "tag1,t1g2",
+			wantPath:           "example.com/my/package",
+		},
+		{
+			// The whole point of the ceiling: 4 x 10s would be 40s, and a mutant
+			// that never terminates gets 40s to exhaust the machine. The cap
+			// takes it to 15s regardless of how slow the package's tests are.
+			name:               "it caps the timeout at timeout-max",
+			timeoutCoefficient: 4,
+			timeoutMax:         "15s",
+			wantExecutionTime:  15 * time.Second,
+			pkg:                "example.com/my/package",
+			callDir:            "test/dir",
+			tags:               "tag1,t1g2",
+			wantPath:           "example.com/my/package",
+		},
+		{
+			// A ceiling above the derived timeout must not pull it UP: the cap
+			// bounds the worst case, it does not set the timeout.
+			name:               "a timeout-max above the derived timeout leaves it alone",
+			timeoutCoefficient: 4,
+			timeoutMax:         "2m",
+			wantExecutionTime:  40 * time.Second,
+			pkg:                "example.com/my/package",
+			callDir:            "test/dir",
+			tags:               "tag1,t1g2",
+			wantPath:           "example.com/my/package",
+		},
+		{
+			// An unparseable ceiling falls back to the derived timeout. It is
+			// reported on stderr rather than swallowed, but it must not abort a
+			// run or silently become zero — a zero timeout would kill every
+			// mutant instantly and report the package as perfectly tested.
+			name:              "a malformed timeout-max is ignored",
+			timeoutMax:        "fifteen seconds",
+			wantExecutionTime: expectedTimeout * engine.DefaultTimeoutCoefficient,
+			pkg:               "example.com/my/package",
+			callDir:           "test/dir",
+			tags:              "tag1,t1g2",
+			wantPath:          "example.com/my/package",
+		},
+		{
+			name:              "a non-positive timeout-max is ignored",
+			timeoutMax:        "0s",
+			wantExecutionTime: expectedTimeout * engine.DefaultTimeoutCoefficient,
+			pkg:               "example.com/my/package",
+			callDir:           "test/dir",
+			tags:              "tag1,t1g2",
+			wantPath:          "example.com/my/package",
+		},
+		{
+			// The floor and the ceiling are applied in that order, so a pair
+			// that contradicts each other resolves to the ceiling rather than
+			// to whichever flag was read last. Neither flag's own tests can
+			// see this: it exists only because this fork carries both.
+			name:               "a timeout-max below a timeout-min wins",
+			timeoutCoefficient: 1,
+			timeoutMin:         90 * time.Second,
+			timeoutMax:         "15s",
+			wantExecutionTime:  15 * time.Second,
 			pkg:                "example.com/my/package",
 			callDir:            "test/dir",
 			tags:               "tag1,t1g2",
@@ -309,6 +374,9 @@ func TestMutatorRun(t *testing.T) {
 			}
 			if tc.timeoutMin != 0 {
 				settings[configuration.UnleashTimeoutMinKey] = tc.timeoutMin
+			}
+			if tc.timeoutMax != "" {
+				settings[configuration.UnleashTimeoutMaxKey] = tc.timeoutMax
 			}
 			viperSet(settings)
 			defer viperReset()
@@ -346,8 +414,8 @@ func TestMutatorRun(t *testing.T) {
 			if tc.timeoutCoefficient != 0 {
 				wantTimeout = 2*time.Second + expectedTimeout*time.Duration(tc.timeoutCoefficient)
 			}
-			if tc.wantTimeoutMin != 0 {
-				wantTimeout = 2*time.Second + tc.wantTimeoutMin
+			if tc.wantExecutionTime != 0 {
+				wantTimeout = 2*time.Second + tc.wantExecutionTime
 			}
 			want := fmt.Sprintf("go test -count=1 -tags %s -timeout %s -failfast %s", tc.tags, wantTimeout, tc.wantPath)
 			got := fmt.Sprintf("go %v", strings.Join(holder.args, " "))

@@ -48,6 +48,7 @@ const (
 	UnleashTimeoutCoefficientKey = "unleash.timeout-coefficient"
 	// UnleashTimeoutMinKey is the floor under the per-mutant timeout.
 	UnleashTimeoutMinKey         = "unleash.timeout-min"
+	UnleashTimeoutMaxKey         = "unleash.timeout-max"
 	UnleashIntegrationMode       = "unleash.integration"
 	UnleashTestSelectionKey      = "unleash.test-selection"
 	UnleashCrossPackageKey       = "unleash.cross-package"
