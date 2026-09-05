@@ -58,10 +58,11 @@ type mapCache struct {
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than
-// per package: the coverage scope the profiles were gathered under, and the
-// build tags that decide which files exist at all.
-func cacheKey(coverPkg, buildTags string) string {
-	sum := sha256.Sum256([]byte(coverPkg + "\x00" + buildTags))
+// per package: how much of the module was mapped — a map built without
+// --cross-package records only each test's own package — and the build tags
+// that decide which files exist at all.
+func cacheKey(scope, buildTags string) string {
+	sum := sha256.Sum256([]byte(scope + "\x00" + buildTags))
 
 	return hex.EncodeToString(sum[:])
 }
