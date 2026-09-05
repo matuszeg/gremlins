@@ -60,6 +60,7 @@ const (
 	paramWorkers            = "workers"
 	paramTimeoutCoefficient = "timeout-coefficient"
 	paramTestSelection      = "test-selection"
+	paramTestSelectionCross = "test-selection-cross-package"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -215,7 +216,8 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 // Integration mode runs the whole module for every mutant by design, so there is
 // nothing for selection to narrow and the map would be paid for nothing.
 func testSelectionRequested() bool {
-	if !configuration.Get[bool](configuration.UnleashTestSelectionKey) {
+	if !configuration.Get[bool](configuration.UnleashTestSelectionKey) &&
+		!configuration.Get[bool](configuration.UnleashTestSelectionCrossKey) {
 		return false
 	}
 	if configuration.Get[bool](configuration.UnleashIntegrationMode) {
@@ -254,7 +256,8 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramWorkers, CfgKey: configuration.UnleashWorkersKey, DefaultV: 0, Usage: "the number of workers to use in mutation testing"},
 		{Name: paramTestCPU, CfgKey: configuration.UnleashTestCPUKey, DefaultV: 0, Usage: "the number of CPUs to allow each test run to use"},
 		{Name: paramTimeoutCoefficient, CfgKey: configuration.UnleashTimeoutCoefficientKey, DefaultV: 0, Usage: "the coefficient by which the timeout is increased"},
-		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests that execute the mutated line, wherever they live"},
+		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests of the mutated package that execute the mutated line"},
+		{Name: paramTestSelectionCross, CfgKey: configuration.UnleashTestSelectionCrossKey, DefaultV: false, Usage: "also run covering tests from other packages (slower; implies --test-selection)"},
 	}
 
 	for _, f := range fls {
