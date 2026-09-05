@@ -173,6 +173,9 @@ func (c *Coverage) profile() (Profile, error) {
 }
 
 func (c *Coverage) profileFrom(path string) (Profile, error) {
+	// The path is the one the caller named on --profile, or the profile Gremlins
+	// just wrote itself. Opening the file the user asked for is the feature.
+	//nolint:gosec // G304: the profile path comes from configuration, not from input
 	cf, err := os.Open(path)
 	defer func(cf *os.File) {
 		_ = cf.Close()
