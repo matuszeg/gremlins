@@ -143,3 +143,48 @@ func TestGetTestFailedStatus(t *testing.T) {
 		})
 	}
 }
+
+func TestTestBinaryTerminatedBySignal(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		output string
+		want   bool
+	}{
+		// This is what `go test` prints when the test binary it spawned was killed
+		// by a signal: the reason on its own line, then the ordinary FAIL summary,
+		// and an exit code of 1 that is indistinguishable from a failing assertion.
+		"go reports the test binary was signalled": {
+			output: "signal: killed\nFAIL\toomtest\t2.991s\nFAIL\n",
+			want:   true,
+		},
+		"a segmentation violation is reported the same way": {
+			output: "signal: segmentation fault\nFAIL\tpkg\t0.004s\nFAIL\n",
+			want:   true,
+		},
+		"an ordinary test failure is not": {
+			output: "--- FAIL: TestSomething (0.00s)\n    a_test.go:9: boom\nFAIL\npkg\t0.005s\nFAIL\n",
+			want:   false,
+		},
+		// A test that prints the words itself has not been signalled: the line only
+		// counts where go puts it, immediately before the FAIL summary.
+		"a test printing the words is not": {
+			output: "signal: this is test output\nok\tpkg\t0.005s\n",
+			want:   false,
+		},
+		"no output at all is not": {
+			output: "",
+			want:   false,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := testBinaryTerminatedBySignal([]byte(tc.output)); got != tc.want {
+				t.Errorf("testBinaryTerminatedBySignal() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
