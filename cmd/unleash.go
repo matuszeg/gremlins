@@ -69,6 +69,7 @@ const (
 	paramTestSelection      = "test-selection"
 	paramCrossPackage       = "cross-package"
 	paramTimeoutMax         = "timeout-max"
+	paramCompileAllowance   = "compile-allowance"
 	paramOnShutdownStatus   = "on-shutdown-status"
 
 	// Thresholds.
@@ -283,6 +284,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests of the mutated package that execute the mutated line"},
 		{Name: paramCrossPackage, CfgKey: configuration.UnleashCrossPackageKey, DefaultV: false, Usage: "also test the mutated package's dependents, so a mutation is judged by what it could break"},
 		{Name: paramTimeoutMax, CfgKey: configuration.UnleashTimeoutMaxKey, DefaultV: "", Usage: "absolute ceiling on a single mutant's test run, as a Go duration (e.g. '15s'); caps the coefficient-derived timeout so a non-terminating mutant cannot exhaust the machine. Empty means no ceiling"},
+		{Name: paramCompileAllowance, CfgKey: configuration.UnleashCompileAllowanceKey, DefaultV: "", Usage: "time a mutant is allowed to COMPILE, as a Go duration (e.g. '2m'), on top of the bound on its test run; the two together form the deadline that also bounds a compile that has hung. Empty uses the default"},
 		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 
