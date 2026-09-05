@@ -205,6 +205,7 @@ Output
 - `v` - NOT VIABLE
 - `s` - SKIPPED
 - `r` - RUNNABLE
+- `e` - ERRORED
 
 ### Diff statuses output
 
