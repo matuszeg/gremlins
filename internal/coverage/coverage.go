@@ -52,6 +52,7 @@ type Coverage struct {
 
 	buildTags       string
 	coverPkg        string
+	cacheDir        string
 	integrationMode bool
 
 	// When profilePath is set, Run parses that pre-computed profile instead
@@ -63,6 +64,17 @@ type Coverage struct {
 
 // Option for the Coverage initialization.
 type Option func(c *Coverage) *Coverage
+
+// WithTestMapCacheDir puts the test map cache somewhere other than the user's
+// cache directory. A CI job that wants the map to survive between runs points
+// this at a directory it restores.
+func WithTestMapCacheDir(dir string) Option {
+	return func(c *Coverage) *Coverage {
+		c.cacheDir = dir
+
+		return c
+	}
+}
 
 type execContext = func(name string, args ...string) *exec.Cmd
 

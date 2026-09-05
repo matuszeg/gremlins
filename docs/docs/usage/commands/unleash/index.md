@@ -470,6 +470,20 @@ trade, and on one where a handful of slow tests dominate it pays for itself many
 gremlins unleash --test-selection
 ```
 
+The map is cached between runs, under `gremlins/testmap` in your user cache directory, keyed per
+module and per checkout. A package is re-mapped only when the build ID of its test binary changes
+— which is Go's own hash over that package's source *and* every dependency's, so editing a package
+three levels down re-maps exactly the binaries that link it and nothing else. On an unchanged tree
+the map costs one compile per package and no test runs at all.
+
+[//]: # (@formatter:off)
+!!! warning
+    The build ID cannot see state outside the build. A test whose coverage depends on a database,
+    a clock, or the network can map differently on two runs of the same binary, and the cache
+    holds that for longer than a single run would. Delete the cache directory to force a full
+    re-map.
+[//]: # (@formatter:on)
+
 [//]: # (@formatter:off)
 !!! warning
     Selection is only ever used where the map is complete. If a package's tests cannot all be
