@@ -17,9 +17,14 @@
 package coverage
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+
+	"github.com/go-gremlins/gremlins/internal/gomodule"
 )
 
 func TestParsePackageList(t *testing.T) {
@@ -132,4 +137,107 @@ func TestTestMapCoverPkg(t *testing.T) {
 			t.Errorf("want ./internal/..., got %s", got)
 		}
 	})
+}
+
+func TestCacheKeyChangesWithWhatItCovers(t *testing.T) {
+	t.Parallel()
+
+	base := cacheKey("./...", "")
+
+	// Both of these change what a profile means, across every package at once:
+	// the coverage scope decides which packages appear in it, and the build tags
+	// decide which files exist at all.
+	if cacheKey("./internal/...", "") == base {
+		t.Error("a different coverage scope must not share a cache")
+	}
+	if cacheKey("./...", "integration") == base {
+		t.Error("different build tags must not share a cache")
+	}
+	if cacheKey("./...", "") != base {
+		t.Error("the same inputs must give the same key")
+	}
+}
+
+func TestLoadCacheIsEmptyRatherThanWrong(t *testing.T) {
+	t.Parallel()
+
+	entry := cachedPackage{BuildID: "id", Tests: map[string]Profile{
+		"TestOne": {"a.go": {{StartLine: 1, StartCol: 2, EndLine: 3, EndCol: 4}}},
+	}}
+
+	t.Run("a cache written with the same key round-trips", func(t *testing.T) {
+		t.Parallel()
+
+		path := filepath.Join(t.TempDir(), "testmap.json")
+		written := &mapCache{Version: cacheVersion, Key: "k", Packages: map[string]cachedPackage{"p": entry}}
+		if err := written.save(path); err != nil {
+			t.Fatalf("save() error: %v", err)
+		}
+
+		if diff := cmp.Diff(written, loadCache(path, "k")); diff != "" {
+			t.Errorf("cache round-trip mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	// Every one of these costs a rebuild, which is what happens without a cache
+	// at all. None of them is worth failing a run for, and none may yield a
+	// half-read map.
+	unusable := map[string]struct {
+		content string
+		key     string
+		write   bool
+	}{
+		"a file that is not there":     {write: false, key: "k"},
+		"a file that is not json":      {write: true, content: "{not json", key: "k"},
+		"a cache from another version": {write: true, content: `{"version":999,"key":"k","packages":{"p":{}}}`, key: "k"},
+		"a cache under another key":    {write: true, content: `{"version":1,"key":"other","packages":{"p":{}}}`, key: "k"},
+		"a cache with no packages map": {write: true, content: `{"version":1,"key":"k"}`, key: "k"},
+	}
+	for name, tc := range unusable {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "testmap.json")
+			if tc.write {
+				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+					t.Fatalf("cannot write the case: %v", err)
+				}
+			}
+
+			got := loadCache(path, tc.key)
+
+			if len(got.Packages) != 0 {
+				t.Errorf("want an empty cache, got %d packages", len(got.Packages))
+			}
+			if got.Version != cacheVersion || got.Key != tc.key {
+				t.Errorf("want a usable empty cache, got version %d key %q", got.Version, got.Key)
+			}
+		})
+	}
+}
+
+func TestCachePathIsOutsideTheModule(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	c := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: "."}}
+
+	path, err := c.cachePath()
+	if err != nil {
+		t.Fatalf("cachePath() error: %v", err)
+	}
+	if !strings.HasPrefix(path, dir) {
+		t.Errorf("want the cache under %s, got %s", dir, path)
+	}
+
+	// Two checkouts of the same module must not share a map: the same code at
+	// two paths can still map differently, and the second would inherit it.
+	other := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: t.TempDir()}}
+	otherPath, err := other.cachePath()
+	if err != nil {
+		t.Fatalf("cachePath() error: %v", err)
+	}
+	if path == otherPath {
+		t.Error("two checkouts of the same module must not share a cache file")
+	}
 }

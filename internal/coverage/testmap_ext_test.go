@@ -47,6 +47,15 @@ const (
 // way `go test` does.
 const pkgDirsEnv = "GREMLINS_TEST_PKG_ROOT"
 
+// buildIDsEnv lets a test decide what `go tool buildid` reports for each
+// package, which is how it controls whether the cache hits.
+const buildIDsEnv = "GREMLINS_TEST_BUILD_IDS"
+
+// invocationLogEnv names a file the helper appends to, so a test can see which
+// commands were actually issued — the only way to tell a cache hit from a
+// rebuild that produced the same answer.
+const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
+
 func fixtureRoot(t *testing.T) string {
 	t.Helper()
 
@@ -68,7 +77,10 @@ func buildMap(t *testing.T, helper string) *coverage.TestMap {
 
 	root := fixtureRoot(t)
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
-	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod)
+	// Every test gets its own cache directory: the real one belongs to whoever
+	// is running the suite, and a shared one would let one test answer another.
+	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
+		coverage.WithTestMapCacheDir(t.TempDir()))
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {
@@ -170,7 +182,8 @@ func TestBuildTestMapFailsWhenThePackagesCannotBeListed(t *testing.T) {
 
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
 	cov := coverage.NewWithCmd(
-		fakeGoCommand("TestTestMapHelperProcessListFailure", fixtureRoot(t)), t.TempDir(), mod)
+		fakeGoCommand("TestTestMapHelperProcessListFailure", fixtureRoot(t)), t.TempDir(), mod,
+		coverage.WithTestMapCacheDir(t.TempDir()))
 
 	if _, err := cov.BuildTestMap(); err == nil {
 		t.Error("expected an error when the packages cannot be listed")
@@ -191,12 +204,21 @@ const (
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
+	return fakeGoCommandWith(helper, pkgRoot, "", "")
+}
+
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
 		// #nosec G204 G702 - We are in tests, we don't care
 		cmd := exec.Command(os.Args[0], cs...)
-		cmd.Env = []string{"GO_TEST_PROCESS=1", pkgDirsEnv + "=" + pkgRoot}
+		cmd.Env = []string{
+			"GO_TEST_PROCESS=1",
+			pkgDirsEnv + "=" + pkgRoot,
+			buildIDsEnv + "=" + buildIDs,
+			invocationLogEnv + "=" + logPath,
+		}
 
 		return cmd
 	}
@@ -245,6 +267,11 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	cmd := command(os.Args)
 	root := os.Getenv(pkgDirsEnv)
 
+	if cmd == "go" && hasFlag(os.Args, "tool") && hasFlag(os.Args, "buildid") {
+		fmt.Fprintln(os.Stdout, buildIDFor(os.Args[len(os.Args)-1]))
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
 	if cmd == "go" && hasFlag(os.Args, "list") {
 		fmt.Fprintf(os.Stdout, "example.com\t%s\t2\t0\n", filepath.Join(root, "root"))
 		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\t1\t0\n", filepath.Join(root, "vm"))
@@ -272,6 +299,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
+	recordInvocation("run " + run)
 	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)
 		os.Exit(1) // skipcq: RVV-A0003
@@ -288,6 +316,35 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// buildIDFor reports the build ID the test chose for the package this binary
+// belongs to, defaulting to one derived from the binary itself so that a test
+// that does not care still gets a stable answer.
+func buildIDFor(binary string) string {
+	for _, pair := range strings.Split(os.Getenv(buildIDsEnv), ",") {
+		pkg, id, ok := strings.Cut(pair, "=")
+		if ok && strings.HasSuffix(binary, binaryName(pkg)) {
+			return id
+		}
+	}
+
+	return "buildid-of-" + filepath.Base(binary)
+}
+
+// recordInvocation appends to the file a test is watching, if it asked for one.
+func recordInvocation(line string) {
+	path := os.Getenv(invocationLogEnv)
+	if path == "" {
+		return
+	}
+	// #nosec G304 G702 G703 - the path comes from the environment this test process was given
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer func() { _ = f.Close() }()
+	fmt.Fprintln(f, line)
 }
 
 // binaryName mirrors the name the builder gives a package's test binary.

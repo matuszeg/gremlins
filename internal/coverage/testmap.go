@@ -154,6 +154,16 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		return nil, err
 	}
 
+	key := cacheKey(c.testMapCoverPkg(), c.buildTags)
+	path, pathErr := c.cachePath()
+	cache := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
+	if pathErr == nil {
+		cache = loadCache(path, key)
+	}
+	// The cache is rebuilt from what this run saw rather than updated in place,
+	// so a package that has gone away does not keep its mapping alive forever.
+	next := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
+
 	tm := &TestMap{
 		profiles: make(map[TestID]Profile),
 		mapped:   make(map[string]struct{}),
@@ -161,7 +171,7 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 
 	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))
 
-	done := 0
+	done, reused := 0, 0
 	for _, pkg := range pkgs {
 		// A package with no test files is mapped by having nothing to map. That
 		// is a complete answer, not a missing one, and saying so lets a mutant
@@ -171,42 +181,76 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 
 			continue
 		}
-		n, ok := c.mapPackage(&pkg, tm)
-		done += n
-		if ok {
+		res := c.mapPackage(&pkg, tm, cache, next)
+		done += res.tests
+		if res.cached {
+			reused += res.tests
+		}
+		if res.mapped {
 			tm.mapped[pkg.importPath] = struct{}{}
 		}
 	}
+	if pathErr == nil {
+		if err := next.save(path); err != nil {
+			log.Errorf("cannot write the test map cache: %v\n", err)
+		}
+	}
 	tm.elapsed = time.Since(start)
-	log.Infof("Mapped %d of %d tests in %s\n", tm.Len(), done, tm.elapsed)
+	log.Infof("Mapped %d of %d tests in %s (%d reused from the cache)\n", tm.Len(), done, tm.elapsed, reused)
 
 	return tm, nil
 }
 
+// mapResult says what became of one package: how many tests it had, whether
+// they came from the cache, and whether the package can be selected from.
+type mapResult struct {
+	tests  int
+	cached bool
+	mapped bool
+}
+
 // mapPackage compiles a package's test binary once and runs each of its tests
-// against it, returning how many tests it attempted and whether every one of
-// them was mapped.
-func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap) (int, bool) {
+// against it, unless the cache already holds a mapping made from a binary with
+// the same build ID.
+func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cache, next *mapCache) mapResult {
 	binary, err := c.compileTests(pkg.importPath)
 	if err != nil {
 		log.Errorf("cannot compile the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
 
-		return 0, false
+		return mapResult{}
 	}
 	pkg.binary = binary
 	defer func() {
 		_ = os.Remove(binary)
 	}()
 
+	// Without an identity for the binary the mapping can neither be trusted
+	// from the cache nor written to it; it is still made, just not remembered.
+	id, err := c.buildID(binary)
+	if err != nil {
+		log.Errorf("cannot identify the test binary of %s, so its mapping will not be cached: %v\n",
+			pkg.importPath, err)
+	}
+	if id != "" {
+		if entry, ok := cache.Packages[pkg.importPath]; ok && entry.BuildID == id {
+			for name, profile := range entry.Tests {
+				tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
+			}
+			next.Packages[pkg.importPath] = entry
+
+			return mapResult{tests: len(entry.Tests), cached: true, mapped: true}
+		}
+	}
+
 	names, err := c.listTests(pkg)
 	if err != nil {
 		log.Errorf("cannot list the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
 
-		return 0, false
+		return mapResult{}
 	}
 
 	complete := true
-	mapped := make(map[TestID]Profile, len(names))
+	mapped := make(map[string]Profile, len(names))
 	for _, name := range names {
 		profile, err := c.profileForTest(pkg, name)
 		if err != nil {
@@ -216,19 +260,23 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap) (int, bool) {
 
 			continue
 		}
-		mapped[TestID{Pkg: pkg.importPath, Name: name}] = profile
+		mapped[name] = profile
 	}
 	// A partial package is discarded rather than kept, so that "the map has no
 	// test here" always means "no test covers this line", never "we did not
-	// look". Selecting from half a package would silently skip the other half.
+	// look". Selecting from half a package would silently skip the other half,
+	// and caching half of it would make that permanent.
 	if !complete {
-		return len(names), false
+		return mapResult{tests: len(names)}
 	}
-	for id, profile := range mapped {
-		tm.profiles[id] = profile
+	for name, profile := range mapped {
+		tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
+	}
+	if id != "" {
+		next.Packages[pkg.importPath] = cachedPackage{BuildID: id, Tests: mapped}
 	}
 
-	return len(names), true
+	return mapResult{tests: len(names), mapped: true}
 }
 
 // wholeModule is the path the map is always built over, even when the run
