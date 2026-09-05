@@ -59,6 +59,7 @@ type MutantExecutorDealer struct {
 	wdDealer          workdir.Dealer
 	execContext       execContext
 	testMap           TestSelector
+	dependents        DependentFinder
 	mod               gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -94,6 +95,26 @@ type TestSelector interface {
 	TestsFor(pos token.Position) []coverage.TestID
 }
 
+// DependentFinder answers which packages depend on a package, through their own
+// code or through their tests.
+//
+// It is what --cross-package needs and all it needs: which packages a mutation
+// could break is a question about imports, answerable statically, with no
+// coverage and no test runs.
+type DependentFinder interface {
+	Dependents(pkg string) []string
+}
+
+// WithDependents turns on cross-package testing: a mutant is tested against the
+// packages that depend on the one it is in, not only that one.
+func WithDependents(d DependentFinder) ExecutorDealerOption {
+	return func(m MutantExecutorDealer) MutantExecutorDealer {
+		m.dependents = d
+
+		return m
+	}
+}
+
 // WithTestSelection turns on test selection: instead of the whole suite of the
 // mutated package, each mutant runs the tests the selector says execute its
 // line, wherever those tests live.
@@ -110,7 +131,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	buildTags := configuration.Get[string](configuration.UnleashTagsKey)
 	dryRun := configuration.Get[bool](configuration.UnleashDryRunKey)
 	integrationMode := configuration.Get[bool](configuration.UnleashIntegrationMode)
-	crossPackage := configuration.Get[bool](configuration.UnleashTestSelectionCrossKey)
+	crossPackage := configuration.Get[bool](configuration.UnleashCrossPackageKey)
 	testCPU := configuration.Get[int](configuration.UnleashTestCPUKey)
 	tCoefficient := configuration.Get[int](configuration.UnleashTimeoutCoefficientKey)
 
@@ -180,6 +201,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		wdDealer:          m.wdDealer,
 		module:            m.mod,
 		testMap:           m.testMap,
+		dependents:        m.dependents,
 		crossPackage:      m.crossPackage,
 		dryRun:            m.dryRun,
 		integrationMode:   m.integrationMode,
@@ -197,6 +219,7 @@ type execContext = func(ctx context.Context, name string, args ...string) *exec.
 type mutantExecutor struct {
 	mutant            mutator.Mutator
 	testMap           TestSelector
+	dependents        DependentFinder
 	wdDealer          workdir.Dealer
 	outCh             chan<- mutator.Mutator
 	wg                *sync.WaitGroup
@@ -275,42 +298,44 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	return m.runTestCommand(ctx, rootDir, m.selectTests(pkg))
 }
 
-// selectTests decides what to run for the mutant.
+// selectTests decides what to run for the mutant, along two independent axes.
 //
-// Package membership is only a guess at which tests could notice a mutation;
-// coverage is the answer. By default the answer is narrowed to the mutated
-// package: those tests were going to be built and their fixtures paid for
-// anyway, so running a subset of them can only be cheaper than running all of
-// them. Measured on Rulewright's backend, that is 24% of the test executions
-// the whole suite would perform.
+// Which PACKAGES: the mutated one, and with --cross-package the packages that
+// depend on it, because those are the ones a mutation can break. That is the
+// gap package scoping leaves — go-gremlins/gremlins#224, a LIVED verdict that
+// was correct for what it measured — and answering it needs nothing but the
+// import graph.
 //
-// Reaching into other packages is a different trade and a different flag. It
-// catches a mutant only another package's tests can kill — go-gremlins#224 —
-// but the packages whose tests reach a mutation are the packages that depend
-// on it, so it pulls in their fixtures too: measured, the same gate went from
-// 15.4 to 22.4 minutes, and the widest selections exhausted a 3GB memory cap.
+// Which TESTS within them: all of them, or with --test-selection only the ones
+// coverage says execute the mutated line. Narrowing inside a package it was
+// already going to build and pay fixtures for cannot cost more than not
+// narrowing; measured on Rulewright's backend it is 24% of the test executions.
 //
-// Every path that cannot give a confident answer returns the mutated package's
-// whole suite, which is the behaviour without selection: never wrong, only slow.
+// The two compose: neither flag is today's behaviour, both together is the
+// narrowest run that still sees the callers.
+//
+// Every path that cannot answer confidently widens rather than narrows, to the
+// whole suites of the packages it settled on: never wrong, only slow.
 func (m *mutantExecutor) selectTests(pkg string) testRun {
-	wholeSuite := testRun{pkgs: []string{pkg}}
+	pkgs := []string{pkg}
+	if m.crossPackage {
+		pkgs = append(pkgs, m.dependents.Dependents(pkg)...)
+	}
+	wholeSuites := testRun{pkgs: pkgs}
 	if m.testMap == nil || m.integrationMode {
-		return wholeSuite
+		return wholeSuites
 	}
 	// A package the map could not see whole might hold the very test that kills
 	// this mutant, and skipping it would turn a killed mutant into a LIVED one.
 	if !m.testMap.Mapped(pkg) {
-		return wholeSuite
+		return wholeSuites
 	}
-	tests := m.testMap.TestsFor(m.mutant.Position())
-	if !m.crossPackage {
-		tests = ownPackage(tests, pkg)
-	}
+	tests := within(m.testMap.TestsFor(m.mutant.Position()), pkgs)
 	if len(tests) == 0 {
 		// An uncovered mutant never reaches here, so an empty answer means the
 		// map is incomplete — coverage is not always deterministic — rather than
 		// that no test exercises the line.
-		return wholeSuite
+		return wholeSuites
 	}
 
 	var sel testRun
@@ -337,11 +362,17 @@ func (m *mutantExecutor) selectTests(pkg string) testRun {
 	return sel
 }
 
-// ownPackage keeps only the tests that live in the mutated package.
-func ownPackage(tests []coverage.TestID, pkg string) []coverage.TestID {
+// within keeps the tests that live in one of the packages being run. Tests
+// outside them are not this run's business: without --cross-package that means
+// the mutated package alone, and with it the packages that depend on it.
+func within(tests []coverage.TestID, pkgs []string) []coverage.TestID {
+	in := make(map[string]struct{}, len(pkgs))
+	for _, p := range pkgs {
+		in[p] = struct{}{}
+	}
 	kept := tests[:0:0]
 	for _, id := range tests {
-		if id.Pkg == pkg {
+		if _, ok := in[id.Pkg]; ok {
 			kept = append(kept, id)
 		}
 	}

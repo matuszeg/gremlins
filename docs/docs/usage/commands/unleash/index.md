@@ -482,31 +482,43 @@ gremlins unleash --test-selection
     about, and in `--integration` mode, where the whole module runs for every mutant by design.
 [//]: # (@formatter:on)
 
-### Test selection across packages
+### Cross package
 
-:material-flag: `--test-selection-cross-package` · :material-sign-direction: Default: `false`
+:material-flag: `--cross-package` · :material-sign-direction: Default: `false`
 
-Implies `--test-selection`, and widens it: a mutant is also run against covering tests in *other*
-packages. That catches a mutant only another package's tests can kill, which package scoping
-reports as a surviving mutant your suite does in fact catch — the drawback described under
-[integration mode](#integration-mode), and the shape of
-[go-gremlins/gremlins#224](https://github.com/go-gremlins/gremlins/issues/224).
+Tests a mutant against the packages that **depend on** the one it is in, not only that one. A
+mutation can only break a package that uses the mutated code, so those are the packages worth
+running — and package scoping never runs them, which is how a mutant your suite does catch gets
+reported as surviving. That is
+[go-gremlins/gremlins#224](https://github.com/go-gremlins/gremlins/issues/224), where a
+maintainer filed a bug against a `LIVED` verdict that was correct for what it had measured.
 
-It is off by default because it is expensive, and expensive for a structural reason. A test can
-only execute the mutated line if its package depends on the mutated package, so the packages this
-reaches into are exactly the packages the mutation invalidates: each one is recompiled, and each
-one pays its own test fixtures. Measured on the same module, the mutant phase went from 15.4 to
-22.4 minutes, and the widest selections exhausted a 3 GB memory cap.
+It needs no coverage map and no mapping phase. Which packages a change could break is a question
+about imports, and one `go list` answers it — including packages whose *tests* import the mutated
+one, which exercise it even when their own code does not.
 
 ```shell
-gremlins unleash --test-selection-cross-package
+gremlins unleash --cross-package
 ```
 
-[//]: # (@formatter:off)
-!!! tip
-    Turn this on when a `LIVED` verdict looks wrong — when you believe a test elsewhere in the
-    module does catch the mutant. Leave it off for routine runs.
-[//]: # (@formatter:on)
+It is off by default because it is not free: the packages it adds are recompiled by the mutation,
+and each pays its own test fixtures. On a module of 450 mutants the mutant phase went from 15.4 to
+22.4 minutes, and the widest runs exhausted a 3 GB memory cap.
+
+### Combining the two
+
+The flags are independent and compose:
+
+| flags | what runs for a mutant in P |
+|---|---|
+| neither | P's whole test suite |
+| `--test-selection` | P's covering tests |
+| `--cross-package` | whole suites of P and of every package that depends on P |
+| both | covering tests in P and in P's dependents |
+
+`--test-selection` alone maps only the packages being mutated, and records each test against its
+own package's code. Adding `--cross-package` widens the map to the whole module, because a test
+that kills the mutant may be anywhere — which is what makes that combination the expensive one.
 
 ### Threshold efficacy
 

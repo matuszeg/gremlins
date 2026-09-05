@@ -53,6 +53,7 @@ type Coverage struct {
 	buildTags       string
 	coverPkg        string
 	cacheDir        string
+	crossPackage    bool
 	integrationMode bool
 
 	// When profilePath is set, Run parses that pre-computed profile instead
@@ -89,6 +90,7 @@ func NewWithCmd(cmdContext execContext, workdir string, mod gomodule.GoModule, o
 	buildTags := configuration.Get[string](configuration.UnleashTagsKey)
 	coverPkg := configuration.Get[string](configuration.UnleashCoverPkgKey)
 	integrationMode := configuration.Get[bool](configuration.UnleashIntegrationMode)
+	crossPackage := configuration.Get[bool](configuration.UnleashCrossPackageKey)
 	profilePath := configuration.Get[string](configuration.UnleashCoverageProfileKey)
 	profileElapsed := configuration.Get[string](configuration.UnleashCoverageElapsedKey)
 
@@ -100,6 +102,7 @@ func NewWithCmd(cmdContext execContext, workdir string, mod gomodule.GoModule, o
 		mod:             mod,
 		buildTags:       buildTags,
 		coverPkg:        coverPkg,
+		crossPackage:    crossPackage,
 		integrationMode: integrationMode,
 		profilePath:     profilePath,
 		profileElapsed:  profileElapsed,
@@ -240,6 +243,12 @@ func (c *Coverage) executeCoverage() (time.Duration, error) {
 	}
 
 	return time.Since(start), nil
+}
+
+// ScanPath is the package pattern this run covers: the whole module, or the
+// subtree the caller scoped it to.
+func (c *Coverage) ScanPath() string {
+	return c.scanPath()
 }
 
 func (c *Coverage) scanPath() string {

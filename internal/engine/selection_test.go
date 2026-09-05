@@ -92,13 +92,18 @@ func runCrossPackage(t *testing.T, sel engine.TestSelector) (*commandsHolder, mu
 	return runWith(t, sel, false, true)
 }
 
+// dependentsStub stands in for the import graph.
+type dependentsStub map[string][]string
+
+func (d dependentsStub) Dependents(pkg string) []string { return d[pkg] }
+
 func runWith(t *testing.T, sel engine.TestSelector, intMode, crossPkg bool) (*commandsHolder, mutator.Mutator) {
 	t.Helper()
 
 	viperSet(map[string]any{
-		configuration.UnleashDryRunKey:             false,
-		configuration.UnleashIntegrationMode:       intMode,
-		configuration.UnleashTestSelectionCrossKey: crossPkg,
+		configuration.UnleashDryRunKey:       false,
+		configuration.UnleashIntegrationMode: intMode,
+		configuration.UnleashCrossPackageKey: crossPkg,
 	})
 	t.Cleanup(viperReset)
 
@@ -107,6 +112,11 @@ func runWith(t *testing.T, sel engine.TestSelector, intMode, crossPkg bool) (*co
 	opts := []engine.ExecutorDealerOption{engine.WithExecContext(recordingExec(holder))}
 	if sel != nil {
 		opts = append(opts, engine.WithTestSelection(sel))
+	}
+	if crossPkg {
+		opts = append(opts, engine.WithDependents(dependentsStub{
+			"example.com/vm": {"example.com"},
+		}))
 	}
 	mjd := engine.NewExecutorDealer(mod, newWdDealerStub(t), expectedTimeout, opts...)
 	mut := &mutantStub{
@@ -247,6 +257,23 @@ func TestSelectionFallsBackWhenOnlyOtherPackagesCover(t *testing.T) {
 	}
 	if got := mut.TestsRun(); len(got) != 0 {
 		t.Errorf("want no recorded tests when the whole suite ran, got %v", got)
+	}
+}
+
+// --cross-package on its own needs no coverage map at all: which packages a
+// mutation could break is a question about imports, so it runs their whole
+// suites and asks nothing about which tests reach the line.
+func TestCrossPackageWithoutSelectionRunsWholeSuitesOfTheDependents(t *testing.T) {
+	holder, mut := runCrossPackage(t, nil)
+
+	want := []string{
+		"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm example.com",
+	}
+	if diff := cmp.Diff(want, holder.commands()); diff != "" {
+		t.Errorf("commands mismatch (-want +got):\n%s", diff)
+	}
+	if got := mut.TestsRun(); len(got) != 0 {
+		t.Errorf("want no recorded tests when whole suites ran, got %v", got)
 	}
 }
 

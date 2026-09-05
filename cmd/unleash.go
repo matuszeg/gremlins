@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/go-gremlins/gremlins/cmd/internal/flags"
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
+	"github.com/go-gremlins/gremlins/internal/deps"
 	"github.com/go-gremlins/gremlins/internal/diff"
 	"github.com/go-gremlins/gremlins/internal/engine"
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
@@ -65,7 +67,7 @@ const (
 	paramTimeoutCoefficient = "timeout-coefficient"
 	paramTimeoutMin         = "timeout-min"
 	paramTestSelection      = "test-selection"
-	paramTestSelectionCross = "test-selection-cross-package"
+	paramCrossPackage       = "cross-package"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -185,17 +187,30 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 
 	covered := cProfile.Profile
 	var opts []engine.ExecutorDealerOption
+
+	// Which packages a mutation could break is a question about imports, so it
+	// costs one `go list` and no test runs at all.
+	if configuration.Get[bool](configuration.UnleashCrossPackageKey) {
+		graph, err := deps.New(exec.Command, c.ScanPath())
+		if err != nil {
+			return report.Results{}, fmt.Errorf("failed to resolve the module's dependents: %w", err)
+		}
+		opts = append(opts, engine.WithDependents(graph))
+	}
+
+	// Which tests within those packages execute the mutated line is a question
+	// about coverage, and that is the expensive one.
 	if testSelectionRequested() {
 		testMap, err := c.BuildTestMap()
 		if err != nil {
 			return report.Results{}, fmt.Errorf("failed to map tests to the code they execute: %w", err)
 		}
 		opts = append(opts, engine.WithTestSelection(testMap))
-		// The map is gathered across the whole module, so it sees a line executed
-		// only by another package's tests — which a plain coverage run attributes
-		// to nobody, leaving the mutants on it untested. Widen the profile with
-		// it rather than replacing it: a package the map could not see whole is
-		// missing from the union, and its mutants must stay runnable.
+		// The map sees a line executed only by another package's tests, which a
+		// plain coverage run attributes to nobody, leaving the mutants on it
+		// untested. Widen the profile with it rather than replacing it: a
+		// package the map could not see whole is missing from the union, and its
+		// mutants must stay runnable.
 		covered = coverage.Merge(cProfile.Profile, testMap.Union())
 	}
 
@@ -221,8 +236,7 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 // Integration mode runs the whole module for every mutant by design, so there is
 // nothing for selection to narrow and the map would be paid for nothing.
 func testSelectionRequested() bool {
-	if !configuration.Get[bool](configuration.UnleashTestSelectionKey) &&
-		!configuration.Get[bool](configuration.UnleashTestSelectionCrossKey) {
+	if !configuration.Get[bool](configuration.UnleashTestSelectionKey) {
 		return false
 	}
 	if configuration.Get[bool](configuration.UnleashIntegrationMode) {
@@ -265,7 +279,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramTimeoutCoefficient, CfgKey: configuration.UnleashTimeoutCoefficientKey, DefaultV: 0, Usage: "the coefficient by which the timeout is increased"},
 		{Name: paramTimeoutMin, CfgKey: configuration.UnleashTimeoutMinKey, DefaultV: time.Duration(0), Usage: "the floor under each mutant's timeout, regardless of how fast the test suite is"},
 		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests of the mutated package that execute the mutated line"},
-		{Name: paramTestSelectionCross, CfgKey: configuration.UnleashTestSelectionCrossKey, DefaultV: false, Usage: "also run covering tests from other packages (slower; implies --test-selection)"},
+		{Name: paramCrossPackage, CfgKey: configuration.UnleashCrossPackageKey, DefaultV: false, Usage: "also test the mutated package's dependents, so a mutation is judged by what it could break"},
 	}
 
 	for _, f := range fls {
