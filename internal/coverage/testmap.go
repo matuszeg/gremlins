@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,18 +124,32 @@ const listPattern = "^(Test|Example|Fuzz)"
 
 var testNameRe = regexp.MustCompile(`^(?:Test|Example|Fuzz)[\p{L}\p{N}_]*$`)
 
+// testPackage is a package of the module as the map builder sees it: where its
+// source lives, and the test binary compiled for it.
+type testPackage struct {
+	importPath string
+	dir        string
+	hasTests   bool
+	binary     string
+}
+
 // BuildTestMap runs every test in the module on its own and records what each
 // one executed.
 //
-// It costs one process per test, paid once before any mutant runs. A package
-// whose tests cannot be mapped is left out of the map rather than half-recorded,
-// so that callers can tell "this test covers nothing here" from "we do not
-// know".
+// The work is per package rather than per test: the test binary is compiled
+// once with coverage over the module, then run once per test. Going through
+// `go test` for each test instead costs a full go invocation every time —
+// measured at ~400ms against ~8ms for a run of the compiled binary, so the
+// invocation, not the test, was most of the map.
+//
+// A package whose tests cannot all be mapped is left out of the map rather than
+// half-recorded, so that callers can tell "no test covers this" from "we did
+// not look".
 func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	start := time.Now()
 	_ = os.Chdir(c.mod.Root)
 
-	perPkg, err := c.listTests()
+	pkgs, err := c.listPackages()
 	if err != nil {
 		return nil, err
 	}
@@ -144,38 +159,23 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		mapped:   make(map[string]struct{}),
 	}
 
-	total := 0
-	for _, names := range perPkg {
-		total += len(names)
-	}
-	log.Infof("Mapping %d tests to the code they execute...\n", total)
+	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))
 
 	done := 0
-	for _, pkg := range sortedPackages(perPkg) {
-		complete := true
-		mapped := make(map[TestID]Profile, len(perPkg[pkg]))
-		for _, name := range perPkg[pkg] {
-			done++
-			profile, err := c.profileForTest(pkg, name)
-			if err != nil {
-				log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n", pkg, name, pkg, err)
-				complete = false
+	for _, pkg := range pkgs {
+		// A package with no test files is mapped by having nothing to map. That
+		// is a complete answer, not a missing one, and saying so lets a mutant
+		// there still be judged by covering tests in other packages.
+		if !pkg.hasTests {
+			tm.mapped[pkg.importPath] = struct{}{}
 
-				continue
-			}
-			mapped[TestID{Pkg: pkg, Name: name}] = profile
-		}
-		// A partial package is discarded rather than kept, so that "the map has
-		// no test here" always means "no test covers this line", never "we did
-		// not look". Selecting from half a package would silently skip the other
-		// half; Mapped now answers for the whole of it.
-		if !complete {
 			continue
 		}
-		for id, profile := range mapped {
-			tm.profiles[id] = profile
+		n, ok := c.mapPackage(&pkg, tm)
+		done += n
+		if ok {
+			tm.mapped[pkg.importPath] = struct{}{}
 		}
-		tm.mapped[pkg] = struct{}{}
 	}
 	tm.elapsed = time.Since(start)
 	log.Infof("Mapped %d of %d tests in %s\n", tm.Len(), done, tm.elapsed)
@@ -183,14 +183,52 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	return tm, nil
 }
 
-func sortedPackages(perPkg map[string][]string) []string {
-	pkgs := make([]string, 0, len(perPkg))
-	for pkg := range perPkg {
-		pkgs = append(pkgs, pkg)
-	}
-	sort.Strings(pkgs)
+// mapPackage compiles a package's test binary once and runs each of its tests
+// against it, returning how many tests it attempted and whether every one of
+// them was mapped.
+func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap) (int, bool) {
+	binary, err := c.compileTests(pkg.importPath)
+	if err != nil {
+		log.Errorf("cannot compile the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
 
-	return pkgs
+		return 0, false
+	}
+	pkg.binary = binary
+	defer func() {
+		_ = os.Remove(binary)
+	}()
+
+	names, err := c.listTests(pkg)
+	if err != nil {
+		log.Errorf("cannot list the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
+
+		return 0, false
+	}
+
+	complete := true
+	mapped := make(map[TestID]Profile, len(names))
+	for _, name := range names {
+		profile, err := c.profileForTest(pkg, name)
+		if err != nil {
+			log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n",
+				pkg.importPath, name, pkg.importPath, err)
+			complete = false
+
+			continue
+		}
+		mapped[TestID{Pkg: pkg.importPath, Name: name}] = profile
+	}
+	// A partial package is discarded rather than kept, so that "the map has no
+	// test here" always means "no test covers this line", never "we did not
+	// look". Selecting from half a package would silently skip the other half.
+	if !complete {
+		return len(names), false
+	}
+	for id, profile := range mapped {
+		tm.profiles[id] = profile
+	}
+
+	return len(names), true
 }
 
 // wholeModule is the path the map is always built over, even when the run
@@ -199,75 +237,115 @@ func sortedPackages(perPkg map[string][]string) []string {
 // listing narrowed to the scanned path could not see them.
 const wholeModule = "./..."
 
-func (c *Coverage) listArgs() []string {
-	args := []string{"test", "-list", listPattern}
-	if c.buildTags != "" {
-		args = append(args, "-tags", c.buildTags)
-	}
+// goListFormat asks for what the builder needs about every package: where it
+// is, and whether it has tests of either kind.
+const goListFormat = `{{.ImportPath}}	{{.Dir}}	{{len .TestGoFiles}}	{{len .XTestGoFiles}}`
 
-	return append(args, wholeModule)
-}
-
-func (c *Coverage) listTests() (map[string][]string, error) {
-	out, err := c.cmdContext("go", c.listArgs()...).CombinedOutput()
+func (c *Coverage) listPackages() ([]testPackage, error) {
+	out, err := c.cmdContext("go", "list", "-f", goListFormat, wholeModule).CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("impossible to list the tests of the module: %w\n%s", err, out)
+		return nil, fmt.Errorf("impossible to list the packages of the module: %w\n%s", err, out)
 	}
 
-	return parseTestList(string(out)), nil
+	return parsePackageList(string(out)), nil
 }
 
-// parseTestList reads the output of `go test -list`, which prints the matching
-// names of a package and then that package's summary line. The summary is what
-// says which package the names above it belong to.
-func parseTestList(out string) map[string][]string {
-	perPkg := make(map[string][]string)
-	var pending []string
+// parsePackageList reads the tab-separated output of `go list -f goListFormat`.
+// Anything that does not have the expected shape is skipped rather than
+// guessed at: go writes build diagnostics to the same stream.
+func parsePackageList(out string) []testPackage {
+	var pkgs []testPackage
 	for _, line := range strings.Split(out, "\n") {
-		if testNameRe.MatchString(line) {
-			pending = append(pending, line)
-
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 {
 			continue
 		}
-		pkg, ok := packageOfSummaryLine(line)
-		if !ok {
+		internal, err := strconv.Atoi(fields[2])
+		if err != nil {
 			continue
 		}
-		if len(pending) > 0 {
-			perPkg[pkg] = pending
-			pending = nil
+		external, err := strconv.Atoi(fields[3])
+		if err != nil {
+			continue
 		}
+		pkgs = append(pkgs, testPackage{
+			importPath: fields[0],
+			dir:        fields[1],
+			hasTests:   internal+external > 0,
+		})
 	}
+	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].importPath < pkgs[j].importPath })
 
-	return perPkg
+	return pkgs
 }
 
-func packageOfSummaryLine(line string) (string, bool) {
-	fields := strings.Split(line, "\t")
-	if len(fields) < 2 {
-		return "", false
-	}
-	switch strings.TrimSpace(fields[0]) {
-	case "ok", "FAIL", "?":
-		return strings.TrimSpace(fields[1]), true
-	default:
-		return "", false
-	}
-}
-
-func (c *Coverage) profileForTest(pkg, name string) (Profile, error) {
-	file := filepath.Join(c.workDir, "testmap.cov")
-	args := []string{"test", "-count=1"}
+// compileTests builds the package's test binary once, instrumented for coverage
+// over the whole module. Every test of the package then runs against this one
+// binary.
+func (c *Coverage) compileTests(importPath string) (string, error) {
+	binary := filepath.Join(c.workDir, strings.NewReplacer("/", "_", ".", "_").Replace(importPath)+".test")
+	args := []string{"test", "-c", "-o", binary}
 	if c.buildTags != "" {
 		args = append(args, "-tags", c.buildTags)
 	}
-	args = append(args,
-		"-run", "^"+regexp.QuoteMeta(name)+"$",
-		"-coverpkg", c.testMapCoverPkg(),
-		"-cover", "-coverprofile", file,
-		pkg)
+	args = append(args, "-coverpkg", c.testMapCoverPkg(), importPath)
 
 	if out, err := c.cmdContext("go", args...).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("%w\n%s", err, out)
+	}
+
+	return binary, nil
+}
+
+// listTests asks the compiled binary which tests it holds, which is the same
+// set `go test` would run and costs nothing extra to ask.
+func (c *Coverage) listTests(pkg *testPackage) ([]string, error) {
+	cmd := c.cmdContext(pkg.binary, "-test.list", listPattern)
+	cmd.Dir = pkg.dir
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%w\n%s", err, out)
+	}
+
+	return parseTestNames(string(out)), nil
+}
+
+// parseTestNames keeps the lines of `-test.list` output that are test names.
+// The binary also writes diagnostics there — "warning: GOCOVERDIR not set" for
+// one — and none of them can be mistaken for a name.
+func parseTestNames(out string) []string {
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		if testNameRe.MatchString(line) {
+			names = append(names, line)
+		}
+	}
+
+	return names
+}
+
+// testTimeout matches the default `go test` applies, so that a test hanging
+// during mapping fails the way it would have anyway rather than never
+// returning.
+const testTimeout = 10 * time.Minute
+
+func (c *Coverage) profileForTest(pkg *testPackage, name string) (Profile, error) {
+	// The binary runs in the package directory, as `go test` runs it, so a test
+	// reading testdata still finds it. That makes the profile path have to be
+	// absolute.
+	file, err := filepath.Abs(filepath.Join(c.workDir, "testmap.cov"))
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := c.cmdContext(pkg.binary,
+		"-test.run", "^"+regexp.QuoteMeta(name)+"$",
+		"-test.timeout", testTimeout.String(),
+		"-test.coverprofile", file)
+	cmd.Dir = pkg.dir
+
+	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("%w\n%s", err, out)
 	}
 
