@@ -20,6 +20,7 @@ import (
 	"go/ast"
 	"go/token"
 	"strings"
+	"unicode"
 
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
@@ -147,7 +148,27 @@ func buildDirectiveIndex(set *token.FileSet, file *ast.File) *directiveIndex {
 // types unknown).
 func parseDirective(set *token.FileSet, c *ast.Comment) (directiveScope, bool) {
 	text := strings.TrimSpace(c.Text)
+
+	// Both forms admit a trailing free-text reason, separated from the
+	// directive by whitespace: `//nomutant why this is equivalent` and
+	// `//nomutant:conditionals-negation why this is equivalent`.
+	//
+	// Requiring the comment to be EXACTLY the directive made the natural
+	// thing to write — a directive plus the reason for it — silently void
+	// the suppression. The bare form fell through the equality check and
+	// was not recognized as a directive at all; the typed form parsed the
+	// whole remainder as one comma-separated type list, so the reason
+	// became a bogus type name and every type was dropped. Documentation
+	// that tells authors to justify a suppression therefore steered them
+	// into the one spelling that does not work.
 	if text == directivePrefix {
+		return directiveScope{all: true}, true
+	}
+	if rest, ok := cutDirectiveWord(text, directivePrefix); ok {
+		// Bare directive followed by a reason. A ":" here would have been
+		// caught by the typed branch below, so `rest` is pure prose.
+		_ = rest
+
 		return directiveScope{all: true}, true
 	}
 	if !strings.HasPrefix(text, directivePrefix+":") {
@@ -161,8 +182,11 @@ func parseDirective(set *token.FileSet, c *ast.Comment) (directiveScope, bool) {
 
 		return directiveScope{}, false
 	}
+
+	typeList, _ := splitTypeListAndReason(rest)
+
 	types := map[mutator.Type]struct{}{}
-	for _, name := range strings.Split(rest, ",") {
+	for _, name := range strings.Split(typeList, ",") {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
@@ -180,6 +204,56 @@ func parseDirective(set *token.FileSet, c *ast.Comment) (directiveScope, bool) {
 	}
 
 	return directiveScope{types: types}, true
+}
+
+// cutDirectiveWord reports whether text begins with the whole word prefix
+// followed by whitespace, returning what follows. It is word-aware so that
+// an unrelated comment such as "//nomutantsomething" is not mistaken for a
+// directive with a reason.
+func cutDirectiveWord(text, prefix string) (string, bool) {
+	if !strings.HasPrefix(text, prefix) {
+		return "", false
+	}
+	rest := text[len(prefix):]
+	if rest == "" {
+		return "", false
+	}
+	if !unicode.IsSpace(rune(rest[0])) {
+		return "", false
+	}
+
+	return strings.TrimSpace(rest), true
+}
+
+// splitTypeListAndReason separates the comma-separated mutator-type list
+// from an optional trailing reason. The list ends at the first whitespace
+// that is not inside the separator run between two types, so both
+// "a-b,c-d reason" and "a-b, c-d reason" yield the list "a-b, c-d".
+//
+// A reason is free text and may contain commas, so the split must happen
+// before the comma split rather than after it.
+func splitTypeListAndReason(rest string) (string, string) {
+	for i := 0; i < len(rest); i++ {
+		if !unicode.IsSpace(rune(rest[i])) {
+			continue
+		}
+		// Whitespace continues the list only when the next non-space rune
+		// resumes it — i.e. we are sitting on the space in "a, b" (the
+		// comma already consumed) or on the space before a comma in "a ,b".
+		j := i
+		for j < len(rest) && unicode.IsSpace(rune(rest[j])) {
+			j++
+		}
+		prevComma := strings.HasSuffix(strings.TrimRight(rest[:i], " \t"), ",")
+		nextComma := j < len(rest) && rest[j] == ','
+		if prevComma || nextComma {
+			continue
+		}
+
+		return strings.TrimSpace(rest[:i]), strings.TrimSpace(rest[j:])
+	}
+
+	return strings.TrimSpace(rest), ""
 }
 
 // mutatorTypeByConfigKey maps a config-style mutator key (e.g.
@@ -203,14 +277,12 @@ func configKeyForType(mt mutator.Type) string {
 
 // collectTokenLines returns the set of source lines that contain at least
 // one non-comment AST node, used to distinguish end-of-line directives from
-// own-line ones.
+// own-line ones. Returning false on *ast.CommentGroup stops the walk before
+// it reaches the *ast.Comment children, so no Comment guard is needed.
 func collectTokenLines(set *token.FileSet, file *ast.File) map[int]bool {
 	lines := map[int]bool{}
 	ast.Inspect(file, func(n ast.Node) bool {
 		if n == nil {
-			return false
-		}
-		if _, isComment := n.(*ast.Comment); isComment {
 			return false
 		}
 		if _, isCG := n.(*ast.CommentGroup); isCG {
@@ -262,9 +334,6 @@ func largestNodeStartingAtLine(set *token.FileSet, file *ast.File, line int) (as
 			return false
 		}
 		if _, isCG := n.(*ast.CommentGroup); isCG {
-			return false
-		}
-		if _, isC := n.(*ast.Comment); isC {
 			return false
 		}
 		if set.Position(n.Pos()).Line != line {

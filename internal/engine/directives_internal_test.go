@@ -245,6 +245,46 @@ func F() int {
 	}
 }
 
+func TestDirectiveIndex_NilReceiverIsSafe(t *testing.T) {
+	t.Parallel()
+
+	// A nil index must answer "not suppressed" without panicking. The
+	// engine relies on this so it can call isSuppressed unconditionally
+	// even when no index has been built (currently never happens, but
+	// the guard is cheap and protects future call sites).
+	var idx *directiveIndex
+	if idx.isSuppressed(token.Position{Line: 1}, mutator.ArithmeticBase) {
+		t.Errorf("nil directiveIndex must return false from isSuppressed")
+	}
+}
+
+func TestBuildDirectiveIndex_TypedFilterWithEmptyEntries(t *testing.T) {
+	t.Parallel()
+
+	// Doubled commas / leading commas leave empty strings in the comma-
+	// split type list. Each empty entry should be skipped silently and
+	// the surrounding valid types still parsed.
+	src := `package p
+
+func F() int {
+	return 1 + 2 //nomutant:arithmetic-base,,invert-bitwise
+}
+`
+	set, file := parseSrc(t, src)
+	idx := buildDirectiveIndex(set, file)
+
+	pos := positionOf(t, set, src, "+")
+	if !idx.isSuppressed(pos, mutator.ArithmeticBase) {
+		t.Errorf("expected ArithmeticBase to be suppressed (valid type before doubled comma)")
+	}
+	if !idx.isSuppressed(pos, mutator.InvertBitwise) {
+		t.Errorf("expected InvertBitwise to be suppressed (valid type after doubled comma)")
+	}
+	if idx.isSuppressed(pos, mutator.ConditionalsBoundary) {
+		t.Errorf("did NOT expect ConditionalsBoundary to be suppressed (not in filter)")
+	}
+}
+
 func TestBuildDirectiveIndex_NestedBlocks_Additive(t *testing.T) {
 	t.Parallel()
 
@@ -341,4 +381,130 @@ func positionOfNth(t *testing.T, set *token.FileSet, src, needle string, n int) 
 	})
 
 	return pos
+}
+
+// TestParseDirective_TrailingReason covers the regression that motivated
+// admitting a reason: requiring the comment to be EXACTLY the directive made
+// the natural thing to write — a suppression plus its justification —
+// silently void the suppression.
+//
+// The two failures had different shapes and neither was visible to an author.
+// The bare form fell through an equality check and was not recognized as a
+// directive at all, so nothing was logged. The typed form parsed the whole
+// remainder as one comma-separated type list, so the reason became a bogus
+// type name; that logged "ignoring unknown mutator type", but the message is
+// easy to lose in a run of a thousand mutants and the mutant simply LIVED.
+func TestParseDirective_TrailingReason(t *testing.T) {
+	cases := []struct {
+		name    string
+		comment string
+		wantAll bool
+		want    []mutator.Type
+	}{
+		{
+			name:    "bare, no reason",
+			comment: "//nomutant",
+			wantAll: true,
+		},
+		{
+			name:    "bare with reason",
+			comment: "//nomutant equivalent mutant: the branch cannot be reached",
+			wantAll: true,
+		},
+		{
+			name:    "bare with punctuated reason",
+			comment: "//nomutant — equivalent mutant, cleanup is a no-op",
+			wantAll: true,
+		},
+		{
+			name:    "typed, no reason",
+			comment: "//nomutant:conditionals-negation",
+			want:    []mutator.Type{mutator.ConditionalsNegation},
+		},
+		{
+			name:    "typed with reason",
+			comment: "//nomutant:conditionals-negation inverting this loops forever",
+			want:    []mutator.Type{mutator.ConditionalsNegation},
+		},
+		{
+			name:    "typed with reason containing commas",
+			comment: "//nomutant:conditionals-negation a reason with, several, commas",
+			want:    []mutator.Type{mutator.ConditionalsNegation},
+		},
+		{
+			name:    "multi-type, no reason",
+			comment: "//nomutant:conditionals-negation,arithmetic-base",
+			want:    []mutator.Type{mutator.ConditionalsNegation, mutator.ArithmeticBase},
+		},
+		{
+			name:    "multi-type with spaces and a reason",
+			comment: "//nomutant:conditionals-negation, arithmetic-base both are equivalent",
+			want:    []mutator.Type{mutator.ConditionalsNegation, mutator.ArithmeticBase},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set, file := parseSrc(t, "package p\n\nvar x = 1 "+tc.comment+"\n")
+			var c *ast.Comment
+			for _, cg := range file.Comments {
+				for _, cc := range cg.List {
+					if strings.HasPrefix(cc.Text, "//nomutant") {
+						c = cc
+					}
+				}
+			}
+			if c == nil {
+				t.Fatal("no directive comment parsed out of the source")
+			}
+			scope, ok := parseDirective(set, c)
+			if !ok {
+				t.Fatalf("parseDirective returned ok=false for %q", tc.comment)
+			}
+			if tc.wantAll {
+				if !scope.all {
+					t.Errorf("scope.all = false, want true for %q", tc.comment)
+				}
+
+				return
+			}
+			if scope.all {
+				t.Fatalf("scope.all = true, want a typed scope for %q", tc.comment)
+			}
+			if len(scope.types) != len(tc.want) {
+				t.Fatalf("got %d types, want %d for %q", len(scope.types), len(tc.want), tc.comment)
+			}
+			for _, mt := range tc.want {
+				if _, found := scope.types[mt]; !found {
+					t.Errorf("type %v missing for %q", mt, tc.comment)
+				}
+			}
+		})
+	}
+}
+
+// TestParseDirective_NotADirective guards the other direction: admitting a
+// trailing reason must not turn every comment that merely starts with the
+// prefix into a suppression.
+func TestParseDirective_NotADirective(t *testing.T) {
+	for _, comment := range []string{
+		"// nomutant with a leading space is prose",
+		"//nomutantsomething",
+		"//nomutants are not a thing",
+		"// this comment mentions //nomutant in passing",
+	} {
+		set, file := parseSrc(t, "package p\n\nvar x = 1 "+comment+"\n")
+		var c *ast.Comment
+		for _, cg := range file.Comments {
+			for _, cc := range cg.List {
+				c = cc
+			}
+		}
+		if c == nil {
+			t.Fatalf("no comment parsed for %q", comment)
+		}
+		if _, ok := parseDirective(set, c); ok {
+			t.Errorf("parseDirective accepted %q as a directive", comment)
+		}
+	}
 }
