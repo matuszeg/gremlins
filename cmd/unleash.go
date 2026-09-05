@@ -68,6 +68,7 @@ const (
 	paramTimeoutMin         = "timeout-min"
 	paramTestSelection      = "test-selection"
 	paramCrossPackage       = "cross-package"
+	paramOnShutdownStatus   = "on-shutdown-status"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -280,6 +281,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramTimeoutMin, CfgKey: configuration.UnleashTimeoutMinKey, DefaultV: time.Duration(0), Usage: "the floor under each mutant's timeout, regardless of how fast the test suite is"},
 		{Name: paramTestSelection, CfgKey: configuration.UnleashTestSelectionKey, DefaultV: false, Usage: "run only the tests of the mutated package that execute the mutated line"},
 		{Name: paramCrossPackage, CfgKey: configuration.UnleashCrossPackageKey, DefaultV: false, Usage: "also test the mutated package's dependents, so a mutation is judged by what it could break"},
+		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 
 	for _, f := range fls {

@@ -60,6 +60,7 @@ type MutantExecutorDealer struct {
 	execContext       execContext
 	testMap           TestSelector
 	dependents        DependentFinder
+	runCtx            context.Context
 	mod               gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -67,6 +68,14 @@ type MutantExecutorDealer struct {
 	integrationMode   bool
 	crossPackage      bool
 	testCPU           int
+}
+
+// SetRunCtx wires the engine's root context into the dealer so that each
+// mutantExecutor it produces can observe cancellation (e.g. SIGTERM from
+// a CI runner) and mark in-flight mutants accordingly instead of falling
+// through to the default mutator.Lived branch.
+func (m *MutantExecutorDealer) SetRunCtx(ctx context.Context) {
+	m.runCtx = ctx
 }
 
 // ExecutorDealerOption is the defining option for the initialisation of a ExecutorDealer.
@@ -194,6 +203,10 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 // will stream the results of the executor, and the wait group will be done when the
 // executor is complete.
 func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor {
+	runCtx := m.runCtx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	mj := mutantExecutor{
 		mutant:            mut,
 		outCh:             outCh,
@@ -209,6 +222,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		execContext:       m.execContext,
 		testCPU:           m.testCPU,
 		testExecutionTime: m.testExecutionTime,
+		runCtx:            runCtx,
 	}
 
 	return &mj
@@ -224,6 +238,7 @@ type mutantExecutor struct {
 	outCh             chan<- mutator.Mutator
 	wg                *sync.WaitGroup
 	execContext       execContext
+	runCtx            context.Context
 	module            gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -292,7 +307,11 @@ type testRun struct {
 }
 
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
-	ctx, cancel := context.WithTimeout(context.Background(), m.testExecutionTime)
+	// Root the test ctx in the engine's runCtx so that an external
+	// cancellation (e.g. SIGTERM from a CI runner) propagates into the
+	// `go test` subprocess and we can distinguish "the runner is shutting
+	// us down" from "the test ran past its deadline".
+	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime)
 	defer cancel()
 
 	return m.runTestCommand(ctx, rootDir, m.selectTests(pkg))
@@ -417,6 +436,14 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return mutator.TimedOut
 	}
+	// If the parent runCtx was cancelled (Ctrl-C or runner SIGTERM) the
+	// `go test` child was killed before reaching a verdict. Reporting
+	// these as LIVED misrepresents the data — they were never tested.
+	// The configured shutdown status (default NotCovered) is the truthful
+	// outcome.
+	if m.runCtx.Err() != nil {
+		return shutdownStatus()
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
 		status := getTestFailedStatus(exitErr.ExitCode())
@@ -437,6 +464,19 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	}
 
 	return mutator.Lived
+}
+
+// shutdownStatus returns the status to record for mutants that were
+// in-flight when the run was cancelled. The choice is driven by the
+// `unleash.on-shutdown-status` config key (CLI flag
+// --on-shutdown-status). Unrecognised values fall back to NotCovered,
+// the truthful default ("we never finished running this mutant").
+func shutdownStatus() mutator.Status {
+	v := configuration.Get[string](configuration.UnleashOnShutdownStatusKey)
+	if s, ok := mutator.ParseShutdownStatus(v); ok {
+		return s
+	}
+	return mutator.NotCovered
 }
 
 // maxCapturedOutput bounds how much of the test output is read back. What is
