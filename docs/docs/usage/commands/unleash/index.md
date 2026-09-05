@@ -231,6 +231,13 @@ example if you are analysing integration or E2E tests. In this scenario, you can
 However, you should be aware that integration mode is generally much slower, and you can also get
 slightly different results depending on your test suite.
 
+[//]: # (@formatter:off)
+!!! tip
+    If what you want is the cross-package tests and not the whole suite,
+    [test selection](#test-selection) runs exactly the tests that execute the mutated line,
+    wherever they live, instead of every test in the module.
+[//]: # (@formatter:on)
+
 ```shell
 gremlins unleash --integration
 ```
@@ -386,6 +393,56 @@ This flag overrides the number of CPUs the Go test tool will utilize. By default
 ```shell
 gremlins unleash --test-cpu=1
 ```
+
+### Test selection
+
+:material-flag: `--test-selection` · :material-sign-direction: Default: `false`
+
+By default Gremlins runs the tests of the package where the mutant is, all of them. Package
+membership is a guess at which tests could notice a mutation; coverage is the answer. With this
+flag Gremlins runs, for each mutant, the tests that actually execute the mutated line — wherever
+in the module those tests live.
+
+That is better in both directions at once:
+
+- **Narrower.** A test that never executes the mutated line cannot notice the mutation, so it does
+  not run. Where most of a package's cost is in tests that touch other code — a suite that talks
+  to a database, say — this is most of the run.
+- **Wider.** A test in *another* package that does execute the line is run, and can kill the
+  mutant. That is the drawback described under [integration mode](#integration-mode), and without
+  this flag it shows up as a mutant reported `LIVED` that your test suite does in fact catch.
+
+When a mutant survives, the report names the tests that ran against it:
+
+```
+       LIVED CONDITIONALS_BOUNDARY at vm/vm.go:6:10
+         not caught by: xpkg.TestRangeAscending, xpkg.TestRangeDescending
+```
+
+The map that makes this possible cannot be read out of a coverage profile, because Go's profile
+does not record which test executed a block. Gremlins builds it by running each test on its own
+with coverage over the whole module, which costs one process per test, once, before any mutant
+runs. The map covers the whole module even when the run itself is scoped to a single package: the
+test that kills a mutant is not necessarily in the package that holds it, which is the point. That is why the flag is off by default: on a module whose suite is already fast it is a bad
+trade, and on one where a handful of slow tests dominate it pays for itself many times over.
+
+```shell
+gremlins unleash --test-selection
+```
+
+[//]: # (@formatter:off)
+!!! warning
+    Selection is only ever used where the map is complete. If a package's tests cannot all be
+    mapped — one of them fails to run, for instance — that package runs its whole suite, which is
+    the behaviour without the flag. The same happens for a mutant the map has nothing to say
+    about. It is never allowed to run *fewer* tests than it can account for.
+[//]: # (@formatter:on)
+
+[//]: # (@formatter:off)
+!!! note
+    The flag has no effect with `--integration`, which runs the whole module for every mutant by
+    design, and there is nothing left to narrow.
+[//]: # (@formatter:on)
 
 ### Threshold efficacy
 

@@ -43,6 +43,7 @@ const (
 	UnleashTestCPUKey            = "unleash.test-cpu"
 	UnleashTimeoutCoefficientKey = "unleash.timeout-coefficient"
 	UnleashIntegrationMode       = "unleash.integration"
+	UnleashTestSelectionKey      = "unleash.test-selection"
 	UnleashExcludeFiles          = "unleash.exclude-files"
 	UnleashDiffRef               = "unleash.diff"
 	UnleashThresholdEfficacyKey  = "unleash.threshold.efficacy"

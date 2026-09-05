@@ -20,14 +20,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
+	"github.com/go-gremlins/gremlins/internal/coverage"
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -55,6 +58,7 @@ type ExecutorDealer interface {
 type MutantExecutorDealer struct {
 	wdDealer          workdir.Dealer
 	execContext       execContext
+	testMap           TestSelector
 	mod               gomodule.GoModule
 	buildTags         string
 	testExecutionTime time.Duration
@@ -70,6 +74,31 @@ type ExecutorDealerOption func(j MutantExecutorDealer) MutantExecutorDealer
 func WithExecContext(c execContext) ExecutorDealerOption {
 	return func(m MutantExecutorDealer) MutantExecutorDealer {
 		m.execContext = c
+
+		return m
+	}
+}
+
+// TestSelector answers, for a position in the code, which tests execute it, and
+// whether a package's tests are known at all.
+//
+// It is the executor's whole view of the test map: an executor asks what covers
+// this mutant and whether it may trust the answer for this package, and nothing
+// else about how the map was built.
+type TestSelector interface {
+	// Mapped reports whether the tests of a package are known in full.
+	Mapped(pkg string) bool
+
+	// TestsFor returns the tests that execute the given position.
+	TestsFor(pos token.Position) []coverage.TestID
+}
+
+// WithTestSelection turns on test selection: instead of the whole suite of the
+// mutated package, each mutant runs the tests the selector says execute its
+// line, wherever those tests live.
+func WithTestSelection(sel TestSelector) ExecutorDealerOption {
+	return func(m MutantExecutorDealer) MutantExecutorDealer {
+		m.testMap = sel
 
 		return m
 	}
@@ -128,6 +157,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		wg:                wg,
 		wdDealer:          m.wdDealer,
 		module:            m.mod,
+		testMap:           m.testMap,
 		dryRun:            m.dryRun,
 		integrationMode:   m.integrationMode,
 		buildTags:         m.buildTags,
@@ -143,6 +173,7 @@ type execContext = func(ctx context.Context, name string, args ...string) *exec.
 
 type mutantExecutor struct {
 	mutant            mutator.Mutator
+	testMap           TestSelector
 	wdDealer          workdir.Dealer
 	outCh             chan<- mutator.Mutator
 	wg                *sync.WaitGroup
@@ -199,11 +230,78 @@ func (m *mutantExecutor) Start(w *workerpool.Worker) {
 	m.outCh <- m.mutant
 }
 
+// testRun is one `go test` invocation: a package, and which of its tests to run.
+// An empty tests slice means the package's whole suite, which is what runs when
+// there is no test selection.
+type testRun struct {
+	pkg   string
+	tests []string
+}
+
 func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	ctx, cancel := context.WithTimeout(context.Background(), m.testExecutionTime)
 	defer cancel()
 
-	cmd := m.execContext(ctx, "go", m.getTestArgs(pkg)...)
+	// One context for the whole mutant, not one per command: the bound is on how
+	// long this mutant may take, and selection can split that across packages.
+	for _, sel := range m.selectTests(pkg) {
+		if status := m.runTestCommand(ctx, rootDir, sel); status != mutator.Lived {
+			return status
+		}
+	}
+
+	return mutator.Lived
+}
+
+// selectTests decides what to run for the mutant.
+//
+// Package membership is only a guess at which tests could notice a mutation;
+// coverage is the answer. Where the map can give it, this is both narrower —
+// tests that never execute the line are skipped — and wider — tests in other
+// packages that do execute it are picked up, which package scoping never ran.
+//
+// Every path that cannot give a confident answer returns the mutated package's
+// whole suite, which is the behaviour without selection: never wrong, only slow.
+func (m *mutantExecutor) selectTests(pkg string) []testRun {
+	wholeSuite := []testRun{{pkg: pkg}}
+	if m.testMap == nil || m.integrationMode {
+		return wholeSuite
+	}
+	// A package the map could not see whole might hold the very test that kills
+	// this mutant, and skipping it would turn a killed mutant into a LIVED one.
+	if !m.testMap.Mapped(pkg) {
+		return wholeSuite
+	}
+	tests := m.testMap.TestsFor(m.mutant.Position())
+	if len(tests) == 0 {
+		// An uncovered mutant never reaches here, so an empty answer means the
+		// map is incomplete — coverage is not always deterministic — rather than
+		// that no test exercises the line.
+		return wholeSuite
+	}
+
+	var order []string
+	byPkg := make(map[string][]string)
+	names := make([]string, 0, len(tests))
+	for _, id := range tests {
+		if _, seen := byPkg[id.Pkg]; !seen {
+			order = append(order, id.Pkg)
+		}
+		byPkg[id.Pkg] = append(byPkg[id.Pkg], id.Name)
+		names = append(names, id.String())
+	}
+	m.mutant.SetTestsRun(names)
+
+	runs := make([]testRun, 0, len(order))
+	for _, p := range order {
+		runs = append(runs, testRun{pkg: p, tests: byPkg[p]})
+	}
+
+	return runs
+}
+
+func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel testRun) mutator.Status {
+	cmd := m.execContext(ctx, "go", m.getTestArgs(sel)...)
 	cmd.Dir = m.mutant.Workdir()
 	if m.integrationMode {
 		cmd.Dir = rootDir
@@ -302,7 +400,7 @@ func testBinaryTerminatedBySignal(output []byte) bool {
 	return goSignalledTestBinary.Match(output)
 }
 
-func (m *mutantExecutor) getTestArgs(pkg string) []string {
+func (m *mutantExecutor) getTestArgs(sel testRun) []string {
 	args := []string{"test"}
 	if m.buildTags != "" {
 		args = append(args, "-tags", m.buildTags)
@@ -317,7 +415,13 @@ func (m *mutantExecutor) getTestArgs(pkg string) []string {
 		args = append(args, "-cpu", fmt.Sprintf("%d", m.testCPU))
 	}
 
-	path := pkg
+	// An empty selection is the whole suite: no -run at all, exactly the command
+	// that runs without selection.
+	if len(sel.tests) > 0 {
+		args = append(args, "-run", "^("+strings.Join(sel.tests, "|")+")$")
+	}
+
+	path := sel.pkg
 	if m.integrationMode {
 		path = "./..."
 	}
