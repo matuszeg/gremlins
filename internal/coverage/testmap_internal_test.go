@@ -20,49 +20,45 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-
-	"github.com/go-gremlins/gremlins/internal/gomodule"
 )
 
-func TestParseTestList(t *testing.T) {
+func TestParsePackageList(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
 		out  string
-		want map[string][]string
+		want []testPackage
 	}{
-		// The names come first and the summary line names the package they
-		// belong to, so the parse has to look ahead rather than behind.
-		"attributes the names above a summary line to its package": {
-			out: "TestRangeDescending\nTestRangeAscending\nok  \txpkg\t0.004s\n" +
-				"TestSizeAscending\nok  \txpkg/vm\t0.005s\n",
-			want: map[string][]string{
-				"xpkg":    {"TestRangeDescending", "TestRangeAscending"},
-				"xpkg/vm": {"TestSizeAscending"},
+		"reads the import path, the directory and whether there are tests": {
+			out: "example.com\t/src\t2\t0\nexample.com/vm\t/src/vm\t0\t1\n",
+			want: []testPackage{
+				{importPath: "example.com", dir: "/src", hasTests: true},
+				{importPath: "example.com/vm", dir: "/src/vm", hasTests: true},
 			},
 		},
-		"a package with no test files contributes nothing": {
-			out:  "?   \txpkg/empty\t[no test files]\n",
-			want: map[string][]string{},
+		// A package with no test files is not an error and not a gap: it has
+		// nothing to map, which is a complete answer.
+		"a package with no test files of either kind has no tests": {
+			out:  "example.com/empty\t/src/empty\t0\t0\n",
+			want: []testPackage{{importPath: "example.com/empty", dir: "/src/empty", hasTests: false}},
 		},
-		"a package whose listing failed still attributes its names": {
-			out:  "TestOne\nFAIL\txpkg\t0.004s\n",
-			want: map[string][]string{"xpkg": {"TestOne"}},
+		"packages come back in a stable order": {
+			out: "example.com/vm\t/src/vm\t1\t0\nexample.com\t/src\t1\t0\n",
+			want: []testPackage{
+				{importPath: "example.com", dir: "/src", hasTests: true},
+				{importPath: "example.com/vm", dir: "/src/vm", hasTests: true},
+			},
 		},
-		"examples and fuzz targets are tests too": {
-			out:  "ExampleAdd\nFuzzAdd\nTestAdd\nok  \txpkg\t0.004s\n",
-			want: map[string][]string{"xpkg": {"ExampleAdd", "FuzzAdd", "TestAdd"}},
-		},
-		// Everything go prints that is not a bare test name is noise here, and
-		// the parse must not mistake any of it for a test.
-		"other output is not mistaken for a test name": {
-			out: "go: downloading example.com v1.0.0\nBenchmarkAdd\ntesting: warning\n" +
-				"TestAdd\nok  \txpkg\t0.004s\n",
-			want: map[string][]string{"xpkg": {"TestAdd"}},
+		// go writes build diagnostics to the same stream, and none of them have
+		// the shape of a package line.
+		"anything that is not a package line is skipped": {
+			out: "go: downloading example.com v1.0.0\nexample.com\t/src\t1\t0\n" +
+				"# example.com/broken\nexample.com/x\t/src/x\tnot-a-number\t0\n",
+			want: []testPackage{{importPath: "example.com", dir: "/src", hasTests: true}},
 		},
 		"no output at all yields no packages": {
 			out:  "",
-			want: map[string][]string{},
+			want: nil,
 		},
 	}
 
@@ -70,8 +66,47 @@ func TestParseTestList(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if diff := cmp.Diff(tc.want, parseTestList(tc.out)); diff != "" {
-				t.Errorf("parseTestList() mismatch (-want +got):\n%s", diff)
+			got := parsePackageList(tc.out)
+			if diff := cmp.Diff(tc.want, got, cmp.AllowUnexported(testPackage{})); diff != "" {
+				t.Errorf("parsePackageList() mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestParseTestNames(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		out  string
+		want []string
+	}{
+		"keeps the names the binary listed": {
+			out:  "TestOne\nExampleTwo\nFuzzThree\n",
+			want: []string{"TestOne", "ExampleTwo", "FuzzThree"},
+		},
+		// The binary writes this to the same stream when it is coverage-built
+		// but not given a GOCOVERDIR, which is exactly how it is listed here.
+		"drops the GOCOVERDIR warning the binary prints while listing": {
+			out:  "TestOne\nwarning: GOCOVERDIR not set, no coverage data emitted\n",
+			want: []string{"TestOne"},
+		},
+		"drops anything else that is not a test name": {
+			out:  "BenchmarkOne\nTestOne\n--- FAIL: something\n",
+			want: []string{"TestOne"},
+		},
+		"no output at all yields no names": {
+			out:  "",
+			want: nil,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if diff := cmp.Diff(tc.want, parseTestNames(tc.out)); diff != "" {
+				t.Errorf("parseTestNames() mismatch (-want +got):\n%s", diff)
 			}
 		})
 	}
@@ -95,35 +130,6 @@ func TestTestMapCoverPkg(t *testing.T) {
 		c := &Coverage{coverPkg: "./internal/..."}
 		if got := c.testMapCoverPkg(); got != "./internal/..." {
 			t.Errorf("want ./internal/..., got %s", got)
-		}
-	})
-}
-
-func TestListArgs(t *testing.T) {
-	t.Parallel()
-
-	// The listing is over the whole module even when the run is scoped to one
-	// package: a test that kills the mutant may live outside the scanned path,
-	// and a narrower listing could not see it.
-	t.Run("lists the whole module even for a scoped run", func(t *testing.T) {
-		t.Parallel()
-
-		c := &Coverage{mod: gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "internal/pkg"}}
-
-		want := []string{"test", "-list", listPattern, wholeModule}
-		if diff := cmp.Diff(want, c.listArgs()); diff != "" {
-			t.Errorf("listArgs() mismatch (-want +got):\n%s", diff)
-		}
-	})
-
-	t.Run("passes the build tags through", func(t *testing.T) {
-		t.Parallel()
-
-		c := &Coverage{buildTags: "tag1,tag2"}
-
-		want := []string{"test", "-list", listPattern, "-tags", "tag1,tag2", wholeModule}
-		if diff := cmp.Diff(want, c.listArgs()); diff != "" {
-			t.Errorf("listArgs() mismatch (-want +got):\n%s", diff)
 		}
 	})
 }
