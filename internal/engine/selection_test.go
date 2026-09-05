@@ -23,7 +23,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -35,9 +34,11 @@ import (
 	"github.com/go-gremlins/gremlins/internal/mutator"
 )
 
-// wantTimeout is the -timeout go is given: the mutant's own bound plus the two
-// seconds that keep go's timeout from firing before Gremlins' own.
-var wantTimeout = (2*time.Second + expectedTimeout*engine.DefaultTimeoutCoefficient).String()
+// wantTimeout is the -timeout go is given: the mutant's run bound, verbatim.
+// The two seconds that used to be added here are gone with the bound split —
+// go's -timeout now bounds the RUN and the context deadline bounds compile plus
+// run, so there is no longer a race between them to bias.
+var wantTimeout = (expectedTimeout * engine.DefaultTimeoutCoefficient).String()
 
 type selectorStub struct {
 	tests  []coverage.TestID
@@ -150,7 +151,7 @@ func TestSelectionRunsOnlyTheTestsThatExecuteTheMutatedLine(t *testing.T) {
 
 	holder, _ := runWithSelector(t, sel, false)
 
-	want := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize|TestClamp)$ example.com/vm"}
+	want := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize|TestClamp)$ example.com/vm"}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
 	}
@@ -173,7 +174,7 @@ func TestSelectionRunsCoveringTestsFromOtherPackages(t *testing.T) {
 	// One invocation listing both packages, not one per package: the build is
 	// most of what a mutant costs, and `go test` builds them together.
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout +
+		"go test -count=1 -vet=off -timeout " + wantTimeout +
 			" -failfast -run ^(TestRangeDescending|TestSize)$ example.com example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
@@ -203,7 +204,7 @@ func TestSelectionNamesEachTestOnceAcrossPackages(t *testing.T) {
 	holder, mut := runCrossPackage(t, sel)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -231,7 +232,7 @@ func TestSelectionKeepsToTheMutatedPackageByDefault(t *testing.T) {
 	holder, mut := runWithSelector(t, sel, false)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast -run ^(TestSize)$ example.com/vm",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -251,7 +252,7 @@ func TestSelectionFallsBackWhenOnlyOtherPackagesCover(t *testing.T) {
 
 	holder, mut := runWithSelector(t, sel, false)
 
-	want := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm"}
+	want := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm"}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
 	}
@@ -267,7 +268,7 @@ func TestCrossPackageWithoutSelectionRunsWholeSuitesOfTheDependents(t *testing.T
 	holder, mut := runCrossPackage(t, nil)
 
 	want := []string{
-		"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm example.com",
+		"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm example.com",
 	}
 	if diff := cmp.Diff(want, holder.commands()); diff != "" {
 		t.Errorf("commands mismatch (-want +got):\n%s", diff)
@@ -278,7 +279,7 @@ func TestCrossPackageWithoutSelectionRunsWholeSuitesOfTheDependents(t *testing.T
 }
 
 func TestSelectionFallsBackToTheWholeSuite(t *testing.T) {
-	wholeSuite := []string{"go test -count=1 -timeout " + wantTimeout + " -failfast example.com/vm"}
+	wholeSuite := []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast example.com/vm"}
 
 	testCases := map[string]struct {
 		sel     engine.TestSelector
@@ -315,7 +316,7 @@ func TestSelectionFallsBackToTheWholeSuite(t *testing.T) {
 
 			want := wholeSuite
 			if tc.intMode {
-				want = []string{"go test -count=1 -timeout " + wantTimeout + " -failfast ./..."}
+				want = []string{"go test -count=1 -vet=off -timeout " + wantTimeout + " -failfast ./..."}
 			}
 			if diff := cmp.Diff(want, holder.commands()); diff != "" {
 				t.Errorf("commands mismatch (-want +got):\n%s", diff)
