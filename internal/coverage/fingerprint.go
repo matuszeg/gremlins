@@ -56,6 +56,29 @@ type fingerprint struct {
 	// it — declarations are cut out rather than blanked, and the whitespace
 	// they leave behind is dropped.
 	Shell string `json:"shell"`
+
+	// Others is, per file, the source order of the declarations the shell
+	// holds: package-level vars whose initialiser is a function literal, and
+	// declarations left in the shell because two of them claimed one key. Their
+	// lines are instrumented like any others, so a profile can hold them, and
+	// then knowing where they have moved to is the difference between keeping
+	// that mapping and re-making the whole package.
+	//
+	// They are matched between two fingerprints by position, which is sound
+	// exactly when the shell agrees: identical shell text means an identical
+	// sequence of them, in the same order, differing only in where the
+	// declarations around them have pushed them to.
+	Others map[string][]declPrint `json:"others,omitempty"`
+
+	// Inputs is everything the test binary is built from except this package:
+	// see buildInputsOf, which fills it in. Without it a moved build ID could
+	// never be told apart from a moved dependency, and narrowing would keep
+	// stale mappings.
+	//
+	// It is not read off the filesystem like the rest, so fingerprintOf leaves
+	// it empty and the caller sets it — which is also what makes a fingerprint
+	// with no inputs unusable rather than optimistic.
+	Inputs string `json:"inputs"`
 }
 
 // The kinds of declaration whose effect reaches past the lines it occupies.
@@ -136,23 +159,118 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 	}
 	candidates, keyCount := c.candidatesOf(pkg, files, referenced)
 
-	fp := fingerprint{Decls: map[string]declPrint{}}
+	fp := fingerprint{Decls: map[string]declPrint{}, Others: map[string][]declPrint{}}
 	cuts := make([][]candidate, len(files))
+	attributed := map[*ast.FuncDecl]bool{}
 	for _, cand := range candidates {
 		if keyCount[cand.key] != 1 {
 			continue
 		}
 		fp.Decls[cand.key] = cand.decl
 		cuts[cand.file] = append(cuts[cand.file], cand)
+		attributed[cand.fn] = true
 	}
 
-	shell := make([]string, 0, len(files))
+	shell := make([]string, 0, len(files)+1)
 	for i := range files {
 		shell = append(shell, files[i].name+"\x00"+hashOf(shellOf(&files[i], cuts[i])))
+		c.recordOthers(pkg, &files[i], attributed, fp.Others)
 	}
+	data, ok := hashDataSubtrees(pkg.dir)
+	if !ok {
+		return fingerprint{}, false
+	}
+	shell = append(shell, "\x00subtrees\x00"+data)
 	fp.Shell = hashOf([]byte(strings.Join(shell, "\x00")))
 
 	return fp, true
+}
+
+// hashDataSubtrees hashes what a package's directory holds below its top level
+// and does not compile: testdata, and the trees an //go:embed pattern reaches
+// into.
+//
+// They belong in the shell because a test can behave differently on new input
+// without a line of the package changing, which would leave a kept mapping
+// describing a path the test no longer takes. The build ID does see embedded
+// files, so on its own that case ends in a whole re-map — but a run that has
+// already found a reason to narrow would never get that far.
+//
+// Subdirectories holding Go files are skipped: those are packages of their own,
+// and a package this one imports is covered by what it is built from, while one
+// it does not import has no business dirtying it.
+func hashDataSubtrees(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		sub := filepath.Join(dir, name)
+		isPkg, ok := holdsGoFiles(sub)
+		if !ok {
+			return "", false
+		}
+		if isPkg {
+			continue
+		}
+		sum, subOK := hashDirectory(sub)
+		if !subOK {
+			return "", false
+		}
+		nested, nestedOK := hashDataSubtrees(sub)
+		if !nestedOK {
+			return "", false
+		}
+		parts = append(parts, name+"\x00"+sum+"\x00"+nested)
+	}
+
+	return hashOf([]byte(strings.Join(parts, "\x00"))), true
+}
+
+func holdsGoFiles(dir string) (bool, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, false
+	}
+	for _, e := range entries {
+		if e.Type().IsRegular() && strings.HasSuffix(e.Name(), ".go") {
+			return true, true
+		}
+	}
+
+	return false, true
+}
+
+// recordOthers notes where the declarations that stayed in the shell sit, in
+// source order, for the files a coverage profile can name.
+//
+// Test files are left out: coverage does not instrument them, so no profile
+// holds a line of one and nothing would ever look these up.
+func (c *Coverage) recordOthers(pkg *testPackage, f *goFile, attributed map[*ast.FuncDecl]bool,
+	into map[string][]declPrint,
+) {
+	if f.ast == nil || strings.HasSuffix(f.name, "_test.go") {
+		return
+	}
+	profileName := c.profileFileName(pkg.importPath, f.name)
+	for _, decl := range f.ast.Decls {
+		if fn, isFunc := decl.(*ast.FuncDecl); isFunc && attributed[fn] {
+			continue
+		}
+		start := f.fset.Position(decl.Pos())
+		end := f.fset.Position(decl.End())
+		into[profileName] = append(into[profileName],
+			declPrint{File: profileName, Start: start.Line, End: end.Line})
+	}
 }
 
 // readPackageFiles reads every regular file of a package directory, parsing the

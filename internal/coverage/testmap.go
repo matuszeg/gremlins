@@ -312,6 +312,14 @@ func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool
 
 		return fingerprint{}, nil
 	}
+	// Without this a moved build ID cannot be told apart from a moved
+	// dependency, so a fingerprint that lacks it must not be narrowed from.
+	fp.Inputs, ok = c.buildInputsOf(pkg)
+	if !ok {
+		log.Errorf("cannot identify what %s is built from, so its whole map will be rebuilt\n", pkg.importPath)
+
+		return fingerprint{}, nil
+	}
 	if !hit {
 		return fp, nil
 	}

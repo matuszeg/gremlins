@@ -45,19 +45,28 @@ func calcPos(line int) token.Position {
 	return token.Position{Filename: "calc/calc.go", Line: line, Column: 1}
 }
 
+// buildCalc maps the calc package alone, which is the shape a run scoped to the
+// package under edit has — the one this whole mechanism exists for, and the one
+// CONTRIBUTING tells a developer to use.
+func (h *cacheHarness) buildCalc(buildIDs string) *coverage.TestMap {
+	h.t.Helper()
+
+	return h.buildScoped("TestTestMapHelperProcess", buildIDs, "example.com/calc")
+}
+
 // The case the whole thing exists for. The package under mutation is the
 // package that was changed, so its build ID is invalid by construction — but
 // most of its tests never executed the lines that moved.
 func TestAChangeReMapsOnlyTheTestsThatExecutedIt(t *testing.T) {
 	h := newCacheHarness(t)
 
-	first := h.build("TestTestMapHelperProcess", "")
+	first := h.buildCalc("")
 	if got := first.TestsFor(calcPos(tripleEndLine)); len(got) != 0 {
 		t.Fatalf("want the line below Triple uncovered before the edit, got %v", got)
 	}
 
 	h.edit("calc/calc.go", calcSourceDoubleGrown)
-	second := h.build("TestTestMapHelperProcess", changedCalc)
+	second := h.buildCalc(changedCalc)
 
 	if diff := cmp.Diff([]string{"TestDouble"}, h.testsRun()); diff != "" {
 		t.Errorf("want only the test that executed the change re-mapped (-want +got):\n%s", diff)
@@ -79,18 +88,18 @@ func TestAChangeReMapsOnlyTheTestsThatExecutedIt(t *testing.T) {
 func TestAChangeNoTestExecutedReMapsNothing(t *testing.T) {
 	h := newCacheHarness(t)
 
-	h.build("TestTestMapHelperProcess", "")
+	h.buildScoped("TestTestMapHelperProcess", "", "example.com/vm")
 	h.edit("vm/vm.go", vmSource+`
 func Unused(v []int) int {
 	return len(v) + 1
 }
 `)
-	tm := h.build("TestTestMapHelperProcess", "example.com/vm=changed-by-an-edit")
+	tm := h.buildScoped("TestTestMapHelperProcess", "example.com/vm=changed-by-an-edit", "example.com/vm")
 
 	if got := h.testsRun(); len(got) != 0 {
 		t.Errorf("want nothing re-mapped for a function nothing calls, got %v", got)
 	}
-	if tm.Len() != 5 {
+	if tm.Len() != 1 {
 		t.Errorf("want the map still complete, got %d tests", tm.Len())
 	}
 }
@@ -100,7 +109,7 @@ func Unused(v []int) int {
 func TestAChangedTestReMapsOnlyItself(t *testing.T) {
 	h := newCacheHarness(t)
 
-	h.build("TestTestMapHelperProcess", "")
+	h.buildCalc("")
 	h.edit("calc/triple_test.go", `package calc
 
 import "testing"
@@ -111,7 +120,7 @@ func TestTriple(t *testing.T) {
 	}
 }
 `)
-	h.build("TestTestMapHelperProcess", changedCalc)
+	h.buildCalc(changedCalc)
 
 	if diff := cmp.Diff([]string{"TestTriple"}, h.testsRun()); diff != "" {
 		t.Errorf("want only the changed test re-mapped (-want +got):\n%s", diff)
@@ -171,10 +180,10 @@ func TestTriple(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			h := newCacheHarness(t)
-			h.build("TestTestMapHelperProcess", "")
+			h.buildCalc("")
 
 			h.edit(tc.file, tc.content)
-			h.build("TestTestMapHelperProcess", changedCalc)
+			h.buildCalc(changedCalc)
 
 			want := []string{"TestDouble", "TestTriple"}
 			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
@@ -210,15 +219,42 @@ func Quadruple(n int) int {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			h := newCacheHarness(t)
-			h.build("TestTestMapHelperProcess", "")
+			h.buildCalc("")
 
 			h.edit("calc/calc.go", calcSource+tc.added)
-			h.build("TestTestMapHelperProcess", changedCalc)
+			h.buildCalc(changedCalc)
 
 			if diff := cmp.Diff(tc.want, h.testsRun()); diff != "" {
 				t.Errorf("re-mapped the wrong tests (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// The hole the build ID cannot close on its own. One hash covers the package's
+// source and every dependency's, so a run that finds a change here has no way
+// to know whether that is all of it — and a dependency's lines are in no
+// profile of this package, so a change there looks clean to every mapping.
+func TestAChangeUnderneathAChangedPackageReMapsAllOfIt(t *testing.T) {
+	h := newCacheHarness(t)
+
+	h.buildCalc("")
+
+	// The same edit to calc that re-maps two tests on its own, made while a
+	// package calc is built on top of has changed as well.
+	h.edit("calc/calc.go", calcSourceDoubleGrown)
+	h.edit("vm/vm.go", vmSource+`
+func Extra(v []int) int {
+	return len(v) + 1
+}
+`)
+	h.buildCalc(changedCalc)
+
+	// calc's own change is attributable and would narrow on its own; what
+	// changed beneath it is in no profile of calc, so none of it can be kept.
+	want := []string{"TestDouble", "TestTriple"}
+	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+		t.Errorf("want the dependent package re-mapped whole (-want +got):\n%s", diff)
 	}
 }
 
@@ -228,8 +264,8 @@ func Quadruple(n int) int {
 func TestAChangeOutsideThePackageReMapsAllOfIt(t *testing.T) {
 	h := newCacheHarness(t)
 
-	h.build("TestTestMapHelperProcess", "")
-	h.build("TestTestMapHelperProcess", changedCalc)
+	h.buildCalc("")
+	h.buildCalc(changedCalc)
 
 	want := []string{"TestDouble", "TestTriple"}
 	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
@@ -250,7 +286,7 @@ func (c counter) String() string {
 }
 `
 	h.edit("calc/calc.go", withMethod)
-	h.build("TestTestMapHelperProcess", "")
+	h.buildCalc("")
 
 	h.edit("calc/calc.go", calcSource+`
 type counter int
@@ -259,7 +295,7 @@ func (c counter) String() string {
 	return "a counter"
 }
 `)
-	h.build("TestTestMapHelperProcess", changedCalc)
+	h.buildCalc(changedCalc)
 
 	// The method sits below both functions, so no test's profile reaches it.
 	if got := h.testsRun(); len(got) != 0 {

@@ -55,6 +55,11 @@ type Coverage struct {
 	cacheDir        string
 	crossPackage    bool
 	integrationMode bool
+
+	// Read once per run and shared by every package the map builder visits:
+	// what the toolchain is, and what each dependency directory hashes to.
+	env       *goEnvironment
+	dirHashes map[string]string
 }
 
 // Option for the Coverage initialization.

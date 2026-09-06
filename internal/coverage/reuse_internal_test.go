@@ -26,12 +26,17 @@ import (
 // which is the body of the declaration keyed "a.go:F".
 func oneTest(decls map[string]declPrint, shell string) cachedPackage {
 	return cachedPackage{
-		Fingerprint: fingerprint{Shell: shell, Decls: decls},
+		Fingerprint: fingerprint{Shell: shell, Inputs: inputsHash, Decls: decls},
 		Tests: map[string]Profile{
 			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
 		},
 	}
 }
+
+// inputsHash stands for everything the test binary is built from besides the
+// package: unchanged in every case that narrows, because a change there is one
+// no profile of this package could have recorded.
+const inputsHash = "inputs"
 
 func decl(file string, start, end int, hash, kind string) declPrint {
 	return declPrint{Hash: hash, File: file, Start: start, End: end, Kind: kind}
@@ -56,19 +61,19 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 		// could not be read, says nothing about what changed.
 		"no fingerprint at all": {
 			cached: oneTest(base, ""),
-			now:    fingerprint{Shell: "shell", Decls: base},
+			now:    fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
 		},
 		// A const, a package-level var, a type, a struct tag, an import, a test
 		// helper, a non-Go file: none of them is a line any profile holds.
 		"the shell moved": {
 			cached: oneTest(base, "shell"),
-			now:    fingerprint{Shell: "other", Decls: base},
+			now:    fingerprint{Shell: "other", Inputs: inputsHash, Decls: base},
 		},
 		// Nothing in the package changed, yet the build ID did — so the change
 		// was in a dependency, which no profile of this package covers.
 		"nothing in the package changed": {
 			cached: oneTest(base, "shell"),
-			now:    fingerprint{Shell: "shell", Decls: base},
+			now:    fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
 		},
 		// init runs before every test in the binary.
 		"an init changed": {
@@ -76,14 +81,14 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 				"a.go:F":    base["a.go:F"],
 				"a.go:init": decl("a.go", 13, 15, "i", kindInit),
 			}, "shell"),
-			now: fingerprint{Shell: "shell", Decls: map[string]declPrint{
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 				"a.go:F":    base["a.go:F"],
 				"a.go:init": decl("a.go", 13, 15, "i2", kindInit),
 			}},
 		},
 		"an init was added": {
 			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Decls: map[string]declPrint{
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 				"a.go:F":    base["a.go:F"],
 				"a.go:G":    base["a.go:G"],
 				"a.go:init": decl("a.go", 13, 15, "i", kindInit),
@@ -96,14 +101,52 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 				"a.go:F":     base["a.go:F"],
 				"a.go:T.Str": decl("a.go", 13, 15, "m", kindMethod),
 			}, "shell"),
-			now: fingerprint{Shell: "shell", Decls: map[string]declPrint{"a.go:F": base["a.go:F"]}},
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{"a.go:F": base["a.go:F"]}},
 		},
 		"a method was added": {
 			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Decls: map[string]declPrint{
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 				"a.go:F":     base["a.go:F"],
 				"a.go:G":     base["a.go:G"],
 				"a.go:T.Str": decl("a.go", 13, 15, "m", kindMethod),
+			}},
+		},
+		// A dependency moved, alone or alongside a change here. Its lines are
+		// in no profile of this package, so which mappings it reached cannot be
+		// worked out — and the build ID, which folds the two together, cannot
+		// tell one from the other.
+		"the dependencies moved too": {
+			cached: oneTest(base, "shell"),
+			now: fingerprint{Shell: "shell", Inputs: "other-inputs", Decls: map[string]declPrint{
+				"a.go:F": decl("a.go", 3, 7, "f2", ""),
+				"a.go:G": base["a.go:G"],
+			}},
+		},
+		"nothing recorded what it was built from": {
+			cached: cachedPackage{
+				Fingerprint: fingerprint{Shell: "shell", Decls: base},
+				Tests:       map[string]Profile{"TestF": {"a.go": {{StartLine: 4, EndLine: 6}}}},
+			},
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
+				"a.go:F": decl("a.go", 3, 7, "f2", ""),
+				"a.go:G": base["a.go:G"],
+			}},
+		},
+		// Positions are paired by order, which only means anything while the
+		// sequence is the same one.
+		"the shell declarations no longer line up": {
+			cached: cachedPackage{
+				Fingerprint: fingerprint{
+					Shell:  "shell",
+					Inputs: inputsHash,
+					Decls:  base,
+					Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 1, End: 1}}},
+				},
+				Tests: map[string]Profile{"TestF": {"a.go": {{StartLine: 4, EndLine: 6}}}},
+			},
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Others: map[string][]declPrint{}, Decls: map[string]declPrint{
+				"a.go:F": decl("a.go", 3, 7, "f2", ""),
+				"a.go:G": base["a.go:G"],
 			}},
 		},
 		// The profile and the fingerprint disagree about the package: the
@@ -111,12 +154,12 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 		// have moved to cannot be worked out.
 		"a kept block belongs to no declaration": {
 			cached: cachedPackage{
-				Fingerprint: fingerprint{Shell: "shell", Decls: base},
+				Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
 				Tests: map[string]Profile{
 					"TestF": {"elsewhere.go": {{StartLine: 4, EndLine: 6}}},
 				},
 			},
-			now: fingerprint{Shell: "shell", Decls: map[string]declPrint{
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 				"a.go:F": decl("a.go", 3, 7, "f2", ""),
 				"a.go:G": base["a.go:G"],
 			}},
@@ -138,11 +181,11 @@ func TestReusableKeepsWhatTheChangeCouldNotReach(t *testing.T) {
 	t.Parallel()
 
 	// F changed and grew by two lines; G did not change and moved with it.
-	was := fingerprint{Shell: "shell", Decls: map[string]declPrint{
+	was := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 		"a.go:F": decl("a.go", 3, 7, "f", ""),
 		"a.go:G": decl("a.go", 9, 11, "g", ""),
 	}}
-	now := fingerprint{Shell: "shell", Decls: map[string]declPrint{
+	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 		"a.go:F": decl("a.go", 3, 9, "f2", ""),
 		"a.go:G": decl("a.go", 11, 13, "g", ""),
 	}}
@@ -167,16 +210,53 @@ func TestReusableKeepsWhatTheChangeCouldNotReach(t *testing.T) {
 	}
 }
 
+// A package-level var holding a function literal is instrumented like any other
+// code, and it is in the shell — so without its position a mapping that reached
+// it could never be kept.
+func TestReusableMovesTheDeclarationsTheShellHolds(t *testing.T) {
+	t.Parallel()
+
+	was := fingerprint{
+		Shell:  "shell",
+		Inputs: inputsHash,
+		Decls:  map[string]declPrint{"a.go:F": decl("a.go", 3, 7, "f", "")},
+		Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 9, End: 12}}},
+	}
+	now := fingerprint{
+		Shell:  "shell",
+		Inputs: inputsHash,
+		Decls:  map[string]declPrint{"a.go:F": decl("a.go", 3, 9, "f2", "")},
+		Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 11, End: 14}}},
+	}
+	cached := cachedPackage{
+		Fingerprint: was,
+		Tests: map[string]Profile{
+			"TestVar": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 9}}},
+		},
+	}
+
+	kept, ok := reusable(cached, now)
+	if !ok {
+		t.Fatal("want the mapping kept, got a whole-package re-map")
+	}
+	want := map[string]Profile{
+		"TestVar": {"a.go": {{StartLine: 12, StartCol: 1, EndLine: 12, EndCol: 9}}},
+	}
+	if diff := cmp.Diff(want, kept); diff != "" {
+		t.Errorf("the shell declaration was not moved with the rest (-want +got):\n%s", diff)
+	}
+}
+
 // A test's own lines are in no profile — coverage does not instrument test
 // files — so a changed test is named rather than located.
 func TestReusableDropsAChangedTestByName(t *testing.T) {
 	t.Parallel()
 
-	was := fingerprint{Shell: "shell", Decls: map[string]declPrint{
+	was := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 		"a.go:F":     decl("a.go", 3, 7, "f", ""),
 		"test:TestF": {Hash: "t", File: "a_test.go", Test: "TestF", Start: 5, End: 9},
 	}}
-	now := fingerprint{Shell: "shell", Decls: map[string]declPrint{
+	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
 		"a.go:F":     decl("a.go", 3, 7, "f", ""),
 		"test:TestF": {Hash: "t2", File: "a_test.go", Test: "TestF", Start: 5, End: 9},
 	}}

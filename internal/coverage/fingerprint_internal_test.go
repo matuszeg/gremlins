@@ -318,6 +318,101 @@ func init() {
 	}
 }
 
+// A test can behave differently on new input without a line of the package
+// changing, so what a package holds below its top level is in the shell too.
+func TestFingerprintCoversTheDataBelowThePackage(t *testing.T) {
+	t.Parallel()
+
+	source := map[string]string{"a.go": "package pkg\n\nfunc F() int {\n\treturn 1\n}\n"}
+
+	withData := func(t *testing.T, files map[string]string, nested map[string]string) fingerprint {
+		t.Helper()
+
+		dir := t.TempDir()
+		for name, content := range files {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+				t.Fatalf("cannot write the source: %v", err)
+			}
+		}
+		for rel, content := range nested {
+			path := filepath.Join(dir, rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				t.Fatalf("cannot create the subtree: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatalf("cannot write the subtree file: %v", err)
+			}
+		}
+		c := &Coverage{mod: gomodule.GoModule{Name: "example.com", Root: dir, CallingDir: "."}}
+		fp, ok := c.fingerprintOf(&testPackage{importPath: "example.com/pkg", dir: dir})
+		if !ok {
+			t.Fatal("want the package fingerprinted, got a failure")
+		}
+
+		return fp
+	}
+
+	base := withData(t, source, map[string]string{"testdata/golden/one.json": `{"n":1}`})
+	changed := withData(t, source, map[string]string{"testdata/golden/one.json": `{"n":2}`})
+	if base.Shell == changed.Shell {
+		t.Error("want a change under testdata to move the shell")
+	}
+
+	// A subdirectory holding Go files is a package of its own: one this package
+	// imports is covered by what it is built from, and one it does not import
+	// has no business dirtying it.
+	withSub := withData(t, source, map[string]string{"sub/sub.go": "package sub\n\nfunc G() int {\n\treturn 1\n}\n"})
+	withSubChanged := withData(t, source, map[string]string{"sub/sub.go": "package sub\n\nfunc G() int {\n\treturn 2\n}\n"})
+	if withSub.Shell != withSubChanged.Shell {
+		t.Error("want a subpackage's own source left out of this package's shell")
+	}
+}
+
+// A package-level declaration can hold instrumented code — a var whose
+// initialiser is a function literal — so where it sits has to be recorded even
+// though its content belongs to the shell.
+func TestFingerprintRecordsWhereTheShellDeclarationsSit(t *testing.T) {
+	t.Parallel()
+
+	fp := fingerprintOfSource(t, map[string]string{
+		"a.go": `package pkg
+
+import "strings"
+
+var upper = func(s string) string {
+	return strings.ToUpper(s)
+}
+
+func F(s string) string {
+	return upper(s)
+}
+`,
+		"a_test.go": `package pkg
+
+import "testing"
+
+func TestF(t *testing.T) {
+	_ = F("x")
+}
+`,
+	})
+
+	others := fp.Others["pkg/a.go"]
+	if len(others) != 2 {
+		t.Fatalf("want the import and the var recorded, got %+v", others)
+	}
+	// In source order: the import, then the var holding the function literal.
+	if others[0].Start != 3 || others[1].Start != 5 || others[1].End != 7 {
+		t.Errorf("want the shell declarations where they are, got %+v", others)
+	}
+
+	// A test file is never named by a profile, so recording it would be work
+	// nothing reads.
+	if got, found := fp.Others["pkg/a_test.go"]; found {
+		t.Errorf("want no shell positions for a test file, got %+v", got)
+	}
+}
+
 func keysOf(decls map[string]declPrint) []string {
 	var keys []string
 	for key := range decls {
