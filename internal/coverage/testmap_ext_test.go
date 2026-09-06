@@ -56,6 +56,11 @@ const buildIDsEnv = "GREMLINS_TEST_BUILD_IDS"
 // rebuild that produced the same answer.
 const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
 
+// listOnlyEnv narrows the `go list` the helper fakes to one package, which is
+// how a test stands a scoped run — the recommended workflow, and the one that
+// used to evict the rest of the module's map.
+const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
+
 func fixtureRoot(t *testing.T) string {
 	t.Helper()
 
@@ -204,10 +209,10 @@ const (
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
-	return fakeGoCommandWith(helper, pkgRoot, "", "")
+	return fakeGoCommandWith(helper, pkgRoot, "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -218,6 +223,7 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath string) func(command s
 			pkgDirsEnv + "=" + pkgRoot,
 			buildIDsEnv + "=" + buildIDs,
 			invocationLogEnv + "=" + logPath,
+			listOnlyEnv + "=" + listOnly,
 		}
 
 		return cmd
@@ -273,9 +279,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	if cmd == "go" && hasFlag(os.Args, "list") {
-		fmt.Fprintf(os.Stdout, "example.com\t%s\t2\t0\n", filepath.Join(root, "root"))
-		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\t1\t0\n", filepath.Join(root, "vm"))
-		fmt.Fprintf(os.Stdout, "example.com/empty\t%s\t0\t0\n", filepath.Join(root, "empty"))
+		listPackagesAsGo(root, os.Getenv(listOnlyEnv))
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -316,6 +320,22 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// listPackagesAsGo writes the package lines `go list -f` would, narrowed to one
+// package when the test asked for a scoped run.
+func listPackagesAsGo(root, only string) {
+	lines := []struct{ path, dir, tests string }{
+		{"example.com", "root", "2\t0"},
+		{"example.com/vm", "vm", "1\t0"},
+		{"example.com/empty", "empty", "0\t0"},
+	}
+	for _, l := range lines {
+		if only != "" && l.path != only {
+			continue
+		}
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%s\n", l.path, filepath.Join(root, l.dir), l.tests)
+	}
 }
 
 // buildIDFor reports the build ID the test chose for the package this binary
