@@ -30,10 +30,13 @@ import (
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
-// Version 2 is one file per package. Version 1 was one file per module, which
-// meant a run had to write back every package it had not looked at or lose
-// them — and a scoped run, which is the recommended workflow, looks at one.
-const cacheVersion = 2
+// Version 3 records the package's source fingerprint beside its mappings, so
+// that a changed package can keep the mappings the change could not have
+// touched. Version 2 was one file per package. Version 1 was one file per
+// module, which meant a run had to write back every package it had not looked
+// at or lose them — and a scoped run, which is the recommended workflow, looks
+// at one.
+const cacheVersion = 3
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
@@ -50,13 +53,20 @@ const cacheVersion = 2
 // on two runs of the same binary. That is the same non-determinism the map has
 // without a cache, held for longer.
 //
+// The build ID being coarse is why Fingerprint is here as well: it records what
+// the package's source looked like when the mappings were made, so that a run
+// whose build ID has moved can still ask which of them the change reached. An
+// entry may have none — a package whose directory could not be read — in which
+// case a changed build ID re-maps the whole package, as it always did.
+//
 // ImportPath is stored as well as hashed into the file name, so that a file
 // found under the wrong name is a miss rather than another package's answer.
 type cachedPackage struct {
-	Tests      map[string]Profile `json:"tests"`
-	ImportPath string             `json:"import_path"`
-	BuildID    string             `json:"build_id"`
-	Version    int                `json:"version"`
+	Tests       map[string]Profile `json:"tests"`
+	ImportPath  string             `json:"import_path"`
+	BuildID     string             `json:"build_id"`
+	Fingerprint fingerprint        `json:"fingerprint"`
+	Version     int                `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than
