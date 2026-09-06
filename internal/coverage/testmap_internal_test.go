@@ -145,13 +145,24 @@ func TestTestMapCoverPkg(t *testing.T) {
 		}
 	})
 
-	t.Run("honours a configured cover-pkg either way", func(t *testing.T) {
+	// A configured --coverpkg is the scope of the coverage GATHER, and it applies
+	// here only where the two questions coincide: under --cross-package, where
+	// the map has to see outside the package anyway. Gathering over ./... while
+	// judging a mutant by its own package's tests is a normal and correct
+	// combination, and it used to instrument every test binary against the whole
+	// module — which made every binary's build ID move whenever any file in the
+	// module changed, so the per-package cache never hit.
+	t.Run("a configured cover-pkg applies only under cross-package", func(t *testing.T) {
 		t.Parallel()
 
-		for _, c := range []*Coverage{{coverPkg: "./internal/..."}, {coverPkg: "./internal/...", crossPackage: true}} {
-			if got := c.testMapCoverPkg(pkg); got != "./internal/..." {
-				t.Errorf("want ./internal/..., got %s", got)
-			}
+		withCross := &Coverage{coverPkg: "./internal/...", crossPackage: true}
+		if got := withCross.testMapCoverPkg(pkg); got != "./internal/..." {
+			t.Errorf("with --cross-package: want ./internal/..., got %s", got)
+		}
+
+		withoutCross := &Coverage{coverPkg: "./internal/..."}
+		if got := withoutCross.testMapCoverPkg(pkg); got != pkg {
+			t.Errorf("without --cross-package: want %s, got %s", pkg, got)
 		}
 	})
 }

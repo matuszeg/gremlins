@@ -424,13 +424,30 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string) (Profile, error
 // in one package executing a line in another. Without it, a test is only ever
 // asked about its own package's code, and instrumenting the rest of the module
 // would cost time to record coverage nothing will read.
+//
+// --cross-package decides this, NOT the configured --coverpkg, and the order of
+// those two checks is the whole of this function. The configured coverpkg is
+// the scope of the coverage GATHER, which is a different question: it decides
+// which lines the profile attributes to anybody, and so which mutants are
+// runnable. It is common and correct to gather over ./... while judging a
+// mutant by its own package's tests, and reading the gather's scope here made
+// that combination instrument every test binary against the whole module.
+//
+// The cost of getting it backwards is not the wasted instrumentation the
+// comment above describes. It is the cache: an entry is keyed by
+// `go tool buildid` of the test binary, so a binary built with -coverpkg ./...
+// depends on every package in the module and one edit anywhere invalidates all
+// of them at once. Measured on a 15-package module with coverpkg ./... set, a
+// one-line addition to the smallest leaf package re-mapped 394 of 394 tests and
+// cost 636s against 77s for a fully cached run — within 2% of a cold build. The
+// per-package cache was doing nothing.
 func (c *Coverage) testMapCoverPkg(importPath string) string {
+	if !c.crossPackage {
+		return importPath
+	}
 	if c.coverPkg != "" {
 		return c.coverPkg
 	}
-	if c.crossPackage {
-		return wholeModule
-	}
 
-	return importPath
+	return wholeModule
 }
