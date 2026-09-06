@@ -332,6 +332,15 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func
 		cmd := exec.Command(os.Args[0], cs...)
 		cmd.Env = []string{
 			"GO_TEST_PROCESS=1",
+			// ThreadSanitizer sleeps for a second on the way out of every
+			// race-instrumented process, so that a race in a thread still
+			// finishing is still reported. This process is a fake `go` that
+			// prints a fixed answer and exits, and the map builder starts
+			// hundreds of them: at the default the package takes nine minutes
+			// under -race and seven seconds without, which reads as a deadlock
+			// rather than as a sleep. There is nothing here for the sleep to
+			// catch.
+			"GORACE=atexit_sleep_ms=0",
 			pkgDirsEnv + "=" + pkgRoot,
 			buildIDsEnv + "=" + buildIDs,
 			invocationLogEnv + "=" + logPath,
