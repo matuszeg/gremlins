@@ -70,9 +70,8 @@ type cachedPackage struct {
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than
-// per package: how much of the module was mapped — a map built without
-// --cross-package records only each test's own package — and the build tags
-// that decide which files exist at all.
+// per package: what the mappings were measured against, and the build tags that
+// decide which files exist at all.
 //
 // It names a directory rather than living inside the files, so that a
 // --cross-package map and a narrow one cannot be mistaken for one another even
@@ -81,6 +80,29 @@ func cacheKey(scope, buildTags string) string {
 	sum := sha256.Sum256([]byte(scope + "\x00" + buildTags))
 
 	return hex.EncodeToString(sum[:])
+}
+
+// perPackageScope stands for "each test binary was instrumented over its own
+// package", which is what happens without --cross-package. It is not a package
+// pattern and cannot collide with one: a --coverpkg value carrying a NUL cannot
+// be typed on a command line or written in a config file.
+const perPackageScope = "\x00per-package"
+
+// cacheScope is what the mappings under one key were measured against, and so
+// what an entry has to agree with to be readable.
+//
+// It is exactly the -coverpkg each test binary was compiled with, which is what
+// decides whose lines can appear in a profile — hence the delegation, so the two
+// cannot drift apart. Without --cross-package that is the package's own import
+// path, and the answer here collapses to a constant: every package's mapping is
+// then a function of that package alone.
+//
+// What is deliberately NOT here is how much of the module was scanned. It
+// decides which packages get mapped and nothing about what a mapping says, so a
+// run scoped to one package reads the file a whole-module run wrote for it
+// rather than starting empty.
+func (c *Coverage) cacheScope() string {
+	return c.testMapCoverPkg(perPackageScope)
 }
 
 // cacheDirPath is where this module's per-package map files live. It is outside

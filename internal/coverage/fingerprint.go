@@ -478,13 +478,7 @@ func hashOf(data []byte) string {
 
 // profileFileName is the name a coverage profile gives one of a package's
 // files. It mirrors removeModuleFromPath, which does the same translation from
-// the other direction.
+// the other direction, and is module-relative for the same reason.
 func (c *Coverage) profileFileName(importPath, base string) string {
-	path := strings.ReplaceAll(importPath+"/"+base, c.mod.Name+"/", "")
-	rel, err := filepath.Rel(c.mod.CallingDir, path)
-	if err != nil {
-		return path
-	}
-
-	return rel
+	return strings.ReplaceAll(importPath+"/"+base, c.mod.Name+"/", "")
 }

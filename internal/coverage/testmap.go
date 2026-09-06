@@ -57,6 +57,12 @@ type TestMap struct {
 	profiles map[TestID]Profile
 	mapped   map[string]struct{}
 	elapsed  time.Duration
+
+	// callingDir is what a caller's positions are relative to. The profiles are
+	// relative to the module root, so that a mapping means the same thing in a
+	// scoped run and a whole-module one — and so that one can read the other's
+	// cache.
+	callingDir string
 }
 
 // Elapsed returns how long the map took to build.
@@ -86,6 +92,7 @@ func (t *TestMap) Mapped(pkg string) bool {
 // package and then name so that a report reads the same way twice.
 func (t *TestMap) TestsFor(pos token.Position) []TestID {
 	var found []TestID
+	pos = ProfilePosition(t.callingDir, pos)
 	for id, profile := range t.profiles {
 		if profile.IsCovered(pos) {
 			found = append(found, id)
@@ -156,15 +163,16 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 
 	// An unusable cache directory is not a reason to stop: the map is still
 	// built, just not remembered. An empty path says so to mapPackage.
-	cacheDir, err := c.cacheDirPath(cacheKey(c.mapScope(), c.buildTags))
+	cacheDir, err := c.cacheDirPath(cacheKey(c.cacheScope(), c.buildTags))
 	if err != nil {
 		log.Errorf("cannot locate the test map cache, so this run will not use one: %v\n", err)
 		cacheDir = ""
 	}
 
 	tm := &TestMap{
-		profiles: make(map[TestID]Profile),
-		mapped:   make(map[string]struct{}),
+		profiles:   make(map[TestID]Profile),
+		mapped:     make(map[string]struct{}),
+		callingDir: c.mod.CallingDir,
 	}
 
 	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))

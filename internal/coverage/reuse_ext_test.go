@@ -41,8 +41,12 @@ func (h *cacheHarness) edit(rel, content string) {
 // was rebuilt, which is what any edit to it does.
 const changedCalc = "example.com/calc=changed-by-an-edit"
 
+// calcPos is a mutant's position as a run scoped to the calc package reports it:
+// relative to the directory Gremlins was pointed at, which is that package. The
+// profiles it is matched against are relative to the module root, and
+// coverage.ProfilePosition is what bridges the two.
 func calcPos(line int) token.Position {
-	return token.Position{Filename: "calc/calc.go", Line: line, Column: 1}
+	return token.Position{Filename: "calc.go", Line: line, Column: 1}
 }
 
 // buildCalc maps the calc package alone, which is the shape a run scoped to the
