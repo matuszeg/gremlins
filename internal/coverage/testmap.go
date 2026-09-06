@@ -154,15 +154,13 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		return nil, err
 	}
 
-	key := cacheKey(c.mapScope(), c.buildTags)
-	path, pathErr := c.cachePath()
-	cache := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
-	if pathErr == nil {
-		cache = loadCache(path, key)
+	// An unusable cache directory is not a reason to stop: the map is still
+	// built, just not remembered. An empty path says so to mapPackage.
+	cacheDir, err := c.cacheDirPath(cacheKey(c.mapScope(), c.buildTags))
+	if err != nil {
+		log.Errorf("cannot locate the test map cache, so this run will not use one: %v\n", err)
+		cacheDir = ""
 	}
-	// The cache is rebuilt from what this run saw rather than updated in place,
-	// so a package that has gone away does not keep its mapping alive forever.
-	next := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
 
 	tm := &TestMap{
 		profiles: make(map[TestID]Profile),
@@ -181,18 +179,13 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 
 			continue
 		}
-		res := c.mapPackage(&pkg, tm, cache, next)
+		res := c.mapPackage(&pkg, tm, cacheDir)
 		done += res.tests
 		if res.cached {
 			reused += res.tests
 		}
 		if res.mapped {
 			tm.mapped[pkg.importPath] = struct{}{}
-		}
-	}
-	if pathErr == nil {
-		if err := next.save(path); err != nil {
-			log.Errorf("cannot write the test map cache: %v\n", err)
 		}
 	}
 	tm.elapsed = time.Since(start)
@@ -212,7 +205,10 @@ type mapResult struct {
 // mapPackage compiles a package's test binary once and runs each of its tests
 // against it, unless the cache already holds a mapping made from a binary with
 // the same build ID.
-func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cache, next *mapCache) mapResult {
+//
+// cacheDir is empty when the cache is unusable, in which case the mapping is
+// still made and simply not remembered.
+func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) mapResult {
 	binary, err := c.compileTests(pkg.importPath)
 	if err != nil {
 		log.Errorf("cannot compile the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
@@ -231,12 +227,13 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cache, next *mapCac
 		log.Errorf("cannot identify the test binary of %s, so its mapping will not be cached: %v\n",
 			pkg.importPath, err)
 	}
-	if id != "" {
-		if entry, ok := cache.Packages[pkg.importPath]; ok && entry.BuildID == id {
+	if id != "" && cacheDir != "" {
+		// A hit writes nothing back. The file is already the answer, which is
+		// what makes it impossible for this run to evict another package's.
+		if entry, ok := loadCachedPackage(cacheDir, pkg.importPath); ok && entry.BuildID == id {
 			for name, profile := range entry.Tests {
 				tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
 			}
-			next.Packages[pkg.importPath] = entry
 
 			return mapResult{tests: len(entry.Tests), cached: true, mapped: true}
 		}
@@ -272,8 +269,11 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cache, next *mapCac
 	for name, profile := range mapped {
 		tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
 	}
-	if id != "" {
-		next.Packages[pkg.importPath] = cachedPackage{BuildID: id, Tests: mapped}
+	if id != "" && cacheDir != "" {
+		entry := cachedPackage{Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id, Tests: mapped}
+		if err := entry.save(cacheDir); err != nil {
+			log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)
+		}
 	}
 
 	return mapResult{tests: len(names), mapped: true}

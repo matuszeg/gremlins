@@ -212,61 +212,97 @@ func TestCacheKeyChangesWithWhatItCovers(t *testing.T) {
 	}
 }
 
-func TestLoadCacheIsEmptyRatherThanWrong(t *testing.T) {
+func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 	t.Parallel()
 
-	entry := cachedPackage{BuildID: "id", Tests: map[string]Profile{
-		"TestOne": {"a.go": {{StartLine: 1, StartCol: 2, EndLine: 3, EndCol: 4}}},
-	}}
+	entry := cachedPackage{
+		Version:    cacheVersion,
+		ImportPath: "example.com/p",
+		BuildID:    "id",
+		Tests: map[string]Profile{
+			"TestOne": {"a.go": {{StartLine: 1, StartCol: 2, EndLine: 3, EndCol: 4}}},
+		},
+	}
 
-	t.Run("a cache written with the same key round-trips", func(t *testing.T) {
+	t.Run("a package written into a directory round-trips", func(t *testing.T) {
 		t.Parallel()
 
-		path := filepath.Join(t.TempDir(), "testmap.json")
-		written := &mapCache{Version: cacheVersion, Key: "k", Packages: map[string]cachedPackage{"p": entry}}
-		if err := written.save(path); err != nil {
+		dir := t.TempDir()
+		if err := entry.save(dir); err != nil {
 			t.Fatalf("save() error: %v", err)
 		}
 
-		if diff := cmp.Diff(written, loadCache(path, "k")); diff != "" {
+		got, ok := loadCachedPackage(dir, entry.ImportPath)
+		if !ok {
+			t.Fatal("want the package read back, got a miss")
+		}
+		if diff := cmp.Diff(entry, got); diff != "" {
 			t.Errorf("cache round-trip mismatch (-want +got):\n%s", diff)
 		}
 	})
 
-	// Every one of these costs a rebuild, which is what happens without a cache
-	// at all. None of them is worth failing a run for, and none may yield a
-	// half-read map.
-	unusable := map[string]struct {
-		content string
-		key     string
-		write   bool
-	}{
-		"a file that is not there":     {write: false, key: "k"},
-		"a file that is not json":      {write: true, content: "{not json", key: "k"},
-		"a cache from another version": {write: true, content: `{"version":999,"key":"k","packages":{"p":{}}}`, key: "k"},
-		"a cache under another key":    {write: true, content: `{"version":1,"key":"other","packages":{"p":{}}}`, key: "k"},
-		"a cache with no packages map": {write: true, content: `{"version":1,"key":"k"}`, key: "k"},
+	// Every one of these costs a re-map of one package, which is what happens
+	// without a cache at all. None of them is worth failing a run for, and none
+	// may yield a half-read mapping.
+	unusable := map[string]string{
+		"a file that is not there": "",
+		"a file that is not json":  "{not json",
+		"a file from another version": `{"version":999,"import_path":"example.com/p",` +
+			`"build_id":"id","tests":{}}`,
+		"a file naming another package": `{"version":2,"import_path":"example.com/other",` +
+			`"build_id":"id","tests":{}}`,
+		"a file with no tests map": `{"version":2,"import_path":"example.com/p","build_id":"id"}`,
+		"a file with no build ID": `{"version":2,"import_path":"example.com/p",` +
+			`"build_id":"","tests":{}}`,
 	}
-	for name, tc := range unusable {
+	for name, content := range unusable {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			path := filepath.Join(t.TempDir(), "testmap.json")
-			if tc.write {
-				if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+			dir := t.TempDir()
+			if content != "" {
+				if err := os.WriteFile(cacheFilePath(dir, "example.com/p"), []byte(content), 0o600); err != nil {
 					t.Fatalf("cannot write the case: %v", err)
 				}
 			}
 
-			got := loadCache(path, tc.key)
-
-			if len(got.Packages) != 0 {
-				t.Errorf("want an empty cache, got %d packages", len(got.Packages))
-			}
-			if got.Version != cacheVersion || got.Key != tc.key {
-				t.Errorf("want a usable empty cache, got version %d key %q", got.Version, got.Key)
+			if got, ok := loadCachedPackage(dir, "example.com/p"); ok {
+				t.Errorf("want a miss, got %d tests", len(got.Tests))
 			}
 		})
+	}
+}
+
+// The point of one file per package: a run that maps one package leaves every
+// other package's file exactly where it was. Under the previous layout — one
+// file per module, rewritten from what the run saw — this destroyed the rest.
+func TestSavingOnePackageLeavesTheOthersAlone(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	for _, path := range []string{"example.com/a", "example.com/b"} {
+		entry := cachedPackage{
+			Version: cacheVersion, ImportPath: path, BuildID: "id",
+			Tests: map[string]Profile{"TestOne": {"a.go": {{StartLine: 1}}}},
+		}
+		if err := entry.save(dir); err != nil {
+			t.Fatalf("save() error: %v", err)
+		}
+	}
+
+	rewritten := cachedPackage{
+		Version: cacheVersion, ImportPath: "example.com/a", BuildID: "changed",
+		Tests: map[string]Profile{"TestTwo": {"a.go": {{StartLine: 9}}}},
+	}
+	if err := rewritten.save(dir); err != nil {
+		t.Fatalf("save() error: %v", err)
+	}
+
+	if got, ok := loadCachedPackage(dir, "example.com/b"); !ok || got.BuildID != "id" {
+		t.Errorf("want the untouched package still cached, got %+v (ok=%t)", got, ok)
+	}
+	if got, _ := loadCachedPackage(dir, "example.com/a"); got.BuildID != "changed" {
+		t.Errorf("want the rewritten package updated, got build ID %q", got.BuildID)
 	}
 }
 
@@ -276,9 +312,9 @@ func TestCachePathIsOutsideTheModule(t *testing.T) {
 	dir := t.TempDir()
 	c := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: "."}}
 
-	path, err := c.cachePath()
+	path, err := c.cacheDirPath("key")
 	if err != nil {
-		t.Fatalf("cachePath() error: %v", err)
+		t.Fatalf("cacheDirPath() error: %v", err)
 	}
 	if !strings.HasPrefix(path, dir) {
 		t.Errorf("want the cache under %s, got %s", dir, path)
@@ -287,11 +323,38 @@ func TestCachePathIsOutsideTheModule(t *testing.T) {
 	// Two checkouts of the same module must not share a map: the same code at
 	// two paths can still map differently, and the second would inherit it.
 	other := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: t.TempDir()}}
-	otherPath, err := other.cachePath()
+	otherPath, err := other.cacheDirPath("key")
 	if err != nil {
-		t.Fatalf("cachePath() error: %v", err)
+		t.Fatalf("cacheDirPath() error: %v", err)
 	}
 	if path == otherPath {
-		t.Error("two checkouts of the same module must not share a cache file")
+		t.Error("two checkouts of the same module must not share a cache directory")
+	}
+
+	// The key names a directory rather than living inside the files, so a map
+	// gathered under a different coverage scope cannot be read as this one.
+	underAnotherKey, err := c.cacheDirPath("other")
+	if err != nil {
+		t.Fatalf("cacheDirPath() error: %v", err)
+	}
+	if path == underAnotherKey {
+		t.Error("two cache keys must not share a directory")
+	}
+}
+
+func TestCacheFilePathSeparatesImportPaths(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	a := cacheFilePath(dir, "example.com/a")
+	if a == cacheFilePath(dir, "example.com/b") {
+		t.Error("two import paths must not name one file")
+	}
+	if a != cacheFilePath(dir, "example.com/a") {
+		t.Error("the same import path must name the same file")
+	}
+	// An import path holds separators, so it cannot be a file name as it is.
+	if filepath.Dir(a) != dir {
+		t.Errorf("want the file directly under %s, got %s", dir, a)
 	}
 }
