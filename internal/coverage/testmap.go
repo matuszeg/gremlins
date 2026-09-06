@@ -181,9 +181,7 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		}
 		res := c.mapPackage(&pkg, tm, cacheDir)
 		done += res.tests
-		if res.cached {
-			reused += res.tests
-		}
+		reused += res.reused
 		if res.mapped {
 			tm.mapped[pkg.importPath] = struct{}{}
 		}
@@ -194,11 +192,12 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	return tm, nil
 }
 
-// mapResult says what became of one package: how many tests it had, whether
-// they came from the cache, and whether the package can be selected from.
+// mapResult says what became of one package: how many tests it had, how many of
+// their mappings came from the cache, and whether the package can be selected
+// from.
 type mapResult struct {
 	tests  int
-	cached bool
+	reused int
 	mapped bool
 }
 
@@ -227,16 +226,19 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		log.Errorf("cannot identify the test binary of %s, so its mapping will not be cached: %v\n",
 			pkg.importPath, err)
 	}
+	var cached cachedPackage
+	hit := false
 	if id != "" && cacheDir != "" {
+		cached, hit = loadCachedPackage(cacheDir, pkg.importPath)
+	}
+	if hit && cached.BuildID == id {
 		// A hit writes nothing back. The file is already the answer, which is
 		// what makes it impossible for this run to evict another package's.
-		if entry, ok := loadCachedPackage(cacheDir, pkg.importPath); ok && entry.BuildID == id {
-			for name, profile := range entry.Tests {
-				tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
-			}
-
-			return mapResult{tests: len(entry.Tests), cached: true, mapped: true}
+		for name, profile := range cached.Tests {
+			tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
 		}
+
+		return mapResult{tests: len(cached.Tests), reused: len(cached.Tests), mapped: true}
 	}
 
 	names, err := c.listTests(pkg)
@@ -246,9 +248,17 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		return mapResult{}
 	}
 
-	complete := true
+	fp, reuse := c.reusableFrom(pkg, cached, hit)
+
+	complete, reused := true, 0
 	mapped := make(map[string]Profile, len(names))
 	for _, name := range names {
+		if profile, keep := reuse[name]; keep {
+			mapped[name] = profile
+			reused++
+
+			continue
+		}
 		profile, err := c.profileForTest(pkg, name)
 		if err != nil {
 			log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n",
@@ -270,13 +280,47 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
 	}
 	if id != "" && cacheDir != "" {
-		entry := cachedPackage{Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id, Tests: mapped}
+		entry := cachedPackage{
+			Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id,
+			Fingerprint: fp, Tests: mapped,
+		}
 		if err := entry.save(cacheDir); err != nil {
 			log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)
 		}
 	}
 
-	return mapResult{tests: len(names), mapped: true}
+	return mapResult{tests: len(names), reused: reused, mapped: true}
+}
+
+// reusableFrom takes the package's current fingerprint and works out which of
+// its cached mappings the change since survived.
+//
+// The fingerprint is returned whether or not anything was reused, because it is
+// what the next run will compare against; an empty one says the package could
+// not be read, and costs that run a whole re-map.
+//
+// Narrowing is off under --cross-package: a profile then covers lines in
+// packages this fingerprint says nothing about, so "no changed line falls in
+// this profile" would be a claim about only part of it.
+func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool) (fingerprint, map[string]Profile) {
+	if c.crossPackage {
+		return fingerprint{}, nil
+	}
+	fp, ok := c.fingerprintOf(pkg)
+	if !ok {
+		log.Errorf("cannot read the sources of %s, so its whole map will be rebuilt\n", pkg.importPath)
+
+		return fingerprint{}, nil
+	}
+	if !hit {
+		return fp, nil
+	}
+	reuse, narrowed := reusable(cached, fp)
+	if !narrowed {
+		return fp, nil
+	}
+
+	return fp, reuse
 }
 
 const wholeModule = "./..."

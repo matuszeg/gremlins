@@ -61,17 +61,124 @@ const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
 // used to evict the rest of the module's map.
 const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
 
+// The fixture has real sources as well as real directories, because the map
+// cache reads them: what a package's source looked like when its map was made
+// is how a run decides which of its mappings a change reached. The line numbers
+// below are the ones the fake profiles name, so a change to either has to be a
+// change to both.
+const (
+	// rootSource declares Descend over lines 5-7 and Ascend over lines 9-11.
+	rootSource = `package root
+
+import "example.com/vm"
+
+func Descend(n int) int {
+	return vm.Clamp(n, 0, 10)
+}
+
+func Ascend(n int) int {
+	return vm.Clamp(n, 10, 0)
+}
+`
+	// vmSource declares Clamp over lines 3-10, doc comment included, and Size
+	// over lines 12-14. No test executes Size, which is what makes it the case
+	// per-test invalidation exists for.
+	vmSource = `package vm
+
+// Clamp holds n between lo and hi.
+func Clamp(n, lo, hi int) int {
+	x := n
+	if x > hi {
+		x = hi
+	}
+	return x
+}
+
+func Size(v []int) int {
+	return len(v)
+}
+`
+)
+
+// The calc package is the fixture for invalidating a map per test rather than
+// per package. Its profiles name only its own files, which is the shape a run
+// without --cross-package produces — the test binary is built with -coverpkg
+// for its own package alone — and the shape per-test invalidation is sound for.
+const (
+	// calcSource declares Double over lines 3-5 and Triple over lines 7-9.
+	calcSource = `package calc
+
+func Double(n int) int {
+	return n * 2
+}
+
+func Triple(n int) int {
+	return n * 3
+}
+`
+	// calcSourceDoubleGrown adds a line inside Double, which pushes Triple down
+	// by one without changing a byte of it.
+	calcSourceDoubleGrown = `package calc
+
+func Double(n int) int {
+	m := n
+	return m * 2
+}
+
+func Triple(n int) int {
+	return n * 3
+}
+`
+	doubleTestSource = `package calc
+
+import "testing"
+
+func TestDouble(t *testing.T) {
+	if Double(2) != 4 {
+		t.Fail()
+	}
+}
+`
+	tripleTestSource = `package calc
+
+import "testing"
+
+func TestTriple(t *testing.T) {
+	if Triple(2) != 6 {
+		t.Fail()
+	}
+}
+`
+)
+
+// tripleEndLine is the last line of Triple before Double grows, and so a line
+// that is covered only once a kept mapping has been moved with it.
+const tripleEndLine = 10
+
 func fixtureRoot(t *testing.T) string {
 	t.Helper()
 
 	root := t.TempDir()
-	for _, d := range []string{"root", "vm", "empty"} {
+	for _, d := range []string{"root", "vm", "empty", "calc"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o750); err != nil {
 			t.Fatalf("cannot create the fixture directory: %v", err)
 		}
 	}
+	writeFixture(t, filepath.Join(root, "root", "root.go"), rootSource)
+	writeFixture(t, filepath.Join(root, "vm", "vm.go"), vmSource)
+	writeFixture(t, filepath.Join(root, "calc", "calc.go"), calcSource)
+	writeFixture(t, filepath.Join(root, "calc", "double_test.go"), doubleTestSource)
+	writeFixture(t, filepath.Join(root, "calc", "triple_test.go"), tripleTestSource)
 
 	return root
+}
+
+func writeFixture(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("cannot write the fixture source: %v", err)
+	}
 }
 
 func buildMap(t *testing.T, helper string) *coverage.TestMap {
@@ -99,8 +206,8 @@ func TestBuildTestMap(t *testing.T) {
 	tm := buildMap(t, "TestTestMapHelperProcess")
 
 	t.Run("maps every test of every package", func(t *testing.T) {
-		if got := tm.Len(); got != 3 {
-			t.Errorf("want 3 tests mapped, got %d", got)
+		if got := tm.Len(); got != 5 {
+			t.Errorf("want 5 tests mapped, got %d", got)
 		}
 	})
 
@@ -165,8 +272,9 @@ func TestBuildTestMapLeavesAPackageUnmappedWhenATestCannotBeRun(t *testing.T) {
 	if !tm.Mapped("example.com/vm") {
 		t.Error("expected the other package to still be mapped")
 	}
-	if got := tm.Len(); got != 1 {
-		t.Errorf("want only the mapped package's single test, got %d", got)
+	// Everything but the package holding the unrunnable test still maps.
+	if got := tm.Len(); got != 3 {
+		t.Errorf("want the other packages' tests, got %d", got)
 	}
 }
 
@@ -202,10 +310,14 @@ const (
 		"example.com/vm/vm.go:4.29,6.15 2 1\n" +
 		"example.com/vm/vm.go:6.15,8.3 1 1\n"
 	profileRangeAscending = "mode: set\n" +
-		"example.com/root.go:6.26,6.50 1 1\n" +
+		"example.com/root.go:10.26,10.50 1 1\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileSizeAscending = "mode: set\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
+	profileDouble = "mode: set\n" +
+		"example.com/calc/calc.go:3.24,5.2 1 1\n"
+	profileTriple = "mode: set\n" +
+		"example.com/calc/calc.go:7.24,9.2 1 1\n"
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
@@ -294,9 +406,12 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	if hasFlag(os.Args, "-test.list") {
-		if strings.HasSuffix(cmd, binaryName("example.com/vm")) {
+		switch {
+		case strings.HasSuffix(cmd, binaryName("example.com/vm")):
 			fmt.Fprint(os.Stdout, "TestSizeAscending\nwarning: GOCOVERDIR not set, no coverage data emitted\n")
-		} else {
+		case strings.HasSuffix(cmd, binaryName("example.com/calc")):
+			fmt.Fprint(os.Stdout, "TestDouble\nTestTriple\n")
+		default:
 			fmt.Fprint(os.Stdout, "TestRangeDescending\nTestRangeAscending\n")
 		}
 		os.Exit(0) // skipcq: RVV-A0003
@@ -312,6 +427,8 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		"TestRangeDescending": profileRangeDescending,
 		"TestRangeAscending":  profileRangeAscending,
 		"TestSizeAscending":   profileSizeAscending,
+		"TestDouble":          profileDouble,
+		"TestTriple":          profileTriple,
 	}
 	profile, ok := profiles[run]
 	if !ok {
@@ -329,6 +446,7 @@ func listPackagesAsGo(root, only string) {
 		{"example.com", "root", "2\t0"},
 		{"example.com/vm", "vm", "1\t0"},
 		{"example.com/empty", "empty", "0\t0"},
+		{"example.com/calc", "calc", "2\t0"},
 	}
 	for _, l := range lines {
 		if only != "" && l.path != only {

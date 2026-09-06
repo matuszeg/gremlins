@@ -27,6 +27,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"github.com/go-gremlins/gremlins/internal/coverage"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -143,8 +144,23 @@ func (h *cacheHarness) cacheFiles() []string {
 	return found
 }
 
+// blockOrder makes a union comparable. Merge keeps every distinct block but not
+// a fixed order, because it reads profiles out of a map.
+func blockOrder() cmp.Option {
+	return cmpopts.SortSlices(func(a, b coverage.Block) bool {
+		if a.StartLine != b.StartLine {
+			return a.StartLine < b.StartLine
+		}
+
+		return a.StartCol < b.StartCol
+	})
+}
+
 func allTests() []string {
-	return []string{"TestRangeAscending", "TestRangeDescending", "TestSizeAscending"}
+	return []string{
+		"TestDouble", "TestRangeAscending", "TestRangeDescending",
+		"TestSizeAscending", "TestTriple",
+	}
 }
 
 func TestMapCacheReusesUnchangedPackages(t *testing.T) {
@@ -161,7 +177,7 @@ func TestMapCacheReusesUnchangedPackages(t *testing.T) {
 	if got := h.testsRun(); len(got) != 0 {
 		t.Errorf("want no test executed on the second build, got %v", got)
 	}
-	if diff := cmp.Diff(first.Union(), second.Union()); diff != "" {
+	if diff := cmp.Diff(first.Union(), second.Union(), blockOrder()); diff != "" {
 		t.Errorf("the cached map covers different code (-want +got):\n%s", diff)
 	}
 	if first.Len() != second.Len() {
@@ -237,7 +253,7 @@ func TestMapCacheRebuildsWhenTheFileIsUnusable(t *testing.T) {
 			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
 				t.Errorf("want the unusable package re-mapped (-want +got):\n%s", diff)
 			}
-			if tm.Len() != 3 {
+			if tm.Len() != 5 {
 				t.Errorf("want the full map after the rebuild, got %d tests", tm.Len())
 			}
 		})
@@ -254,7 +270,7 @@ func TestMapCacheSurvivesTheRoundTripExactly(t *testing.T) {
 	if diff := cmp.Diff(first.TestsFor(pos), second.TestsFor(pos)); diff != "" {
 		t.Errorf("the cached map answers differently (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff(first.Union(), second.Union()); diff != "" {
+	if diff := cmp.Diff(first.Union(), second.Union(), blockOrder()); diff != "" {
 		t.Errorf("the cached union differs (-want +got):\n%s", diff)
 	}
 }
@@ -266,7 +282,7 @@ func TestAScopedRunDoesNotEvictTheRestOfTheModule(t *testing.T) {
 	h := newCacheHarness(t)
 
 	h.build("TestTestMapHelperProcess", "")
-	if got := h.cacheFiles(); len(got) != 2 {
+	if got := h.cacheFiles(); len(got) != 3 {
 		t.Fatalf("want one file per package with tests, got %d", len(got))
 	}
 
@@ -274,8 +290,8 @@ func TestAScopedRunDoesNotEvictTheRestOfTheModule(t *testing.T) {
 	if got := scoped.Len(); got != 1 {
 		t.Errorf("want the scoped run to map its one package, got %d tests", got)
 	}
-	if got := h.cacheFiles(); len(got) != 2 {
-		t.Errorf("want the other package's file left alone, got %d files", len(got))
+	if got := h.cacheFiles(); len(got) != 3 {
+		t.Errorf("want the other packages' files left alone, got %d files", len(got))
 	}
 
 	// The whole-module run that follows is the one that pays for eviction, so
@@ -293,6 +309,7 @@ func TestTwoScopedRunsDoNotClobberEachOther(t *testing.T) {
 
 	h.buildScoped("TestTestMapHelperProcess", "", "example.com")
 	h.buildScoped("TestTestMapHelperProcess", "", "example.com/vm")
+	h.buildScoped("TestTestMapHelperProcess", "", "example.com/calc")
 
 	h.build("TestTestMapHelperProcess", "")
 	if got := h.testsRun(); len(got) != 0 {
