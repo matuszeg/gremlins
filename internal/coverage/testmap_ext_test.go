@@ -56,17 +56,129 @@ const buildIDsEnv = "GREMLINS_TEST_BUILD_IDS"
 // rebuild that produced the same answer.
 const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
 
+// listOnlyEnv narrows the `go list` the helper fakes to one package, which is
+// how a test stands a scoped run — the recommended workflow, and the one that
+// used to evict the rest of the module's map.
+const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
+
+// The fixture has real sources as well as real directories, because the map
+// cache reads them: what a package's source looked like when its map was made
+// is how a run decides which of its mappings a change reached. The line numbers
+// below are the ones the fake profiles name, so a change to either has to be a
+// change to both.
+const (
+	// rootSource declares Descend over lines 5-7 and Ascend over lines 9-11.
+	rootSource = `package root
+
+import "example.com/vm"
+
+func Descend(n int) int {
+	return vm.Clamp(n, 0, 10)
+}
+
+func Ascend(n int) int {
+	return vm.Clamp(n, 10, 0)
+}
+`
+	// vmSource declares Clamp over lines 3-10, doc comment included, and Size
+	// over lines 12-14. No test executes Size, which is what makes it the case
+	// per-test invalidation exists for.
+	vmSource = `package vm
+
+// Clamp holds n between lo and hi.
+func Clamp(n, lo, hi int) int {
+	x := n
+	if x > hi {
+		x = hi
+	}
+	return x
+}
+
+func Size(v []int) int {
+	return len(v)
+}
+`
+)
+
+// The calc package is the fixture for invalidating a map per test rather than
+// per package. Its profiles name only its own files, which is the shape a run
+// without --cross-package produces — the test binary is built with -coverpkg
+// for its own package alone — and the shape per-test invalidation is sound for.
+const (
+	// calcSource declares Double over lines 3-5 and Triple over lines 7-9.
+	calcSource = `package calc
+
+func Double(n int) int {
+	return n * 2
+}
+
+func Triple(n int) int {
+	return n * 3
+}
+`
+	// calcSourceDoubleGrown adds a line inside Double, which pushes Triple down
+	// by one without changing a byte of it.
+	calcSourceDoubleGrown = `package calc
+
+func Double(n int) int {
+	m := n
+	return m * 2
+}
+
+func Triple(n int) int {
+	return n * 3
+}
+`
+	doubleTestSource = `package calc
+
+import "testing"
+
+func TestDouble(t *testing.T) {
+	if Double(2) != 4 {
+		t.Fail()
+	}
+}
+`
+	tripleTestSource = `package calc
+
+import "testing"
+
+func TestTriple(t *testing.T) {
+	if Triple(2) != 6 {
+		t.Fail()
+	}
+}
+`
+)
+
+// tripleEndLine is the last line of Triple before Double grows, and so a line
+// that is covered only once a kept mapping has been moved with it.
+const tripleEndLine = 10
+
 func fixtureRoot(t *testing.T) string {
 	t.Helper()
 
 	root := t.TempDir()
-	for _, d := range []string{"root", "vm", "empty"} {
+	for _, d := range []string{"root", "vm", "empty", "calc"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o750); err != nil {
 			t.Fatalf("cannot create the fixture directory: %v", err)
 		}
 	}
+	writeFixture(t, filepath.Join(root, "root", "root.go"), rootSource)
+	writeFixture(t, filepath.Join(root, "vm", "vm.go"), vmSource)
+	writeFixture(t, filepath.Join(root, "calc", "calc.go"), calcSource)
+	writeFixture(t, filepath.Join(root, "calc", "double_test.go"), doubleTestSource)
+	writeFixture(t, filepath.Join(root, "calc", "triple_test.go"), tripleTestSource)
 
 	return root
+}
+
+func writeFixture(t *testing.T, path, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("cannot write the fixture source: %v", err)
+	}
 }
 
 func buildMap(t *testing.T, helper string) *coverage.TestMap {
@@ -94,8 +206,8 @@ func TestBuildTestMap(t *testing.T) {
 	tm := buildMap(t, "TestTestMapHelperProcess")
 
 	t.Run("maps every test of every package", func(t *testing.T) {
-		if got := tm.Len(); got != 3 {
-			t.Errorf("want 3 tests mapped, got %d", got)
+		if got := tm.Len(); got != 5 {
+			t.Errorf("want 5 tests mapped, got %d", got)
 		}
 	})
 
@@ -160,8 +272,9 @@ func TestBuildTestMapLeavesAPackageUnmappedWhenATestCannotBeRun(t *testing.T) {
 	if !tm.Mapped("example.com/vm") {
 		t.Error("expected the other package to still be mapped")
 	}
-	if got := tm.Len(); got != 1 {
-		t.Errorf("want only the mapped package's single test, got %d", got)
+	// Everything but the package holding the unrunnable test still maps.
+	if got := tm.Len(); got != 3 {
+		t.Errorf("want the other packages' tests, got %d", got)
 	}
 }
 
@@ -197,17 +310,21 @@ const (
 		"example.com/vm/vm.go:4.29,6.15 2 1\n" +
 		"example.com/vm/vm.go:6.15,8.3 1 1\n"
 	profileRangeAscending = "mode: set\n" +
-		"example.com/root.go:6.26,6.50 1 1\n" +
+		"example.com/root.go:10.26,10.50 1 1\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileSizeAscending = "mode: set\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
+	profileDouble = "mode: set\n" +
+		"example.com/calc/calc.go:3.24,5.2 1 1\n"
+	profileTriple = "mode: set\n" +
+		"example.com/calc/calc.go:7.24,9.2 1 1\n"
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
-	return fakeGoCommandWith(helper, pkgRoot, "", "")
+	return fakeGoCommandWith(helper, pkgRoot, "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -218,6 +335,7 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath string) func(command s
 			pkgDirsEnv + "=" + pkgRoot,
 			buildIDsEnv + "=" + buildIDs,
 			invocationLogEnv + "=" + logPath,
+			listOnlyEnv + "=" + listOnly,
 		}
 
 		return cmd
@@ -272,10 +390,22 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
+	// A dependency listing is a `go list` too, and it has to be answered before
+	// the package listing or the package listing swallows it.
+	if cmd == "go" && hasFlag(os.Args, "list") && hasFlag(os.Args, "-deps") {
+		listDepsAsGo(root, os.Args[len(os.Args)-1])
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
+	if cmd == "go" && hasFlag(os.Args, "env") {
+		// A toolchain root and a module cache the fixture is not inside, so
+		// nothing the fixture holds is filtered out as already pinned.
+		fmt.Fprint(os.Stdout, "/nonexistent/goroot\n/nonexistent/modcache\ngo-fixture\n")
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
 	if cmd == "go" && hasFlag(os.Args, "list") {
-		fmt.Fprintf(os.Stdout, "example.com\t%s\t2\t0\n", filepath.Join(root, "root"))
-		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\t1\t0\n", filepath.Join(root, "vm"))
-		fmt.Fprintf(os.Stdout, "example.com/empty\t%s\t0\t0\n", filepath.Join(root, "empty"))
+		listPackagesAsGo(root, os.Getenv(listOnlyEnv))
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -290,9 +420,12 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	if hasFlag(os.Args, "-test.list") {
-		if strings.HasSuffix(cmd, binaryName("example.com/vm")) {
+		switch {
+		case strings.HasSuffix(cmd, binaryName("example.com/vm")):
 			fmt.Fprint(os.Stdout, "TestSizeAscending\nwarning: GOCOVERDIR not set, no coverage data emitted\n")
-		} else {
+		case strings.HasSuffix(cmd, binaryName("example.com/calc")):
+			fmt.Fprint(os.Stdout, "TestDouble\nTestTriple\n")
+		default:
 			fmt.Fprint(os.Stdout, "TestRangeDescending\nTestRangeAscending\n")
 		}
 		os.Exit(0) // skipcq: RVV-A0003
@@ -308,6 +441,8 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		"TestRangeDescending": profileRangeDescending,
 		"TestRangeAscending":  profileRangeAscending,
 		"TestSizeAscending":   profileSizeAscending,
+		"TestDouble":          profileDouble,
+		"TestTriple":          profileTriple,
 	}
 	profile, ok := profiles[run]
 	if !ok {
@@ -316,6 +451,49 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// listPackagesAsGo writes the package lines `go list -f` would, narrowed to one
+// package when the test asked for a scoped run.
+func listPackagesAsGo(root, only string) {
+	lines := []struct{ path, dir, tests string }{
+		{"example.com", "root", "2\t0"},
+		{"example.com/vm", "vm", "1\t0"},
+		{"example.com/empty", "empty", "0\t0"},
+		{"example.com/calc", "calc", "2\t0"},
+	}
+	for _, l := range lines {
+		if only != "" && l.path != only {
+			continue
+		}
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%s\n", l.path, filepath.Join(root, l.dir), l.tests)
+	}
+}
+
+// listDepsAsGo writes the directories `go list -deps -test` would, which is
+// what says whether a package was changed from underneath. Everything depends
+// on vm, so an edit there is the case where a package's own fingerprint looks
+// narrowable and its mappings are stale anyway.
+func listDepsAsGo(root, pkg string) {
+	fmt.Fprintln(os.Stdout, filepath.Join(root, dirOf(pkg)))
+	if pkg != "example.com/vm" {
+		fmt.Fprintln(os.Stdout, filepath.Join(root, "vm"))
+	}
+	// go writes build diagnostics to the same stream, and a synthesised test
+	// package can report no directory at all.
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "go: downloading example.com/thing v1.0.0")
+}
+
+func dirOf(pkg string) string {
+	switch pkg {
+	case "example.com/vm":
+		return "vm"
+	case "example.com/calc":
+		return "calc"
+	default:
+		return "root"
+	}
 }
 
 // buildIDFor reports the build ID the test chose for the package this binary

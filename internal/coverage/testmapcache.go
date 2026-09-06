@@ -26,51 +26,68 @@ import (
 	"strings"
 )
 
-// cacheVersion is the shape of the cache file. A cache written by a different
+// cacheVersion is the shape of a cache file. A file written by a different
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
-const cacheVersion = 1
+//
+// Version 3 records the package's source fingerprint beside its mappings, so
+// that a changed package can keep the mappings the change could not have
+// touched. Version 2 was one file per package. Version 1 was one file per
+// module, which meant a run had to write back every package it had not looked
+// at or lose them — and a scoped run, which is the recommended workflow, looks
+// at one.
+const cacheVersion = 3
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
-type cachedPackage struct {
-	BuildID string             `json:"build_id"`
-	Tests   map[string]Profile `json:"tests"`
-}
-
-// mapCache is the on-disk test map.
 //
-// The key of a package is the build ID of its test binary, which Go computes
-// over the package's own source AND every dependency's, transitively. So an
-// unchanged build ID means nothing that the package's tests execute has
-// changed, and the coverage they produced cannot have changed either. Touching
-// a package three levels down invalidates every binary that links it, without
-// Gremlins doing any dependency analysis of its own.
+// The build ID is the key, and Go computes it over the package's own source AND
+// every dependency's, transitively. So an unchanged build ID means nothing the
+// package's tests execute has changed, and the coverage they produced cannot
+// have changed either. Touching a package three levels down invalidates exactly
+// the binaries that link it, without Gremlins doing any dependency analysis of
+// its own.
 //
 // What the build ID cannot see is state outside the build: a test whose
 // coverage depends on a database, a clock, or the network can map differently
 // on two runs of the same binary. That is the same non-determinism the map has
 // without a cache, held for longer.
-type mapCache struct {
-	Version  int                      `json:"version"`
-	Key      string                   `json:"key"`
-	Packages map[string]cachedPackage `json:"packages"`
+//
+// The build ID being coarse is why Fingerprint is here as well: it records what
+// the package's source looked like when the mappings were made, so that a run
+// whose build ID has moved can still ask which of them the change reached. An
+// entry may have none — a package whose directory could not be read — in which
+// case a changed build ID re-maps the whole package, as it always did.
+//
+// ImportPath is stored as well as hashed into the file name, so that a file
+// found under the wrong name is a miss rather than another package's answer.
+type cachedPackage struct {
+	Tests       map[string]Profile `json:"tests"`
+	ImportPath  string             `json:"import_path"`
+	BuildID     string             `json:"build_id"`
+	Fingerprint fingerprint        `json:"fingerprint"`
+	Version     int                `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than
 // per package: how much of the module was mapped — a map built without
 // --cross-package records only each test's own package — and the build tags
 // that decide which files exist at all.
+//
+// It names a directory rather than living inside the files, so that a
+// --cross-package map and a narrow one cannot be mistaken for one another even
+// though they describe the same packages.
 func cacheKey(scope, buildTags string) string {
 	sum := sha256.Sum256([]byte(scope + "\x00" + buildTags))
 
 	return hex.EncodeToString(sum[:])
 }
 
-// cachePath is where the map for this module lives. It is outside the module,
-// under the user's cache directory unless a caller names another, so that a
-// checkout stays clean and two checkouts of the same module do not share a map.
-func (c *Coverage) cachePath() (string, error) {
+// cacheDirPath is where this module's per-package map files live. It is outside
+// the module, under the user's cache directory unless a caller names another,
+// so that a checkout stays clean and two checkouts of the same module do not
+// share a map.
+func (c *Coverage) cacheDirPath(key string) (string, error) {
 	base := c.cacheDir
 	if base == "" {
 		var err error
@@ -86,44 +103,62 @@ func (c *Coverage) cachePath() (string, error) {
 	}
 	sum := sha256.Sum256([]byte(modName + "\x00" + root))
 
-	return filepath.Join(base, "gremlins", "testmap", hex.EncodeToString(sum[:])+".json"), nil
+	return filepath.Join(base, "gremlins", "testmap", hex.EncodeToString(sum[:]), key), nil
 }
 
-// loadCache reads the cache, or returns an empty one.
+// cacheFilePath is the file holding one package's mapping. The import path is
+// hashed rather than used directly: it contains separators, and on a
+// case-insensitive filesystem two distinct import paths can name one file.
+func cacheFilePath(dir, importPath string) string {
+	sum := sha256.Sum256([]byte(importPath))
+
+	return filepath.Join(dir, hex.EncodeToString(sum[:])+".json")
+}
+
+// loadCachedPackage reads one package's mapping, reporting whether there is a
+// usable one.
 //
-// Every failure returns an empty cache rather than an error: a missing,
-// unreadable, corrupt, or stale-versioned cache costs a rebuild, which is
+// Every failure reads as a miss rather than an error: a missing, unreadable,
+// corrupt, or stale-versioned file costs a re-map of that package, which is
 // exactly what happens without a cache at all. There is no failure here worth
 // stopping a run for.
-func loadCache(path, key string) *mapCache {
-	empty := &mapCache{Version: cacheVersion, Key: key, Packages: map[string]cachedPackage{}}
-
-	data, err := os.ReadFile(path) //nolint:gosec // G304: the path is Gremlins' own cache directory
+//
+// A package that has gone away is never asked about — reads are keyed by an
+// import path taken from the current `go list` — so its file is dead disk
+// rather than a stale answer, and reclaiming it is housekeeping, not
+// correctness.
+func loadCachedPackage(dir, importPath string) (cachedPackage, bool) {
+	data, err := os.ReadFile(cacheFilePath(dir, importPath))
 	if err != nil {
-		return empty
+		return cachedPackage{}, false
 	}
-	var c mapCache
-	if err := json.Unmarshal(data, &c); err != nil {
-		return empty
+	var p cachedPackage
+	if err := json.Unmarshal(data, &p); err != nil {
+		return cachedPackage{}, false
 	}
-	if c.Version != cacheVersion || c.Key != key || c.Packages == nil {
-		return empty
+	if p.Version != cacheVersion || p.ImportPath != importPath || p.Tests == nil || p.BuildID == "" {
+		return cachedPackage{}, false
 	}
 
-	return &c
+	return p, true
 }
 
-// save writes the cache through a temporary file, so that an interrupted run
-// leaves the previous cache rather than a half-written one.
-func (c *mapCache) save(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+// save writes one package's mapping through a temporary file in the same
+// directory, so that an interrupted run leaves the previous file rather than a
+// half-written one.
+//
+// A run writes only the packages it mapped. It has no reason to touch another
+// package's file, so a scoped run cannot evict the rest of the module's map,
+// and two runs scoped to different packages cannot clobber each other.
+func (p cachedPackage) save(dir string) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	data, err := json.Marshal(c)
+	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "testmap-*.json")
+	tmp, err := os.CreateTemp(dir, "testmap-*.json")
 	if err != nil {
 		return err
 	}
@@ -140,7 +175,7 @@ func (c *mapCache) save(path string) error {
 		return err
 	}
 
-	return os.Rename(name, path)
+	return os.Rename(name, cacheFilePath(dir, p.ImportPath))
 }
 
 // buildID asks Go for the identity of a compiled binary. It is the hash Go
