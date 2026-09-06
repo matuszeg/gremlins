@@ -193,21 +193,87 @@ func TestMapScope(t *testing.T) {
 	})
 }
 
+func TestCacheScopeIsWhatAMappingMeans(t *testing.T) {
+	t.Parallel()
+
+	whole := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
+	scoped := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "internal/vm"}
+
+	// How much of the module was scanned decides which packages get mapped, and
+	// nothing about what any one mapping says: without --cross-package every test
+	// binary is built with -coverpkg set to its own package, so an entry is a
+	// function of that package alone. Dividing the cache by the scanned path
+	// would mean a run scoped to one package could not read the map a
+	// whole-module run had just built for it — which is the whole point of
+	// having a cache in CI.
+	t.Run("the scanned path does not divide the cache", func(t *testing.T) {
+		t.Parallel()
+
+		a := &Coverage{mod: whole}
+		b := &Coverage{mod: scoped}
+		if a.cacheScope() != b.cacheScope() {
+			t.Errorf("a scoped run must share the whole-module map, got %q and %q",
+				a.cacheScope(), b.cacheScope())
+		}
+	})
+
+	// Cross-package instruments each binary over the module, so its entries
+	// record lines outside the package under test: the same tests, with strictly
+	// more in them. Read as a narrow map it would say no test reaches a line that
+	// one does, and the mutant there would be judged by fewer tests than execute
+	// it.
+	t.Run("cross-package does divide it", func(t *testing.T) {
+		t.Parallel()
+
+		narrow := &Coverage{mod: whole}
+		wide := &Coverage{mod: whole, crossPackage: true}
+		if narrow.cacheScope() == wide.cacheScope() {
+			t.Error("a cross-package map records other packages' lines and cannot be read as a narrow one")
+		}
+	})
+
+	// Two cross-package runs with different --coverpkg record a different set of
+	// packages per test, and the scanned path could not tell them apart: it
+	// answered "./..." for both.
+	t.Run("so does a different cover-pkg under cross-package", func(t *testing.T) {
+		t.Parallel()
+
+		module := &Coverage{mod: whole, crossPackage: true}
+		subtree := &Coverage{mod: whole, crossPackage: true, coverPkg: "./internal/..."}
+		if module.cacheScope() == subtree.cacheScope() {
+			t.Error("different --coverpkg values instrument different packages and must not share a cache")
+		}
+	})
+
+	// A --coverpkg that cross-package is not on to use changes nothing about the
+	// map, for the same reason the scanned path does not: the binaries are still
+	// built against their own packages.
+	t.Run("a cover-pkg without cross-package does not divide it", func(t *testing.T) {
+		t.Parallel()
+
+		plain := &Coverage{mod: whole}
+		withCoverPkg := &Coverage{mod: whole, coverPkg: "./internal/..."}
+		if plain.cacheScope() != withCoverPkg.cacheScope() {
+			t.Error("without --cross-package a configured --coverpkg does not reach the test map")
+		}
+	})
+}
+
 func TestCacheKeyChangesWithWhatItCovers(t *testing.T) {
 	t.Parallel()
 
-	base := cacheKey("./...", "")
+	base := cacheKey("self", "")
 
 	// Both of these change what a profile means, across every package at once:
 	// the coverage scope decides which packages appear in it, and the build tags
 	// decide which files exist at all.
-	if cacheKey("./internal/...", "") == base {
+	if cacheKey(wholeModule, "") == base {
 		t.Error("a different coverage scope must not share a cache")
 	}
-	if cacheKey("./...", "integration") == base {
+	if cacheKey("self", "integration") == base {
 		t.Error("different build tags must not share a cache")
 	}
-	if cacheKey("./...", "") != base {
+	if cacheKey("self", "") != base {
 		t.Error("the same inputs must give the same key")
 	}
 }

@@ -39,6 +39,9 @@ import (
 const (
 	clampedLine   = 7
 	uncoveredLine = 20
+	// vmOwnLine is executed by the vm package's own test, which is what a run
+	// scoped to that package can still answer about.
+	vmOwnLine = 5
 )
 
 // pkgDirsEnv carries the fixture's package directories to the helper process,

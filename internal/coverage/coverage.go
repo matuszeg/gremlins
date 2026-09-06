@@ -292,9 +292,19 @@ func (c *Coverage) parse(data io.Reader) (Profile, error) {
 	return status, nil
 }
 
+// removeModuleFromPath is the name a profile block is recorded under: the file's
+// path from the MODULE ROOT, whatever directory Gremlins was pointed at.
+//
+// It used to be relative to the calling directory, which made the same file two
+// different names depending on the run's scope — `internal/api/handler.go` from
+// the module root, `handler.go` from a run scoped to that package. Nothing
+// noticed while a profile was only ever compared with positions from the same
+// run. The test map cache is the thing that outlives a run, and under two names
+// a restored map answers about no test at all: never wrong, and exactly as slow
+// as having no cache.
+//
+// A mutant's position IS relative to the calling directory, so the comparison
+// translates it: see ProfilePosition.
 func (c *Coverage) removeModuleFromPath(p *cover.Profile) string {
-	path := strings.ReplaceAll(p.FileName, c.mod.Name+"/", "")
-	path, _ = filepath.Rel(c.mod.CallingDir, path)
-
-	return path
+	return strings.ReplaceAll(p.FileName, c.mod.Name+"/", "")
 }
