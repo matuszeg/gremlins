@@ -61,6 +61,12 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	if was.Shell == "" || was.Shell != now.Shell {
 		return nil, false
 	}
+	// The build ID moved for a reason outside this package as well as, or
+	// instead of, one inside it — and a dependency's lines are in no profile
+	// here, so which mappings it reached cannot be worked out.
+	if was.Inputs == "" || was.Inputs != now.Inputs {
+		return nil, false
+	}
 
 	dirtyLines := map[string][]span{}
 	dirtyTests := map[string]bool{}
@@ -92,6 +98,20 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 		case before.Test == "":
 			moved[before.File] = append(moved[before.File],
 				span{start: before.Start, end: before.End, delta: after.Start - before.Start})
+		}
+	}
+
+	// The shell agreeing means every declaration it holds is unchanged, so they
+	// are paired by position and contribute only where they have moved to. A
+	// count that disagrees means the pairing would be a guess.
+	for file, before := range was.Others {
+		after := now.Others[file]
+		if len(after) != len(before) {
+			return nil, false
+		}
+		for i, decl := range before {
+			moved[file] = append(moved[file],
+				span{start: decl.Start, end: decl.End, delta: after[i].Start - decl.Start})
 		}
 	}
 

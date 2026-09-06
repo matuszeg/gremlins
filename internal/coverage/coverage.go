@@ -56,6 +56,11 @@ type Coverage struct {
 	crossPackage    bool
 	integrationMode bool
 
+	// Read once per run and shared by every package the map builder visits:
+	// what the toolchain is, and what each dependency directory hashes to.
+	env       *goEnvironment
+	dirHashes map[string]string
+
 	// When profilePath is set, Run parses that pre-computed profile instead
 	// of gathering coverage itself, and reports profileElapsed as the test
 	// suite duration.

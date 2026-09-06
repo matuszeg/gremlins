@@ -390,6 +390,20 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
+	// A dependency listing is a `go list` too, and it has to be answered before
+	// the package listing or the package listing swallows it.
+	if cmd == "go" && hasFlag(os.Args, "list") && hasFlag(os.Args, "-deps") {
+		listDepsAsGo(root, os.Args[len(os.Args)-1])
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
+	if cmd == "go" && hasFlag(os.Args, "env") {
+		// A toolchain root and a module cache the fixture is not inside, so
+		// nothing the fixture holds is filtered out as already pinned.
+		fmt.Fprint(os.Stdout, "/nonexistent/goroot\n/nonexistent/modcache\ngo-fixture\n")
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
 	if cmd == "go" && hasFlag(os.Args, "list") {
 		listPackagesAsGo(root, os.Getenv(listOnlyEnv))
 		os.Exit(0) // skipcq: RVV-A0003
@@ -453,6 +467,32 @@ func listPackagesAsGo(root, only string) {
 			continue
 		}
 		fmt.Fprintf(os.Stdout, "%s\t%s\t%s\n", l.path, filepath.Join(root, l.dir), l.tests)
+	}
+}
+
+// listDepsAsGo writes the directories `go list -deps -test` would, which is
+// what says whether a package was changed from underneath. Everything depends
+// on vm, so an edit there is the case where a package's own fingerprint looks
+// narrowable and its mappings are stale anyway.
+func listDepsAsGo(root, pkg string) {
+	fmt.Fprintln(os.Stdout, filepath.Join(root, dirOf(pkg)))
+	if pkg != "example.com/vm" {
+		fmt.Fprintln(os.Stdout, filepath.Join(root, "vm"))
+	}
+	// go writes build diagnostics to the same stream, and a synthesised test
+	// package can report no directory at all.
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "go: downloading example.com/thing v1.0.0")
+}
+
+func dirOf(pkg string) string {
+	switch pkg {
+	case "example.com/vm":
+		return "vm"
+	case "example.com/calc":
+		return "calc"
+	default:
+		return "root"
 	}
 }
 
