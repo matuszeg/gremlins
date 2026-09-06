@@ -73,7 +73,15 @@ func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestM
 	h.t.Helper()
 
 	_ = os.Remove(h.logPath)
-	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
+	// A real run is scoped by the directory gremlins was pointed at, and that
+	// directory is what used to divide the cache. Deriving it from the package
+	// under test is what makes these cases scoped runs rather than whole-module
+	// runs with a narrowed `go list`.
+	callingDir := "."
+	if suffix, ok := strings.CutPrefix(pkg, "example.com/"); ok {
+		callingDir = suffix
+	}
+	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: callingDir}
 	cov := coverage.NewWithCmd(
 		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg),
 		h.t.TempDir(), mod,
@@ -299,6 +307,44 @@ func TestAScopedRunDoesNotEvictTheRestOfTheModule(t *testing.T) {
 	h.build("TestTestMapHelperProcess", "")
 	if got := h.testsRun(); len(got) != 0 {
 		t.Errorf("want every package still served from the cache, got %v re-run", got)
+	}
+}
+
+// The case CI is built on: main maps the module, a pull request mutates one
+// package, and the mapping it needs is already there.
+//
+// The scan path used to be part of the cache key, so a scoped run looked in a
+// directory the whole-module run had never written to and re-mapped from
+// nothing. That failure only ever cost time, which is why it needed a test: a
+// cache that silently never hits looks exactly like one that does.
+func TestAScopedRunReadsTheWholeModuleMap(t *testing.T) {
+	h := newCacheHarness(t)
+
+	h.build("TestTestMapHelperProcess", "")
+
+	scoped := h.buildScoped("TestTestMapHelperProcess", "", "example.com/vm")
+	if got := h.testsRun(); len(got) != 0 {
+		t.Errorf("want the scoped run served from the whole-module map, got %v re-run", got)
+	}
+	if got := scoped.Len(); got != 1 {
+		t.Errorf("want the scoped package's tests, got %d", got)
+	}
+	// A second copy under another key is the shape of the defect: the mappings
+	// would be right, and paid for twice.
+	if got := h.cacheFiles(); len(got) != 3 {
+		t.Errorf("want no second copy of the map, got %d files", len(got))
+	}
+
+	// Reading the file is not the same as being able to use it, and the
+	// difference is invisible from everything above: a map that answers "no test
+	// reaches this line" for every line still loads, still reports its tests, and
+	// still runs nothing — the selector simply falls back to whole suites, which
+	// is the cost the cache existed to avoid. A scoped run's mutants are located
+	// relative to the directory it was pointed at, so this is the name it asks
+	// about.
+	pos := token.Position{Filename: "vm.go", Line: vmOwnLine, Column: 3}
+	if got := scoped.TestsFor(pos); len(got) == 0 {
+		t.Error("the restored map answers about no test at the scoped run's own paths")
 	}
 }
 
