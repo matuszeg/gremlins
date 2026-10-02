@@ -177,3 +177,13 @@ var tokenMutations = map[mutator.Type]map[token.Token]token.Token{
 		token.XOR_ASSIGN:     token.ASSIGN,
 	},
 }
+
+// TokenMutation returns the token that mutation type mt rewrites tok to, and
+// false when mt does not apply to tok. It is a read-only view of the rewrite
+// table, for code that must reproduce the engine's rewrites exactly without
+// being able to change them (the schemata helpers are checked against it).
+func TokenMutation(mt mutator.Type, tok token.Token) (token.Token, bool) {
+	to, ok := tokenMutations[mt][tok]
+
+	return to, ok
+}
