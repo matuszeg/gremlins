@@ -19,7 +19,9 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"go/token"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,7 +192,7 @@ func TestSchemaNullRun(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out")
 		bin := writeScript(t, `{ echo "$@"; pwd; env; } > `+out)
 		dir := t.TempDir()
-		if err := dealer.nullRun(context.Background(), bin, dir, []string{"TestA", "TestB"}); err != nil {
+		if err := dealer.nullRun(context.Background(), bin, dir, "", []string{"TestA", "TestB"}); err != nil {
 			t.Fatalf("nullRun: %v", err)
 		}
 		raw, err := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
@@ -214,7 +216,7 @@ func TestSchemaNullRun(t *testing.T) {
 	t.Run("whole_suite", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out")
 		bin := writeScript(t, `echo "$@" > `+out)
-		if err := dealer.nullRun(context.Background(), bin, t.TempDir(), nil); err != nil {
+		if err := dealer.nullRun(context.Background(), bin, t.TempDir(), "", nil); err != nil {
 			t.Fatalf("nullRun: %v", err)
 		}
 		raw, _ := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
@@ -225,7 +227,7 @@ func TestSchemaNullRun(t *testing.T) {
 
 	t.Run("failure", func(t *testing.T) {
 		bin := writeScript(t, "echo '=== RUN   TestA'\necho '--- FAIL: TestA (0.00s)'\necho FAIL\nexit 1")
-		err := dealer.nullRun(context.Background(), bin, t.TempDir(), nil)
+		err := dealer.nullRun(context.Background(), bin, t.TempDir(), "", nil)
 		if err == nil {
 			t.Fatal("nullRun of a failing binary returned nil")
 		}
@@ -235,12 +237,63 @@ func TestSchemaNullRun(t *testing.T) {
 		}
 	})
 
+	t.Run("overlay", func(t *testing.T) {
+		// The null run, in the module root, gets the overlay a mutant's run
+		// gets in its worker copy: a test running the go command builds the
+		// schema source in both.
+		out := filepath.Join(t.TempDir(), "out")
+		bin := writeScript(t, `env > `+out)
+		root, work := t.TempDir(), t.TempDir()
+		d := dealer
+		d.mod = gomodule.GoModule{Name: "m", Root: root}
+		build := &schemata.Build{Dir: filepath.Join(work, "schema"), Rewritten: []string{"a.go", filepath.Join("p", "b.go")}}
+		pkgDir := filepath.Join(root, "p")
+		if err := os.Mkdir(pkgDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := d.schemaNullRun(context.Background(), work, schemaTargets{})(build, bin, pkgDir); err != nil {
+			t.Fatalf("nullRun: %v", err)
+		}
+		raw, err := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
+		if err != nil {
+			t.Fatal(err)
+		}
+		var overlay string
+		for _, l := range strings.Split(string(raw), "\n") {
+			if flags, ok := strings.CutPrefix(l, "GOFLAGS="); ok {
+				for _, f := range strings.Fields(flags) {
+					if p, ok := strings.CutPrefix(f, "-overlay="); ok {
+						overlay = p
+					}
+				}
+			}
+		}
+		if overlay == "" {
+			t.Fatalf("no -overlay in the null run's GOFLAGS:\n%s", raw)
+		}
+		data, err := os.ReadFile(overlay) //nolint:gosec // G304: test code reading the null run's overlay
+		if err != nil {
+			t.Fatal(err)
+		}
+		var o struct{ Replace map[string]string }
+		if err := json.Unmarshal(data, &o); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]string{
+			filepath.Join(root, "a.go"):      filepath.Join(build.Dir, "a.go"),
+			filepath.Join(root, "p", "b.go"): filepath.Join(build.Dir, "p", "b.go"),
+		}
+		if !maps.Equal(o.Replace, want) {
+			t.Errorf("overlay = %v, want %v", o.Replace, want)
+		}
+	})
+
 	t.Run("hang", func(t *testing.T) {
 		d := dealer
 		d.testExecutionTime = 100 * time.Millisecond
 		bin := writeScript(t, "exec sleep 60")
 		start := time.Now()
-		err := d.nullRun(context.Background(), bin, t.TempDir(), nil)
+		err := d.nullRun(context.Background(), bin, t.TempDir(), "", nil)
 		if err == nil || !strings.Contains(err.Error(), "no verdict within") {
 			t.Errorf("err = %v, want a bound error", err)
 		}

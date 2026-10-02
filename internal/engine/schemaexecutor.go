@@ -233,7 +233,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (muta
 	cmd.Env = append(os.Environ(),
 		"GREMLINS_MUTANT="+strconv.Itoa(s.id),
 		"GREMLINS_REACHED="+reach,
-		"GOFLAGS="+strings.TrimSpace(os.Getenv("GOFLAGS")+" -overlay="+r.overlay),
+		overlayGOFLAGS(r.overlay),
 	)
 	scanner := newOutputScanner()
 	cmd.Stdout = scanner
@@ -277,6 +277,12 @@ func (s *schemaExecutor) binaryArgs(tests []string) []string {
 	}
 
 	return args
+}
+
+// overlayGOFLAGS is the GOFLAGS setting that adds -overlay=overlay to the
+// user's own GOFLAGS.
+func overlayGOFLAGS(overlay string) string {
+	return "GOFLAGS=" + strings.TrimSpace(os.Getenv("GOFLAGS")+" -overlay="+overlay)
 }
 
 // overlayCache holds, per schema build and worker copy, the overlay file that

@@ -56,6 +56,12 @@ type Plan struct {
 	Netted []NetEntry
 }
 
+// NullRunFunc runs the test binary bin of build b once, with no mutant
+// selected, in pkgDir: the package's directory in the original module. b is
+// the build bin belongs to, for the overlay a test running the go command
+// needs to see the source the binary was built from.
+type NullRunFunc func(b *Build, bin, pkgDir string) error
+
 // nullFailed prefixes the reason of a mutant netted by a failing null run.
 const nullFailed = "null-mutant run failed: "
 
@@ -76,7 +82,7 @@ const nullFailed = "null-mutant run failed: "
 // of Placed and Netted. Prepare writes nothing outside workDir, which the
 // caller removes. The error is the context's, when it ends first.
 func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-	testPkgs func(pkg string) []string, allowance time.Duration, nullRun func(bin, pkgDir string) error,
+	testPkgs func(pkg string) []string, allowance time.Duration, nullRun NullRunFunc,
 ) (Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return Plan{}, err
@@ -108,7 +114,7 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		for pkg, err := range errs {
 			failed[pkg] = err.Error()
 		}
-		if err := p.nullCheck(ctx, b, failed, nullRun); err != nil {
+		if err := p.nullCheck(ctx, &b, failed, nullRun); err != nil {
 			return Plan{}, err
 		}
 		p.netFailed(need, failed)
@@ -283,7 +289,7 @@ func (p *preparer) sites(lp *packages.Package, idx []int) []Site {
 
 // nullCheck runs every built binary once with no mutant selected, and once
 // more on failure; a second failure marks the package failed.
-func (p *preparer) nullCheck(ctx context.Context, b Build, failed map[string]string, nullRun func(bin, pkgDir string) error) error {
+func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]string, nullRun NullRunFunc) error {
 	for _, pkg := range slices.Sorted(maps.Keys(b.Binaries)) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -295,10 +301,10 @@ func (p *preparer) nullCheck(ctx context.Context, b Build, failed map[string]str
 			continue
 		}
 		bin := b.Binaries[pkg]
-		if nullRun(bin, dir) == nil {
+		if nullRun(b, bin, dir) == nil {
 			continue
 		}
-		if err := nullRun(bin, dir); err != nil {
+		if err := nullRun(b, bin, dir); err != nil {
 			failed[pkg] = nullFailed + firstLine(err)
 		}
 	}
