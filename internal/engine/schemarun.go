@@ -1,0 +1,328 @@
+/*
+ * Copyright 2026 The Gremlins Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+package engine
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
+	"github.com/go-gremlins/gremlins/internal/log"
+	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/go-gremlins/gremlins/internal/procgroup"
+	"github.com/go-gremlins/gremlins/internal/report"
+	"github.com/go-gremlins/gremlins/internal/schemata"
+)
+
+// nullRunOutputLimit bounds how much of a null run's output is kept for its
+// error. The first lines say what failed; a runaway suite can print without
+// bound.
+const nullRunOutputLimit = 64 << 10
+
+// executeSchemata is executeTests under --schemata. It collects every mutant
+// first, because the schema build needs all of them: the runnable ones go to
+// Prepare, the ones it places run against the schema binaries, and every other
+// mutant goes to the executor NewExecutor makes, exactly as without schemata.
+func (mu *Engine) executeSchemata(ctx context.Context) report.Results {
+	var all, runnable []mutator.Mutator
+	for m := range mu.mutantStream {
+		all = append(all, m)
+		if m.Status() == mutator.Runnable {
+			runnable = append(runnable, m)
+		}
+	}
+
+	summary := &report.SchemataSummary{}
+	d, ok := mu.jDealer.(*MutantExecutorDealer)
+	switch {
+	case !ok:
+		log.Errorf("schemata: the executor dealer cannot run schema binaries; every mutant runs through go test\n")
+		summary.PerMutant = len(runnable)
+	case d.dryRun || len(runnable) == 0:
+		// No mutant runs, so there is nothing to build.
+	case d.integrationMode:
+		log.Infoln("schemata has no effect in integration mode: every mutant runs the whole module")
+		summary.PerMutant = len(runnable)
+	default:
+		return mu.executePlaced(ctx, d, all, runnable)
+	}
+
+	res := mu.execute(ctx, feed(all), mu.jDealer.NewExecutor)
+	res.Schemata = summary
+
+	return res
+}
+
+// executePlaced prepares the schema build of runnable and runs all: the
+// placed mutants against the build, every other one as without schemata.
+func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, all, runnable []mutator.Mutator) report.Results {
+	if d.schemaCounts == nil {
+		d.schemaCounts = &schemaCounts{}
+	}
+	plan, err := mu.prepareSchemata(ctx, d, runnable)
+	if err != nil {
+		// Only the run's context ends Prepare early: the run is over.
+		log.Errorf("schemata: %v\n", err)
+
+		return report.Results{Schemata: &report.SchemataSummary{}}
+	}
+
+	ids := make(map[mutator.Mutator]int, len(plan.Placed))
+	for _, p := range plan.Placed {
+		ids[p.Mutator] = p.ID
+	}
+	build := &plan.Build
+	judged, fell := d.schemaCounts.judged.Load(), d.schemaCounts.fallbacks.Load()
+	res := mu.execute(ctx, feed(all), func(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor {
+		if id, ok := ids[mut]; ok {
+			return d.NewSchemaExecutor(mut, id, build, outCh, wg)
+		}
+
+		return d.NewExecutor(mut, outCh, wg)
+	})
+	// Counted, not taken from the plan: a placed mutant counts as placed only
+	// once its executor has judged it against the binaries.
+	res.Schemata = &report.SchemataSummary{
+		Placed:    int(d.schemaCounts.judged.Load() - judged),
+		PerMutant: len(plan.Netted) + int(d.schemaCounts.fallbacks.Load()-fell),
+	}
+
+	return res
+}
+
+// prepareSchemata runs Prepare over runnable in a fresh directory of the
+// engine's work directory, which the caller of the engine removes, with the
+// test packages and null runs the executors' own test selection gives.
+func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, runnable []mutator.Mutator) (schemata.Plan, error) {
+	targets := d.schemaTargets(runnable)
+	workDir, err := os.MkdirTemp(d.wdDealer.WorkDir(), "schemata-*")
+	if err != nil {
+		reason := fmt.Sprintf("schemata: no build directory: %v", err)
+		log.Errorf("%s\n", reason)
+		var plan schemata.Plan
+		for _, m := range runnable {
+			plan.Netted = append(plan.Netted, schemata.NetEntry{Mutator: m, Reason: reason})
+		}
+
+		return plan, nil
+	}
+
+	nullRun := func(bin, pkgDir string) error {
+		return d.nullRun(ctx, bin, pkgDir, targets.testsAt(pkgDir))
+	}
+	plan, err := mu.prepare(ctx, mu.module, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance, nullRun)
+	if err != nil {
+		return plan, err
+	}
+	for _, line := range nettedByReason(plan.Netted) {
+		log.Infof("schemata: netted %s\n", line)
+	}
+
+	return plan, nil
+}
+
+// feed returns a closed channel holding muts, in order.
+func feed(muts []mutator.Mutator) <-chan mutator.Mutator {
+	ch := make(chan mutator.Mutator, len(muts))
+	for _, m := range muts {
+		ch <- m
+	}
+	close(ch)
+
+	return ch
+}
+
+// nettedByReason counts the netted mutants by the first line of their reason,
+// as "<count>: <reason>" lines, most frequent first.
+func nettedByReason(netted []schemata.NetEntry) []string {
+	counts := map[string]int{}
+	for _, n := range netted {
+		reason, _, _ := strings.Cut(n.Reason, "\n")
+		counts[reason]++
+	}
+	reasons := slices.Collect(maps.Keys(counts))
+	slices.SortFunc(reasons, func(a, b string) int {
+		if c := cmp.Compare(counts[b], counts[a]); c != 0 {
+			return c
+		}
+
+		return strings.Compare(a, b)
+	})
+	lines := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		lines = append(lines, fmt.Sprintf("%d: %s", counts[r], r))
+	}
+
+	return lines
+}
+
+// selection is the test selection the dealer's executors make.
+func (m MutantExecutorDealer) selection() testSelection {
+	return testSelection{
+		testMap:         m.testMap,
+		dependents:      m.dependents,
+		crossPackage:    m.crossPackage,
+		integrationMode: m.integrationMode,
+	}
+}
+
+// schemaTargets is what the executors of a run's mutants will run, gathered
+// before any of them does, so that Prepare builds and null-checks exactly it.
+type schemaTargets struct {
+	// pkgs maps a mutated package to the packages its mutants select.
+	pkgs map[string][]string
+	// tests maps a selected package to the tests the mutants that select it
+	// run there; nil when one of them runs its whole suite.
+	tests map[string][]string
+	// dirs maps a selected package's directory under the module root to it.
+	dirs map[string]string
+}
+
+// schemaTargets gathers what the executors of runnable will select, from the
+// same testSelection.forMutant their selectTests calls.
+func (m MutantExecutorDealer) schemaTargets(runnable []mutator.Mutator) schemaTargets {
+	sel := m.selection()
+	t := schemaTargets{pkgs: map[string][]string{}, tests: map[string][]string{}, dirs: map[string]string{}}
+	whole := map[string]bool{}
+	for _, mut := range runnable {
+		run, _ := sel.forMutant(mut.Pkg(), mut.Position())
+		t.pkgs[mut.Pkg()] = append(t.pkgs[mut.Pkg()], run.pkgs...)
+		for _, p := range run.pkgs {
+			if len(run.tests) == 0 {
+				whole[p] = true
+			}
+			t.tests[p] = append(t.tests[p], run.tests...)
+		}
+	}
+	for pkg, pkgs := range t.pkgs {
+		slices.Sort(pkgs)
+		t.pkgs[pkg] = slices.Compact(pkgs)
+	}
+	for pkg, tests := range t.tests {
+		if whole[pkg] {
+			t.tests[pkg] = nil
+		} else {
+			slices.Sort(tests)
+			t.tests[pkg] = slices.Compact(tests)
+		}
+		if dir, ok := packageDir(m.mod.Root, m.mod, pkg); ok {
+			t.dirs[filepath.Clean(dir)] = pkg
+		}
+	}
+
+	return t
+}
+
+// testPkgs is the packages the mutants of pkg select: Prepare's testPkgs.
+func (t schemaTargets) testPkgs(pkg string) []string {
+	return t.pkgs[pkg]
+}
+
+// testsAt is the tests to run in the package at dir, nil for the whole suite.
+// A package no mutant selects runs its whole suite.
+func (t schemaTargets) testsAt(dir string) []string {
+	pkg, ok := t.dirs[filepath.Clean(dir)]
+	if !ok {
+		return nil
+	}
+
+	return t.tests[pkg]
+}
+
+// nullRun runs the test binary bin in pkgDir with no mutant switched on, the
+// tests named in tests (all of them when empty), and the bounds a mutant's run
+// gets. A run that does not pass is an error whose first line says how it
+// ended and, when the output shows it, which test failed.
+func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir string, tests []string) error {
+	bound := m.testExecutionTime + schemaBackstopGrace
+	ctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String()}
+	if len(tests) > 0 {
+		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
+	}
+	cmd := m.execContext(ctx, bin, args...)
+	cmd.Dir = pkgDir
+	cmd.Env = withoutMutant(os.Environ())
+	out := &headWriter{limit: nullRunOutputLimit}
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.WaitDelay = outputDrainGrace
+	procgroup.Setup(cmd)
+
+	err := run(ctx, cmd)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("%s in %s: no verdict within %s", filepath.Base(bin), pkgDir, bound)
+	case cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0:
+		// exec.ErrWaitDelay: the binary passed, a child held its output.
+		return nil
+	}
+	text := out.String()
+
+	return fmt.Errorf("%s in %s: %w%s\n%s", filepath.Base(bin), pkgDir, err, firstFailure(text), text)
+}
+
+// withoutMutant is env without the variables that switch a mutant on.
+func withoutMutant(env []string) []string {
+	return slices.DeleteFunc(env, func(kv string) bool {
+		return strings.HasPrefix(kv, "GREMLINS_MUTANT=") || strings.HasPrefix(kv, "GREMLINS_REACHED=")
+	})
+}
+
+// firstFailure is ": <line>" for the first line of out that names a failing
+// test or a panic, or "" when there is none.
+func firstFailure(out string) string {
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimSpace(l)
+		if strings.HasPrefix(l, "--- FAIL") || strings.HasPrefix(l, "panic:") {
+			return ": " + l
+		}
+	}
+
+	return ""
+}
+
+// headWriter keeps the first limit bytes written to it and drops the rest.
+// os/exec writes Stdout and Stderr from one goroutine when they are the same
+// comparable writer, so it needs no lock.
+type headWriter struct {
+	buf   []byte
+	limit int
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	if room := w.limit - len(w.buf); room > 0 {
+		w.buf = append(w.buf, p[:min(room, len(p))]...)
+	}
+
+	return len(p), nil
+}
+
+func (w *headWriter) String() string {
+	return string(w.buf)
+}

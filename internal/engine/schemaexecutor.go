@@ -64,8 +64,13 @@ func (m MutantExecutorDealer) NewSchemaExecutor(mut mutator.Mutator, id int, b *
 		// is written per mutant.
 		overlays = newOverlayCache()
 	}
+	counts := m.schemaCounts
+	if counts == nil {
+		// Likewise: correct, but the counts reach no summary.
+		counts = &schemaCounts{}
+	}
 
-	return &schemaExecutor{legacy: legacy, id: id, build: b, overlays: overlays}
+	return &schemaExecutor{legacy: legacy, id: id, build: b, overlays: overlays, counts: counts}
 }
 
 // schemaExecutor runs one mutant against the schema test binaries. It holds
@@ -75,16 +80,22 @@ type schemaExecutor struct {
 	legacy   *mutantExecutor
 	build    *schemata.Build
 	overlays *overlayCache
+	counts   *schemaCounts
 	id       int
 }
 
 // Start is the workerpool.Executor entry point.
 func (s *schemaExecutor) Start(w *workerpool.Worker) {
 	m := s.legacy
-	if s.build == nil || m.integrationMode {
+	switch {
+	case s.build == nil:
+		s.fallBack(w, "no schema build")
+
+		return
+	case m.integrationMode:
 		// Integration mode runs every package of the module; the binaries
 		// cover only the packages that were built.
-		m.Start(w)
+		s.fallBack(w, "integration mode runs every package of the module")
 
 		return
 	}
@@ -113,15 +124,23 @@ func (s *schemaExecutor) Start(w *workerpool.Worker) {
 		}
 	}
 	if err != nil {
-		log.Errorf("mutant at %s runs through go test instead of the schema binaries: %v\n", m.mutant.Position(), err)
-		m.Start(w)
+		s.fallBack(w, err.Error())
 
 		return
 	}
 
 	defer m.wg.Done()
+	s.counts.judged.Add(1)
 	m.mutant.SetStatus(s.runAll(rootDir, sel.tests, runs))
 	m.outCh <- m.mutant
+}
+
+// fallBack hands the mutant whole to the legacy executor, counting it for the
+// run's summary and saying why.
+func (s *schemaExecutor) fallBack(w *workerpool.Worker, reason string) {
+	s.counts.fallbacks.Add(1)
+	log.Errorf("mutant at %s runs through go test instead of the schema binaries: %s\n", s.legacy.mutant.Position(), reason)
+	s.legacy.Start(w)
 }
 
 // binaryRun is one package's test binary and where it runs.

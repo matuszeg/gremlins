@@ -219,6 +219,34 @@ func TestReport(t *testing.T) {
 	}
 }
 
+// TestReportSchemataSummary checks the schemata line: printed after the run
+// summary when the run used --schemata, absent otherwise.
+func TestReportSchemataSummary(t *testing.T) {
+	mutants := []mutator.Mutator{
+		stubMutant{status: mutator.Killed, mutantType: mutator.ConditionalsNegation, position: fakePosition},
+	}
+	testCases := map[string]struct {
+		summary *report.SchemataSummary
+		want    string
+	}{
+		"with_schemata":    {summary: &report.SchemataSummary{Placed: 3, PerMutant: 2}, want: "Mutator coverage: 100.00%\nSchemata: placed 3, per-mutant path 2\n"},
+		"without_schemata": {want: "Mutator coverage: 100.00%\n"},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			out := &bytes.Buffer{}
+			log.Init(out, &bytes.Buffer{})
+			defer log.Reset()
+
+			_ = report.Do(report.Results{Mutants: mutants, Schemata: tc.summary})
+
+			if got := out.String(); !strings.HasSuffix(got, tc.want) || strings.Count(got, "Schemata:") != strings.Count(tc.want, "Schemata:") {
+				t.Errorf("report ends %q, want it to end %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func newPosition(filename string, col, line int) token.Position {
 	return token.Position{
 		Filename: filename,

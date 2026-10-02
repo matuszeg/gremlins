@@ -144,6 +144,11 @@ func TestUnleash(t *testing.T) {
 			defValue: "false",
 		},
 		{
+			name:     "schemata",
+			flagType: "bool",
+			defValue: "false",
+		},
+		{
 			name:      "tags",
 			shorthand: "t",
 			flagType:  "string",
@@ -221,7 +226,7 @@ func TestUnleashFlagsPropagateToConfiguration(t *testing.T) {
 		t.Fatal("newUnleashCmd should not fail")
 	}
 	c.cmd.RunE = func(_ *cobra.Command, _ []string) error { return nil }
-	c.cmd.SetArgs([]string{"--threshold-efficacy", "50", "--threshold-mcover", "25", "--workers", "4"})
+	c.cmd.SetArgs([]string{"--threshold-efficacy", "50", "--threshold-mcover", "25", "--workers", "4", "--schemata"})
 	if err := c.cmd.Execute(); err != nil {
 		t.Fatal("Execute should not fail")
 	}
@@ -240,6 +245,11 @@ func TestUnleashFlagsPropagateToConfiguration(t *testing.T) {
 			key:  configuration.UnleashThresholdMCoverageKey,
 			got:  configuration.Get[float64](configuration.UnleashThresholdMCoverageKey),
 			want: float64(25),
+		},
+		{
+			key:  configuration.UnleashSchemataKey,
+			got:  configuration.Get[bool](configuration.UnleashSchemataKey),
+			want: true,
 		},
 		{
 			key:  configuration.UnleashWorkersKey,

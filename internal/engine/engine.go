@@ -37,6 +37,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/report"
+	"github.com/go-gremlins/gremlins/internal/schemata"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -54,6 +55,10 @@ type Engine struct {
 	module       gomodule.GoModule
 	logger       report.MutantLogger
 	viability    Viability
+	// prepare is schemata.Prepare, replaceable in tests. It is called only
+	// when schemata is set.
+	prepare  PrepareFunc
+	schemata bool
 }
 
 // CodeData is used to check if the mutant should be executed.
@@ -82,6 +87,8 @@ func New(mod gomodule.GoModule, codeData CodeData, jDealer ExecutorDealer, opts 
 			dir,
 			configuration.Get[string](configuration.UnleashTagsKey),
 		),
+		prepare:  schemata.Prepare,
+		schemata: configuration.Get[bool](configuration.UnleashSchemataKey),
 	}
 	for _, opt := range opts {
 		mut = opt(mut)
@@ -106,6 +113,21 @@ func WithDirFs(dirFS fs.FS) Option {
 func WithViability(v Viability) Option {
 	return func(m Engine) Engine {
 		m.viability = v
+
+		return m
+	}
+}
+
+// PrepareFunc has the signature of schemata.Prepare.
+type PrepareFunc func(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
+	testPkgs func(pkg string) []string, allowance time.Duration, nullRun func(bin, pkgDir string) error,
+) (schemata.Plan, error)
+
+// WithPrepare overrides the schemata.Prepare a --schemata run calls (mainly
+// used for testing purposes).
+func WithPrepare(p PrepareFunc) Option {
+	return func(m Engine) Engine {
+		m.prepare = p
 
 		return m
 	}
@@ -271,6 +293,19 @@ func (mu *Engine) mutationStatus(pos token.Position) mutator.Status {
 }
 
 func (mu *Engine) executeTests(ctx context.Context) report.Results {
+	if mu.schemata {
+		return mu.executeSchemata(ctx)
+	}
+
+	return mu.execute(ctx, mu.mutantStream, mu.jDealer.NewExecutor)
+}
+
+// newExecutorFunc makes the executor of one mutant.
+type newExecutorFunc func(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor
+
+// execute runs every mutant of muts with the executor newExecutor makes for
+// it, and collects the results.
+func (mu *Engine) execute(ctx context.Context, muts <-chan mutator.Mutator, newExecutor newExecutorFunc) report.Results {
 	pool := workerpool.Initialize("mutator")
 	pool.Start()
 
@@ -280,7 +315,7 @@ func (mu *Engine) executeTests(ctx context.Context) report.Results {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for mut := range mu.mutantStream {
+		for mut := range muts {
 			ok := checkDone(ctx)
 			if !ok {
 				pool.Stop()
@@ -288,7 +323,7 @@ func (mu *Engine) executeTests(ctx context.Context) report.Results {
 				break
 			}
 			wg.Add(1)
-			pool.AppendExecutor(mu.jDealer.NewExecutor(mut, outCh, wg))
+			pool.AppendExecutor(newExecutor(mut, outCh, wg))
 		}
 	}()
 
