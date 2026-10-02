@@ -34,7 +34,15 @@ import (
 // Exit 1 (test failure) and 2 (panic) kill the mutant only if the reach file
 // shows the mutant's site ran: a failure without reach is a broken baseline or
 // environment, so it is ERRORED, never a kill. A pass without reach is NOT
-// COVERED. pos is only used to name the mutant in the log line.
+// COVERED.
+//
+// exitCode must be cmd.ProcessState.ExitCode(), which is -1 both for a
+// signalled process and when the process never started (missing binary, bad
+// Dir, fork failure); callers must not default it to 0 on a start failure. err
+// is deliberately not consulted past the timeout check: err == exec.ErrWaitDelay
+// with exit code 0 is a pass, and an err-based guard would misclassify it.
+//
+// pos is only used to name the mutant in the log line.
 func classifyDirect(err error, exitCode int, sawTimeout, reached, deadlineHit, runCancelled bool, pos token.Position) mutator.Status {
 	switch {
 	case err != nil && sawTimeout:
