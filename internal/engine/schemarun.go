@@ -259,7 +259,8 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir string, t
 	bound := m.testExecutionTime + schemaBackstopGrace
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String()}
+	// As in a mutant's run: -test.paniconexit0 is what go test passes.
+	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.paniconexit0"}
 	if len(tests) > 0 {
 		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
 	}

@@ -251,11 +251,14 @@ func (s *schemaExecutor) runOne(rootDir string, tests []string, r binaryRun) (mu
 }
 
 // binaryArgs are the test binary's flags: the go test flags the legacy
-// executor passes, in their -test. form. Build tags and -vet do not apply to
-// a binary that is already built.
+// executor passes, in their -test. form, and the -test.paniconexit0 go test
+// adds itself. Build tags and -vet do not apply to a binary that is already
+// built.
 func (s *schemaExecutor) binaryArgs(tests []string) []string {
 	m := s.legacy
-	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.failfast"}
+	// go test always passes -test.paniconexit0, so a test that calls
+	// os.Exit(0) fails the run instead of passing it.
+	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.failfast", "-test.paniconexit0"}
 	if len(tests) > 0 {
 		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
 	}
