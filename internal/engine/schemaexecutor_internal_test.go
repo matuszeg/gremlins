@@ -54,7 +54,9 @@ func TestClassifyDirect(t *testing.T) {
 		"fail_without_reach":                 {err: exitErr, exitCode: 1, want: mutator.Errored},
 		"panic_exit_2_reached":               {err: exitErr, exitCode: 2, reached: true, want: mutator.Killed},
 		"panic_exit_2_without_reach":         {err: exitErr, exitCode: 2, want: mutator.Errored},
-		"other_exit_code":                    {err: exitErr, exitCode: 3, reached: true, want: mutator.Errored},
+		"other_exit_code_reached":            {err: exitErr, exitCode: 3, reached: true, want: mutator.Killed},
+		"other_exit_code_without_reach":      {err: exitErr, exitCode: 3, want: mutator.Errored},
+		"os_exit_42_reached":                 {err: exitErr, exitCode: 42, reached: true, want: mutator.Killed},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {

@@ -331,10 +331,11 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 // binary's own -test.timeout fired; the deadline means the per-mutant backstop
 // killed it; a cancelled run follows the on-shutdown-status setting. A
 // negative exit code means a signal ended the process, which is no verdict.
-// Exit 1 (test failure) and 2 (panic) kill the mutant only if the reach file
-// shows the mutant's site ran: a failure without reach is a broken baseline or
-// environment, so it is ERRORED, never a kill. A pass without reach is NOT
-// COVERED.
+// Any positive exit code -- 1 (test failure), 2 (panic) or whatever a test's
+// os.Exit chose -- kills the mutant if the reach file shows the mutant's site
+// ran, as go test, which folds every failing binary exit into its own exit 1,
+// would. A failure without reach is a broken baseline or environment, so it is
+// ERRORED, never a kill. A pass without reach is NOT COVERED.
 //
 // exitCode must be cmd.ProcessState.ExitCode(), which is -1 both for a
 // signalled process and when the process never started (missing binary, bad
@@ -361,15 +362,10 @@ func classifyDirect(err error, exitCode int, sawTimeout, reached, deadlineHit, r
 		}
 
 		return mutator.NotCovered
-	case exitCode == 1 || exitCode == 2:
-		if reached {
-			return mutator.Killed
-		}
-		log.Errorf("test run for %s failed without reaching the mutant (exit %d)\n", pos, exitCode)
-
-		return mutator.Errored
+	case reached:
+		return mutator.Killed
 	default:
-		log.Errorf("test run for %s reached no verdict: unexpected exit code %d\n", pos, exitCode)
+		log.Errorf("test run for %s failed without reaching the mutant (exit %d)\n", pos, exitCode)
 
 		return mutator.Errored
 	}
