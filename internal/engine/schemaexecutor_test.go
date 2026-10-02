@@ -288,7 +288,9 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 		t.Fatal(err)
 	}
 	fm := fx.muts["Unused/ARITHMETIC_BASE"]
-	reach := filepath.Join(root, ".reached-"+strconv.Itoa(fm.id))
+	// The reach file sits outside every module copy, named for the worker
+	// and the mutant, so no test walking its tree can see it.
+	reach := filepath.Join(wdd.WorkDir(), "schemata-reached-w-3-"+strconv.Itoa(fm.id))
 	if err := os.WriteFile(reach, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -298,6 +300,20 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 		t.Errorf("status with a stale reach file = %s, want NOT COVERED", got.Status())
 	}
 	runSchemaMutant(t, d, fx, "Add/ARITHMETIC_BASE", &fx.build, w)
+	if _, err := os.Stat(reach); !os.IsNotExist(err) {
+		t.Errorf("reach file %s left after the run: %v", reach, err)
+	}
+	addReach := filepath.Join(wdd.WorkDir(), "schemata-reached-w-3-"+strconv.Itoa(fx.muts["Add/ARITHMETIC_BASE"].id))
+	if _, err := os.Stat(addReach); !os.IsNotExist(err) {
+		t.Errorf("reach file %s of a reached run left after it: %v", addReach, err)
+	}
+	_ = filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err == nil && strings.Contains(filepath.Base(path), "reached") {
+			t.Errorf("reach file %s in the worker copy", path)
+		}
+
+		return err
+	})
 
 	cmds := rec.all()
 	if len(cmds) != 2 {

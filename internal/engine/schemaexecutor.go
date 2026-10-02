@@ -129,9 +129,14 @@ func (s *schemaExecutor) Start(w *workerpool.Worker) {
 		return
 	}
 
+	// The reach file sits in the work directory, outside every module copy,
+	// where no test walking its package's tree sees it; the worker's name
+	// keeps two workers judging one mutant apart.
+	reach := filepath.Join(m.wdDealer.WorkDir(), "schemata-reached-"+workerName+"-"+strconv.Itoa(s.id))
+
 	defer m.wg.Done()
 	s.counts.judged.Add(1)
-	m.mutant.SetStatus(s.runAll(rootDir, sel.tests, runs))
+	m.mutant.SetStatus(s.runAll(reach, sel.tests, runs))
 	m.outCh <- m.mutant
 }
 
@@ -185,14 +190,15 @@ func packageDir(rootDir string, mod gomodule.GoModule, pkg string) (string, bool
 
 // runAll runs the packages in order and stops at the first verdict other
 // than LIVED or NOT COVERED. Past them all, the mutant LIVED if any run
-// reached its site, and is NOT COVERED if none did.
-func (s *schemaExecutor) runAll(rootDir string, tests []string, runs []binaryRun) mutator.Status {
+// reached its site, and is NOT COVERED if none did. reach is the file the
+// mutant's site creates when it runs.
+func (s *schemaExecutor) runAll(reach string, tests []string, runs []binaryRun) mutator.Status {
 	anyReached := false
 	for _, r := range runs {
 		if s.legacy.runCtx.Err() != nil {
 			return shutdownStatus()
 		}
-		status, reached, cancelled := s.runOne(rootDir, tests, r)
+		status, reached, cancelled := s.runOne(reach, tests, r)
 		if cancelled || (status != mutator.Lived && status != mutator.NotCovered) {
 			return status
 		}
@@ -207,13 +213,13 @@ func (s *schemaExecutor) runAll(rootDir string, tests []string, runs []binaryRun
 
 // runOne runs one test binary with the mutant switched on and classifies the
 // run. It also reports whether the mutant's site ran and whether the run was
-// cancelled, which ends the mutant whatever the status says.
-func (s *schemaExecutor) runOne(rootDir string, tests []string, r binaryRun) (mutator.Status, bool, bool) {
+// cancelled, which ends the mutant whatever the status says. The reach file
+// is removed both before the run and after it.
+func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (mutator.Status, bool, bool) {
 	m := s.legacy
 	pos := m.mutant.Position()
 	// A reach file left by an earlier package's run, or an earlier run of
 	// this worker, would credit this run with a reach it did not make.
-	reach := filepath.Join(rootDir, ".reached-"+strconv.Itoa(s.id))
 	if err := os.Remove(reach); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Errorf("test run for %s reached no verdict: cannot clear %s: %v\n", pos, reach, err)
 
@@ -243,6 +249,10 @@ func (s *schemaExecutor) runOne(rootDir string, tests []string, r binaryRun) (mu
 	}
 	_, statErr := os.Stat(reach)
 	reached := statErr == nil
+	if err := os.Remove(reach); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// The next run clears it before it starts; this run's verdict stands.
+		log.Errorf("cannot remove the reach file %s: %v\n", reach, err)
+	}
 	cancelled := m.runCtx.Err() != nil
 	deadlineHit := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	status := classifyDirect(err, exitCode, scanner.sawTestTimeout(), reached, deadlineHit, cancelled, pos)
