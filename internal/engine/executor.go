@@ -114,6 +114,10 @@ type MutantExecutorDealer struct {
 	integrationMode   bool
 	crossPackage      bool
 	testCPU           int
+	// overlays is shared by every copy of the dealer, so each worker's
+	// overlay file for a schema build is written once per run, not once per
+	// mutant.
+	overlays *overlayCache
 }
 
 // SetRunCtx wires the engine's root context into the dealer so that each
@@ -217,6 +221,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		testExecutionTime: cappedExecutionTime(baseTime * time.Duration(coefficient)),
 		compileAllowance:  compileAllowance(),
 		execContext:       exec.CommandContext,
+		overlays:          newOverlayCache(),
 	}
 
 	for _, opt := range opts {

@@ -17,11 +17,292 @@
 package engine
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
+	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
+	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/go-gremlins/gremlins/internal/procgroup"
+	"github.com/go-gremlins/gremlins/internal/schemata"
 )
+
+// schemaBackstopGrace is how far past -test.timeout the per-run context
+// deadline sits. The binary is prebuilt, so nothing but the run itself needs
+// bounding; the grace only lets the binary's own watchdog fire first and print
+// its marker, which is the better evidence.
+const schemaBackstopGrace = 5 * time.Second
+
+// NewSchemaExecutor returns a workerpool.Executor that judges mut, whose ID in
+// the schema build b is id, by running b's prebuilt test binaries with that
+// mutant switched on, instead of mutating the source and running go test.
+//
+// The executor never modifies the worker's copy of the module, which keeps
+// the original source: the binaries run in it so that tests reading source
+// files or testdata see what they always see. A selected package with no
+// binary in b, or a run in integration mode, is not guessed at: the mutant is
+// handed whole to the executor NewExecutor returns, and judged exactly as
+// without schemata.
+func (m MutantExecutorDealer) NewSchemaExecutor(mut mutator.Mutator, id int, b *schemata.Build,
+	outCh chan<- mutator.Mutator, wg *sync.WaitGroup,
+) workerpool.Executor {
+	legacy, _ := m.NewExecutor(mut, outCh, wg).(*mutantExecutor)
+	overlays := m.overlays
+	if overlays == nil {
+		// A dealer not made by NewExecutorDealer: correct, but the overlay
+		// is written per mutant.
+		overlays = newOverlayCache()
+	}
+
+	return &schemaExecutor{legacy: legacy, id: id, build: b, overlays: overlays}
+}
+
+// schemaExecutor runs one mutant against the schema test binaries. It holds
+// the legacy executor both for its configuration and test selection, and as
+// the fallback for a mutant it cannot run.
+type schemaExecutor struct {
+	legacy   *mutantExecutor
+	build    *schemata.Build
+	overlays *overlayCache
+	id       int
+}
+
+// Start is the workerpool.Executor entry point.
+func (s *schemaExecutor) Start(w *workerpool.Worker) {
+	m := s.legacy
+	if s.build == nil || m.integrationMode {
+		// Integration mode runs every package of the module; the binaries
+		// cover only the packages that were built.
+		m.Start(w)
+
+		return
+	}
+	workerName := fmt.Sprintf("%s-%d", w.Name, w.ID)
+	rootDir, err := m.wdDealer.Get(workerName)
+	if err != nil {
+		log.Errorf("failed to get working directory for worker %s: %v", workerName, err)
+		panic(fmt.Sprintf("failed to get working directory for worker %s: %v", workerName, err))
+	}
+	m.mutant.SetWorkdir(filepath.Join(rootDir, m.module.CallingDir))
+
+	if m.mutant.Status() == mutator.NotCovered || m.mutant.Status() == mutator.Skipped || m.dryRun {
+		defer m.wg.Done()
+		m.outCh <- m.mutant
+
+		return
+	}
+
+	sel := m.selectTests(m.mutant.Pkg())
+	runs, err := s.plan(rootDir, sel)
+	if err == nil {
+		var overlay string
+		overlay, err = s.overlays.get(s.build, rootDir, m.wdDealer.WorkDir())
+		for i := range runs {
+			runs[i].overlay = overlay
+		}
+	}
+	if err != nil {
+		log.Errorf("mutant at %s runs through go test instead of the schema binaries: %v\n", m.mutant.Position(), err)
+		m.Start(w)
+
+		return
+	}
+
+	defer m.wg.Done()
+	m.mutant.SetStatus(s.runAll(rootDir, sel.tests, runs))
+	m.outCh <- m.mutant
+}
+
+// binaryRun is one package's test binary and where it runs.
+type binaryRun struct {
+	bin, dir, overlay string
+}
+
+// plan resolves each selected package to its binary and its directory in the
+// worker copy, in selection order. Any package it cannot resolve fails the
+// whole plan: running the others alone could miss the test that kills the
+// mutant.
+func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) {
+	runs := make([]binaryRun, 0, len(sel.pkgs))
+	for _, pkg := range sel.pkgs {
+		bin, ok := s.build.Binaries[pkg]
+		if !ok {
+			return nil, fmt.Errorf("no schema test binary for %s", pkg)
+		}
+		dir, ok := packageDir(rootDir, s.legacy.module, pkg)
+		if !ok {
+			return nil, fmt.Errorf("%s is not a package of module %s", pkg, s.legacy.module.Name)
+		}
+		runs = append(runs, binaryRun{bin: bin, dir: dir})
+	}
+
+	return runs, nil
+}
+
+// packageDir maps an import path of mod to its directory under rootDir, a
+// copy of the module root.
+func packageDir(rootDir string, mod gomodule.GoModule, pkg string) (string, bool) {
+	if pkg == mod.Name {
+		return rootDir, true
+	}
+	rel, ok := strings.CutPrefix(pkg, mod.Name+"/")
+	if !ok || rel == "" {
+		return "", false
+	}
+
+	return filepath.Join(rootDir, filepath.FromSlash(rel)), true
+}
+
+// runAll runs the packages in order and stops at the first verdict other
+// than LIVED or NOT COVERED. Past them all, the mutant LIVED if any run
+// reached its site, and is NOT COVERED if none did.
+func (s *schemaExecutor) runAll(rootDir string, tests []string, runs []binaryRun) mutator.Status {
+	anyReached := false
+	for _, r := range runs {
+		if s.legacy.runCtx.Err() != nil {
+			return shutdownStatus()
+		}
+		status, reached, cancelled := s.runOne(rootDir, tests, r)
+		if cancelled || (status != mutator.Lived && status != mutator.NotCovered) {
+			return status
+		}
+		anyReached = anyReached || reached
+	}
+	if anyReached {
+		return mutator.Lived
+	}
+
+	return mutator.NotCovered
+}
+
+// runOne runs one test binary with the mutant switched on and classifies the
+// run. It also reports whether the mutant's site ran and whether the run was
+// cancelled, which ends the mutant whatever the status says.
+func (s *schemaExecutor) runOne(rootDir string, tests []string, r binaryRun) (mutator.Status, bool, bool) {
+	m := s.legacy
+	pos := m.mutant.Position()
+	// A reach file left by an earlier package's run, or an earlier run of
+	// this worker, would credit this run with a reach it did not make.
+	reach := filepath.Join(rootDir, ".reached-"+strconv.Itoa(s.id))
+	if err := os.Remove(reach); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Errorf("test run for %s reached no verdict: cannot clear %s: %v\n", pos, reach, err)
+
+		return mutator.Errored, false, false
+	}
+
+	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+schemaBackstopGrace)
+	defer cancel()
+	cmd := m.execContext(ctx, r.bin, s.binaryArgs(tests)...)
+	cmd.Dir = r.dir
+	cmd.Env = append(os.Environ(),
+		"GREMLINS_MUTANT="+strconv.Itoa(s.id),
+		"GREMLINS_REACHED="+reach,
+		"GOFLAGS="+strings.TrimSpace(os.Getenv("GOFLAGS")+" -overlay="+r.overlay),
+	)
+	scanner := newOutputScanner()
+	cmd.Stdout = scanner
+	cmd.Stderr = scanner
+	cmd.WaitDelay = outputDrainGrace
+	procgroup.Setup(cmd)
+
+	err := run(ctx, cmd)
+
+	exitCode := -1 // never started: classifyDirect's contract
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	_, statErr := os.Stat(reach)
+	reached := statErr == nil
+	cancelled := m.runCtx.Err() != nil
+	deadlineHit := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	status := classifyDirect(err, exitCode, scanner.sawTestTimeout(), reached, deadlineHit, cancelled, pos)
+
+	return status, reached, cancelled
+}
+
+// binaryArgs are the test binary's flags: the go test flags the legacy
+// executor passes, in their -test. form. Build tags and -vet do not apply to
+// a binary that is already built.
+func (s *schemaExecutor) binaryArgs(tests []string) []string {
+	m := s.legacy
+	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.failfast"}
+	if len(tests) > 0 {
+		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
+	}
+	if m.testCPU != 0 {
+		args = append(args, "-test.cpu", strconv.Itoa(m.testCPU))
+	}
+
+	return args
+}
+
+// overlayCache holds, per schema build and worker copy, the overlay file that
+// points the worker copy's rewritten files at the schema copy's. A test that
+// runs the go command itself then builds what the binary was built from.
+type overlayCache struct {
+	files map[overlayKey]string
+	mu    sync.Mutex
+}
+
+type overlayKey struct {
+	build *schemata.Build
+	root  string
+}
+
+func newOverlayCache() *overlayCache {
+	return &overlayCache{files: map[overlayKey]string{}}
+}
+
+// get returns the overlay file of build for the worker copy root, writing it
+// into tmpDir the first time it is asked for.
+func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := overlayKey{build: build, root: root}
+	if path, ok := c.files[key]; ok {
+		return path, nil
+	}
+	replace := make(map[string]string, len(build.Rewritten))
+	for _, rel := range build.Rewritten {
+		replace[filepath.Join(root, rel)] = filepath.Join(build.Dir, rel)
+	}
+	data, err := json.Marshal(struct{ Replace map[string]string }{replace})
+	if err != nil {
+		return "", fmt.Errorf("overlay: %w", err)
+	}
+	f, err := os.CreateTemp(tmpDir, "schemata-overlay-*.json")
+	if err != nil {
+		return "", fmt.Errorf("overlay: %w", err)
+	}
+	path := f.Name()
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", fmt.Errorf("overlay: %w", err)
+	}
+	// GOFLAGS is split on spaces and has no quoting.
+	if strings.ContainsAny(path, " \t\n") {
+		_ = os.Remove(path)
+
+		return "", fmt.Errorf("overlay path %q has whitespace and cannot go in GOFLAGS", path)
+	}
+	c.files[key] = path
+
+	return path, nil
+}
 
 // classifyDirect turns the observations of one direct run of a prebuilt test
 // binary (GREMLINS_MUTANT=<id>) into a mutant status. It is the counterpart of
