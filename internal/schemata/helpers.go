@@ -107,11 +107,6 @@ type {{.}}Integer interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~uintptr
 }
 `),
-	def("Signed", false, nil, nil, `
-type {{.}}Signed interface {
-	~int | ~int8 | ~int16 | ~int32 | ~int64 | ~float32 | ~float64 | ~complex64 | ~complex128
-}
-`),
 	arith("ADD", "Number", "+", "-"),
 	def("SUB", true, []string{"Number"}, nil, `
 // {{.}}SUB is binary minus. The engine discovers both ARITHMETIC_BASE (idA)
@@ -127,10 +122,11 @@ func {{.}}SUB[T {{.}}Number](idA, idN int, l, r T) T {
 	arith("MUL", "Number", "*", "/"),
 	arith("QUO", "Number", "/", "*"),
 	arith("REM", "Integer", "%", "*"),
-	def("NEG", true, []string{"Signed"}, nil, `
+	def("NEG", true, []string{"Number"}, nil, `
 // {{.}}NEG is unary minus; ARITHMETIC_BASE (idA) and INVERT_NEGATIVES (idN)
-// both rewrite -x to +x.
-func {{.}}NEG[T {{.}}Signed](idA, idN int, x T) T {
+// both rewrite -x to +x. Every numeric type, unsigned included: -u is legal
+// Go and wraps.
+func {{.}}NEG[T {{.}}Number](idA, idN int, x T) T {
 	if {{.}}Active != 0 && ({{.}}Active == idA || {{.}}Active == idN) {
 		{{.}}Reached()
 		return +x
@@ -138,9 +134,9 @@ func {{.}}NEG[T {{.}}Signed](idA, idN int, x T) T {
 	return -x
 }
 `),
-	def("POS", true, []string{"Signed"}, nil, `
+	def("POS", true, []string{"Number"}, nil, `
 // {{.}}POS is unary plus; ARITHMETIC_BASE rewrites +x to -x.
-func {{.}}POS[T {{.}}Signed](id int, x T) T {
+func {{.}}POS[T {{.}}Number](id int, x T) T {
 	if id != 0 && {{.}}Active == id {
 		{{.}}Reached()
 		return -x

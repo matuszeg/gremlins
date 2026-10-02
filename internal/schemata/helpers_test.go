@@ -103,7 +103,8 @@ func helperSites() []site {
 		}
 		sites = append(sites, site{helper: a.helper, kind: kindBinary, tok: a.tok, operands: a.ops[0], muts: muts, zero: true})
 	}
-	for _, ops := range []string{"unI", "unF"} {
+	// unU: unary minus and plus are legal Go on unsigned operands too.
+	for _, ops := range []string{"unI", "unF", "unU"} {
 		sites = append(sites,
 			site{helper: "NEG", kind: kindUnary, tok: token.SUB, operands: ops, muts: neg},
 			site{helper: "POS", kind: kindUnary, tok: token.ADD, operands: ops, muts: ab})
@@ -149,6 +150,7 @@ var (
 	nzF  = [][2]float64{{3, 5}, {5, 3}, {5, 5}, {-2, 7}}
 	unI  = []int{3, -2, 0, 5}
 	unF  = []float64{3, -2, 0, 5}
+	unU  = []uint8{3, 0, 200}
 )
 `
 
@@ -407,7 +409,7 @@ func TestHelperFileCompilesWithOnlyUsedHelpers(t *testing.T) {
 		"rem_only": {
 			use:     []string{"REM"},
 			present: []string{"type _zzInteger interface", "func _zzREM["},
-			absent:  []string{`"cmp"`, "_zzNumber", "_zzSigned"},
+			absent:  []string{`"cmp"`, "_zzNumber"},
 		},
 		"nothing_used": {
 			present: []string{"var _zzActive =", "func _zzReached("},
@@ -423,7 +425,8 @@ func TestHelperFileCompilesWithOnlyUsedHelpers(t *testing.T) {
 			use: allHelpers,
 			// A user package may declare cmp, os, sync or strconv itself.
 			user:    "package fixture\n\nfunc cmp() {}\n\nvar os, sync, strconv = 1, 2, 3\n",
-			present: []string{`"cmp"`, "_zzNumber", "_zzInteger", "_zzSigned", "func _zzIncDecMap["},
+			present: []string{`"cmp"`, "_zzNumber", "_zzInteger", "func _zzIncDecMap["},
+			absent:  []string{"_zzSigned"},
 		},
 	}
 	for name, tc := range cases {
