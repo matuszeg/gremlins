@@ -160,3 +160,34 @@ func TestTokenMutantTypeAndTokenMutationsAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestTokenMutationReadsTheRewriteTable checks the exported accessor returns
+// exactly the tokenMutations entries -- the documented table -- and reports
+// false for a pair the table does not hold.
+func TestTokenMutationReadsTheRewriteTable(t *testing.T) {
+	t.Parallel()
+
+	for mt, table := range documentedMutations {
+		for from, want := range table {
+			got, ok := TokenMutation(mt, from)
+			if !ok || got != want {
+				t.Errorf("TokenMutation(%s, %s) = %s, %v; want %s, true", mt, from, got, ok, want)
+			}
+		}
+	}
+	absent := map[string]struct {
+		mt  mutator.Type
+		tok token.Token
+	}{
+		"token_not_in_type": {mt: mutator.InvertNegatives, tok: token.ADD},
+		"unknown_type":      {mt: mutator.Type(9999), tok: token.ADD},
+	}
+	for name, tc := range absent {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got, ok := TokenMutation(tc.mt, tc.tok); ok || got != token.ILLEGAL {
+				t.Errorf("TokenMutation(%d, %s) = %s, %v; want ILLEGAL, false", int(tc.mt), tc.tok, got, ok)
+			}
+		})
+	}
+}
