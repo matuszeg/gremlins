@@ -27,6 +27,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
@@ -118,6 +119,16 @@ type MutantExecutorDealer struct {
 	// overlay file for a schema build is written once per run, not once per
 	// mutant.
 	overlays *overlayCache
+	// schemaCounts is shared by every copy of the dealer, like overlays.
+	schemaCounts *schemaCounts
+}
+
+// schemaCounts counts how the mutants given to schema executors were judged.
+type schemaCounts struct {
+	// judged were run against the schema binaries.
+	judged atomic.Int64
+	// fallbacks were handed to the legacy path.
+	fallbacks atomic.Int64
 }
 
 // SetRunCtx wires the engine's root context into the dealer so that each
@@ -222,6 +233,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		compileAllowance:  compileAllowance(),
 		execContext:       exec.CommandContext,
 		overlays:          newOverlayCache(),
+		schemaCounts:      &schemaCounts{},
 	}
 
 	for _, opt := range opts {
@@ -459,7 +471,40 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 	return m.runTestCommand(ctx, rootDir, m.selectTests(pkg))
 }
 
-// selectTests decides what to run for the mutant, along two independent axes.
+// selectTests decides what to run for the mutant and records the tests it
+// narrowed to on the mutant. See testSelection.forMutant.
+func (m *mutantExecutor) selectTests(pkg string) testRun {
+	sel, names := m.selection().forMutant(pkg, m.mutant.Position())
+	if names != nil {
+		m.mutant.SetTestsRun(names)
+	}
+
+	return sel
+}
+
+func (m *mutantExecutor) selection() testSelection {
+	return testSelection{
+		testMap:         m.testMap,
+		dependents:      m.dependents,
+		crossPackage:    m.crossPackage,
+		integrationMode: m.integrationMode,
+	}
+}
+
+// testSelection is what decides, for a mutant, which packages and tests run.
+// It is one value shared by the executor, which runs the selection, and by the
+// schemata preparation, which must build and null-check exactly the packages
+// the executor will later run.
+type testSelection struct {
+	testMap         TestSelector
+	dependents      DependentFinder
+	crossPackage    bool
+	integrationMode bool
+}
+
+// forMutant decides what to run for a mutant of pkg at pos, along two
+// independent axes. It also returns the IDs of the tests it narrowed to, nil
+// when it runs whole suites.
 //
 // Which PACKAGES: the mutated one, and with --cross-package the packages that
 // depend on it, because those are the ones a mutation can break. That is the
@@ -477,26 +522,26 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 //
 // Every path that cannot answer confidently widens rather than narrows, to the
 // whole suites of the packages it settled on: never wrong, only slow.
-func (m *mutantExecutor) selectTests(pkg string) testRun {
+func (s testSelection) forMutant(pkg string, pos token.Position) (testRun, []string) {
 	pkgs := []string{pkg}
-	if m.crossPackage {
-		pkgs = append(pkgs, m.dependents.Dependents(pkg)...)
+	if s.crossPackage {
+		pkgs = append(pkgs, s.dependents.Dependents(pkg)...)
 	}
 	wholeSuites := testRun{pkgs: pkgs}
-	if m.testMap == nil || m.integrationMode {
-		return wholeSuites
+	if s.testMap == nil || s.integrationMode {
+		return wholeSuites, nil
 	}
 	// A package the map could not see whole might hold the very test that kills
 	// this mutant, and skipping it would turn a killed mutant into a LIVED one.
-	if !m.testMap.Mapped(pkg) {
-		return wholeSuites
+	if !s.testMap.Mapped(pkg) {
+		return wholeSuites, nil
 	}
-	tests := within(m.testMap.TestsFor(m.mutant.Position()), pkgs)
+	tests := within(s.testMap.TestsFor(pos), pkgs)
 	if len(tests) == 0 {
 		// An uncovered mutant never reaches here, so an empty answer means the
 		// map is incomplete — coverage is not always deterministic — rather than
 		// that no test exercises the line.
-		return wholeSuites
+		return wholeSuites, nil
 	}
 
 	var sel testRun
@@ -518,9 +563,8 @@ func (m *mutantExecutor) selectTests(pkg string) testRun {
 		}
 		names = append(names, id.String())
 	}
-	m.mutant.SetTestsRun(names)
 
-	return sel
+	return sel, names
 }
 
 // within keeps the tests that live in one of the packages being run. Tests

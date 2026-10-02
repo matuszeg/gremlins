@@ -131,6 +131,11 @@ func TestUnleash(t *testing.T) {
 			defValue: "false",
 		},
 		{
+			name:     "schemata",
+			flagType: "bool",
+			defValue: "false",
+		},
+		{
 			name:      "tags",
 			shorthand: "t",
 			flagType:  "string",

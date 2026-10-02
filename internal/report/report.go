@@ -45,16 +45,28 @@ var (
 // Results contains the list of mutator.Mutator to be reported
 // and the time it took to discover and test them.
 type Results struct {
-	Module  string
-	Mutants []mutator.Mutator
-	Elapsed time.Duration
+	// Schemata is set only when the run used --schemata.
+	Schemata *SchemataSummary
+	Module   string
+	Mutants  []mutator.Mutator
+	Elapsed  time.Duration
+}
+
+// SchemataSummary is how the runnable mutants of a --schemata run were
+// executed: Placed were judged against the schema test binaries, PerMutant
+// through the per-mutant go test path, whether Prepare netted them or their
+// executor fell back to it.
+type SchemataSummary struct {
+	Placed    int
+	PerMutant int
 }
 
 type reportStatus struct {
 	files map[string][]internal.Mutation
 
-	elapsed *durafmt.Durafmt
-	module  string
+	elapsed  *durafmt.Durafmt
+	schemata *SchemataSummary
+	module   string
 
 	killed      int
 	lived       int
@@ -77,8 +89,9 @@ func newReport(results Results) (*reportStatus, bool) {
 		return nil, false
 	}
 	rep := &reportStatus{
-		module:  results.Module,
-		elapsed: durafmt.Parse(results.Elapsed).LimitFirstN(2),
+		module:   results.Module,
+		elapsed:  durafmt.Parse(results.Elapsed).LimitFirstN(2),
+		schemata: results.Schemata,
 	}
 	rep.files = make(map[string][]internal.Mutation)
 	for _, m := range results.Mutants {
@@ -165,6 +178,9 @@ func (r *reportStatus) reportFindings() {
 		r.dryRunReport()
 	} else {
 		r.fullRunReport()
+	}
+	if r.schemata != nil {
+		log.Infof("Schemata: placed %d, per-mutant path %d\n", r.schemata.Placed, r.schemata.PerMutant)
 	}
 	r.fileReport()
 }
