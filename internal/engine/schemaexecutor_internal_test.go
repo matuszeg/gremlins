@@ -47,6 +47,7 @@ func TestClassifyDirect(t *testing.T) {
 		"deadline_wins_over_cancelled":       {err: exitErr, exitCode: -1, deadlineHit: true, cancelled: true, want: mutator.TimedOut},
 		"cancelled":                          {err: exitErr, exitCode: -1, cancelled: true, want: shutdownStatus()},
 		"signalled":                          {err: exitErr, exitCode: -1, reached: true, want: mutator.Errored},
+		"start_failure":                      {err: exitErr, exitCode: -1, want: mutator.Errored},
 		"pass_reached":                       {exitCode: 0, reached: true, want: mutator.Lived},
 		"pass_without_reach":                 {exitCode: 0, want: mutator.NotCovered},
 		"fail_reached":                       {err: exitErr, exitCode: 1, reached: true, want: mutator.Killed},
