@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
+	"github.com/go-gremlins/gremlins/internal/procgroup"
 )
 
 // ErrNoTestBinary reports a package whose `go test -c` succeeded without
@@ -85,6 +86,16 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 		return failAll(fmt.Errorf("schemata: binary dir: %w", err))
 	}
 
+	// The go command's work directories go here rather than the default
+	// TMPDIR, so that a build killed at the deadline -- which cannot clean
+	// up after itself -- leaves nothing outside workDir, and this function
+	// can remove what it left.
+	goTmp, err := os.MkdirTemp(workDir, "schemata-gotmp-*")
+	if err != nil {
+		return failAll(fmt.Errorf("schemata: build temp dir: %w", err))
+	}
+	defer func() { _ = os.RemoveAll(goTmp) }()
+
 	b := Build{Dir: dir, Binaries: map[string]string{}}
 	for _, p := range slices.Sorted(maps.Keys(rewritten)) {
 		rels, err := writeFiles(modRoot, dir, rewritten[p])
@@ -112,7 +123,7 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			bin := filepath.Join(binDir, names[p])
-			err := buildTest(ctx, dir, bin, tags, p)
+			err := buildTest(ctx, dir, goTmp, bin, tags, p)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -146,8 +157,12 @@ func writeFiles(modRoot, dir string, files map[string][]byte) ([]string, error) 
 	return rels, nil
 }
 
-// buildTest compiles the test binary of pkg, in the module copy dir, to bin.
-func buildTest(ctx context.Context, dir, bin, tags, pkg string) error {
+// buildTest compiles the test binary of pkg, in the module copy dir, to bin,
+// with goTmp as the go command's GOTMPDIR. The go command runs in its own
+// process group, and the deadline kills the whole group: killing only the go
+// command would leave its compile and link processes running, competing with
+// whatever runs next.
+func buildTest(ctx context.Context, dir, goTmp, bin, tags, pkg string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("schemata: build %s: %w", pkg, err)
 	}
@@ -158,6 +173,9 @@ func buildTest(ctx context.Context, dir, bin, tags, pkg string) error {
 	args = append(args, pkg)
 	cmd := exec.CommandContext(ctx, "go", args...) //nolint:gosec // G204: a fixed tool, the package list is the caller's
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOTMPDIR="+goTmp)
+	procgroup.Setup(cmd)
+	cmd.Cancel = func() error { return procgroup.Kill(cmd) }
 	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
 	if ctxErr := ctx.Err(); ctxErr != nil {

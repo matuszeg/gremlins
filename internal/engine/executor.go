@@ -36,6 +36,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/go-gremlins/gremlins/internal/procgroup"
 )
 
 // DefaultTimeoutCoefficient is the default multiplier for the timeout length
@@ -574,7 +575,7 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	cmd.WaitDelay = outputDrainGrace
 
 	// Set up process group for killing entire process tree
-	setupProcessGroup(cmd)
+	procgroup.Setup(cmd)
 
 	err := run(ctx, cmd)
 
@@ -814,7 +815,7 @@ func run(ctx context.Context, cmd *exec.Cmd) error {
 		if cmd.Process != nil {
 			// Always kill the process group to catch any child processes
 			// This is safe even if the process already exited
-			_ = killProcessGroup(cmd)
+			_ = procgroup.Kill(cmd)
 			// Release OS resources
 			_ = cmd.Process.Release()
 		}
@@ -830,7 +831,7 @@ func run(ctx context.Context, cmd *exec.Cmd) error {
 	case <-ctx.Done():
 		// Context cancelled/timed out - kill the entire process group
 		// Do this BEFORE the parent process exits to catch children
-		_ = killProcessGroup(cmd)
+		_ = procgroup.Kill(cmd)
 		// Wait for the process to actually exit
 		<-done
 
