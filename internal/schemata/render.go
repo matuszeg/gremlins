@@ -33,6 +33,9 @@ var (
 	errBadRange = errors.New("schemata: site range outside source")
 	// errForeignFile reports a site whose node is not in the file src holds.
 	errForeignFile = errors.New("schemata: site is not in the rendered file")
+	// errSourceSize reports a site not rendered because src is not the
+	// length of the file it is said to hold.
+	errSourceSize = errors.New("schemata: src length differs from the file size")
 	// errNewlineChanged reports a rewrite that adds or removes a newline,
 	// which would move every line after it.
 	errNewlineChanged = errors.New("schemata: rewrite changes the line count")
@@ -56,43 +59,41 @@ type siteNode struct {
 	rendered   string
 }
 
-// Render returns src with every site replaced by its rewrite. Edits are
-// spliced into the original bytes: text outside the sites is byte-identical
-// and every line keeps its number. Sites nested in another site are rendered
-// first and reach the outer rewrite through inner. A site whose rewrite fails
-// keeps its original text (with its nested sites still rendered) and is
-// reported as a SiteError.
-func Render(fset *token.FileSet, src []byte, sites []Site, rw Rewriter) ([]byte, []SiteError) {
-	file := srcFile(fset, src, sites)
-	roots, errs := buildForest(file, sites)
+// Render returns src, the bytes of file, with every site replaced by its
+// rewrite. Edits are spliced into the original bytes: text outside the sites
+// is byte-identical and every line keeps its number. Sites nested in another
+// site are rendered first and reach the outer rewrite through inner. A site
+// whose rewrite fails keeps its original text (with its nested sites still
+// rendered) and is reported as a SiteError, as is every site that does not
+// lie in file. If src is not file.Size() bytes, every site is reported and
+// src is returned unchanged.
+//
+// Caller contract: sites must come from fset. A token.Pos is a plain offset
+// into fset, so a node from a different FileSet whose position happens to
+// fall inside file cannot be detected and is spliced as if it were file's.
+func Render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []SiteError) {
+	if file == nil || file.Size() != len(src) {
+		errs := make([]SiteError, 0, len(sites))
+		for _, s := range sites {
+			errs = append(errs, SiteError{Site: s, Err: errSourceSize})
+		}
+
+		return src, errs
+	}
+	roots, errs := buildForest(fset, file, sites)
 	for _, r := range roots {
-		errs = renderNode(file, src, r, rw, errs)
+		errs = renderNode(fset, file, src, r, rw, errs)
 	}
 
 	return []byte(splice(src, 0, len(src), roots)), errs
 }
 
-// srcFile returns the file src holds: the file of the first site whose file
-// is exactly len(src) bytes, or nil if no site's file is.
-func srcFile(fset *token.FileSet, src []byte, sites []Site) *token.File {
-	for _, s := range sites {
-		if s.Node == nil || !s.Node.Pos().IsValid() {
-			continue
-		}
-		if f := fset.File(s.Node.Pos()); f != nil && f.Size() == len(src) {
-			return f
-		}
-	}
-
-	return nil
-}
-
 // buildForest nests each site under the smallest site containing it.
-func buildForest(file *token.File, sites []Site) ([]*siteNode, []SiteError) {
+func buildForest(fset *token.FileSet, file *token.File, sites []Site) ([]*siteNode, []SiteError) {
 	var errs []SiteError
 	nodes := make([]*siteNode, 0, len(sites))
 	for _, s := range sites {
-		start, end, err := nodeRange(file, s.Node)
+		start, end, err := nodeRange(fset, file, s.Node)
 		if err != nil {
 			errs = append(errs, SiteError{Site: s, Err: err})
 
@@ -137,12 +138,12 @@ func buildForest(file *token.File, sites []Site) ([]*siteNode, []SiteError) {
 }
 
 // renderNode renders n's children, then n itself, into n.rendered.
-func renderNode(file *token.File, src []byte, n *siteNode, rw Rewriter, errs []SiteError) []SiteError {
+func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, rw Rewriter, errs []SiteError) []SiteError {
 	for _, c := range n.children {
-		errs = renderNode(file, src, c, rw, errs)
+		errs = renderNode(fset, file, src, c, rw, errs)
 	}
 	inner := func(x ast.Node) string {
-		start, end, err := nodeRange(file, x)
+		start, end, err := nodeRange(fset, file, x)
 		if err != nil {
 			return ""
 		}
@@ -188,21 +189,13 @@ func splice(src []byte, start, end int, sites []*siteNode) string {
 }
 
 // nodeRange returns n's byte range within file, unadjusted by //line
-// directives. A node that does not start in file is foreign; one that starts
-// in file but has no valid end inside it is a bad range.
-func nodeRange(file *token.File, n ast.Node) (int, int, error) {
-	if n == nil || !n.Pos().IsValid() || !n.End().IsValid() {
+// directives. A node whose start or end is not in file is foreign.
+func nodeRange(fset *token.FileSet, file *token.File, n ast.Node) (int, int, error) {
+	if n == nil || !n.Pos().IsValid() || !n.End().IsValid() || n.End() < n.Pos() {
 		return 0, 0, errBadRange
 	}
-	if file == nil {
+	if fset.File(n.Pos()) != file || int(n.End()) > file.Base()+file.Size() {
 		return 0, 0, errForeignFile
-	}
-	base := file.Base()
-	if int(n.Pos()) < base || int(n.Pos()) > base+file.Size() {
-		return 0, 0, errForeignFile
-	}
-	if int(n.End()) < int(n.Pos()) || int(n.End()) > base+file.Size() {
-		return 0, 0, errBadRange
 	}
 
 	return file.Offset(n.Pos()), file.Offset(n.End()), nil
