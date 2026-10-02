@@ -78,19 +78,27 @@ func (s srcRange) End() token.Pos { return s.end }
 // their original order, with their original line breaks -- so that with no
 // mutant active the program evaluates what it did before, and with one of
 // the site's mutants active it evaluates what the engine's token mutant
-// would. info must hold the types of the package the sites come from. A site
-// outside those forms, or one whose operand types the helper cannot take,
-// is refused with ErrUnsupported.
-func NewRewriter(info *types.Info, prefix string, h *HelperSet) Rewriter {
-	r := &rewriter{info: info, prefix: prefix, h: h}
+// would. A constant-valued site takes one of the constant forms instead
+// (see constantForm), which depend on the context the site is in: files are
+// the package's syntax, where that context is looked up. info must hold the
+// Types and Uses of the package the sites come from. A site outside those
+// forms, or one whose operand types the helper cannot take, is refused with
+// ErrUnsupported.
+func NewRewriter(info *types.Info, files []*ast.File, prefix string, h *HelperSet) Rewriter {
+	r := &rewriter{info: info, files: files, prefix: prefix, h: h}
 
 	return r.rewrite
 }
 
 type rewriter struct {
 	info   *types.Info
+	files  []*ast.File
 	prefix string
 	h      *HelperSet
+
+	// parents maps each node of files to its parent, built on the first
+	// constant-valued site.
+	parents map[ast.Node]ast.Node
 }
 
 func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) {
@@ -99,19 +107,25 @@ func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) 
 	}
 	switch n := s.Node.(type) {
 	case *ast.BinaryExpr:
-		if err := r.checkSite(s, n.Op, n); err != nil {
+		if err := checkTok(s, n.Op); err != nil {
 			return "", err
+		}
+		if r.info.Types[n].Value != nil {
+			return r.constant(s, n, inner)
 		}
 
 		return r.binary(s, n, inner)
 	case *ast.UnaryExpr:
-		if err := r.checkSite(s, n.Op, n); err != nil {
+		if err := checkTok(s, n.Op); err != nil {
 			return "", err
+		}
+		if r.info.Types[n].Value != nil {
+			return r.constant(s, n, inner)
 		}
 
 		return r.unary(s, n, inner)
 	case *ast.IncDecStmt:
-		if err := r.checkSite(s, n.Tok, nil); err != nil {
+		if err := checkTok(s, n.Tok); err != nil {
 			return "", err
 		}
 
@@ -121,18 +135,10 @@ func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) 
 	return "", fmt.Errorf("%w: %T site", ErrUnsupported, s.Node)
 }
 
-// checkSite refuses a site whose token is not its node's, and an expression
-// site whose value is constant.
-func (r *rewriter) checkSite(s Site, op token.Token, e ast.Expr) error {
+// checkTok refuses a site whose token is not its node's.
+func checkTok(s Site, op token.Token) error {
 	if s.Tok != op {
 		return fmt.Errorf("%w: site token %s is not the node's %s", ErrUnsupported, s.Tok, op)
-	}
-	if e != nil && r.info.Types[e].Value != nil {
-		// A constant-valued site cannot become a call: the value may be
-		// needed at compile time, and its operands are folded exactly
-		// rather than in the type's arithmetic. This is the hook for Task 5's
-		// constantForm.
-		return fmt.Errorf("%w: constant-valued %s site", ErrUnsupported, op)
 	}
 
 	return nil
@@ -258,7 +264,12 @@ func operandText(e *ast.BinaryExpr, inner func(ast.Node) string) []string {
 // boolResult refuses a comparison whose result is used as a named boolean
 // type: the helpers return bool, which such a context does not accept.
 func (r *rewriter) boolResult(e ast.Expr) error {
-	t := r.info.Types[e].Type
+	return plainBool(r.info, e)
+}
+
+// plainBool refuses an expression whose type is not bool or untyped bool.
+func plainBool(info *types.Info, e ast.Expr) error {
+	t := info.Types[e].Type
 	if t == nil || !types.Identical(t, types.Typ[types.Bool]) && !types.Identical(t, types.Typ[types.UntypedBool]) {
 		return fmt.Errorf("%w: comparison of type %v, not bool", ErrUnsupported, t)
 	}
