@@ -108,13 +108,22 @@ func typeCheck(t *testing.T, fset *token.FileSet, name string, src []byte) (*ast
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}}
+	info := newInfo()
 	conf := types.Config{Importer: importer.Default()}
 	if _, err := conf.Check("fixture", fset, []*ast.File{f}, info); err != nil {
 		t.Fatal(err)
 	}
 
 	return f, info
+}
+
+// newInfo returns a types.Info recording what NewRewriter reads.
+func newInfo() *types.Info {
+	return &types.Info{
+		Types:     map[ast.Expr]types.TypeAndValue{},
+		Uses:      map[*ast.Ident]types.Object{},
+		Instances: map[*ast.Ident]types.Instance{},
+	}
 }
 
 // runFixture runs the fixture test binary bin and returns its output.
@@ -177,7 +186,7 @@ func TestFormsBehave(t *testing.T) {
 
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}
-	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, prefix, h))
+	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
 	for _, e := range errs {
 		t.Errorf("site at %s not rewritten: %v", fset.Position(e.Site.Node.Pos()), e.Err)
 	}
@@ -188,7 +197,7 @@ func TestFormsBehave(t *testing.T) {
 		t.Fatalf("rewrite has %d lines, original %d", got, want)
 	}
 	schemaBin := buildFixture(t, map[string][]byte{
-		"forms.go": out, "forms_test.go": driver, "gremlins_schemata.go": h.File("forms", prefix),
+		"forms.go": out, "forms_test.go": driver, "gremlins_schemata.go": helperFile(t, h, "forms", prefix),
 	})
 	origBin := buildFixture(t, map[string][]byte{"forms.go": src, "forms_test.go": driver})
 
@@ -250,6 +259,10 @@ func TestNewRewriter(t *testing.T) {
 		siteTok token.Token
 		muts    []mutator.Type
 		want    string // empty: want ErrUnsupported
+		// bareInfo drops info.Uses, which the float witness form needs.
+		bareInfo bool
+		// noFiles gives NewRewriter no files to find a site's context in.
+		noFiles bool
 	}{
 		"eql":             {src: "func f(a, b int) bool { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, want: "_zzXor(1, a == b)"},
 		"neq_iface":       {src: "func f(e error) bool { return e != nil }", tok: token.NEQ, muts: []mutator.Type{cn}, want: "_zzXor(1, e != nil)"},
@@ -277,10 +290,52 @@ func TestNewRewriter(t *testing.T) {
 		"string_add":      {src: "func f(a, b string) string { return a + b }", tok: token.ADD, muts: []mutator.Type{ab}},
 		"generic_str_add": {src: "func f[T ~int | ~string](a, b T) T { return a + b }", tok: token.ADD, muts: []mutator.Type{ab}},
 		"generic_mul_num": {src: "func f[T ~int | ~float64](a, b T) T { return a * b }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzMUL(1, a, b)"},
-		// Constant-valued sites are Task 5's constantForm.
-		"const_binary":  {src: "const c = 2\nfunc f() int { return c * 3 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_unary":   {src: "func f(x int) int { return x * -1 }", tok: token.SUB, muts: []mutator.Type{ab, in}},
-		"const_compare": {src: "const c = 2\nfunc f() bool { return c < 3 }", tok: token.LSS, muts: []mutator.Type{cn}},
+		// Constant-valued sites: the integer shift form (c/3 folds with
+		// integer division), the bool form, the float witness form.
+		"const_binary":       {src: "const c = 2\nfunc f() int { return c * 3 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "(6*(1-(1<<_zzBit(1)-1)) + 0*(1<<_zzBit(1)-1))"},
+		"const_unary":        {src: "func f(x int) int { return x * -1 }", tok: token.SUB, muts: []mutator.Type{ab, in}, want: "(-1*(1-(1<<_zzBit(1)-1)-(1<<_zzBit(2)-1)) + 1*(1<<_zzBit(1)-1) + 1*(1<<_zzBit(2)-1))"},
+		"const_typed":        {src: "type L int\nconst c L = 2\nfunc f() any { return c * 3 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "((c)*0 + 6*(1-(1<<_zzBit(1)-1)) + 0*(1<<_zzBit(1)-1))"},
+		"const_rune":         {src: "func f() any { return 'a' + 1 }", tok: token.ADD, muts: []mutator.Type{ab}, want: "(('a')*0 + 98*(1-(1<<_zzBit(1)-1)) + 96*(1<<_zzBit(1)-1))"},
+		"const_multiline":    {src: "func f() int {\n\treturn 1 +\n\t\t2\n}", tok: token.ADD, muts: []mutator.Type{ab}, want: "(\n3*(1-(1<<_zzBit(1)-1)) + -1*(1<<_zzBit(1)-1))"},
+		"const_float_div":    {src: "func f() int { return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_compare":      {src: "const c = 2\nfunc f() bool { return c < 3 }", tok: token.LSS, muts: []mutator.Type{cn}, want: "_zzBool1(1, true, false)"},
+		"const_bool_if":      {src: "func f() int { if 1 < 2 { return 1 }; return 0 }", tok: token.LSS, muts: []mutator.Type{cb, cn}, want: "_zzBool2(1, 2, true, true, false)"},
+		"const_float_call":   {src: "func g(r float64) float64 { return r }\nfunc f() float64 { return g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(g)"},
+		"const_float_method": {src: "type b struct{}\nfunc (b) m(x int, r float32) {}\nfunc f(v b) { v.m(1, (1.5 * 2)) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(v.m)"},
+		"const_float_assign": {src: "func f() float64 { var r float64; r = 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&r)"},
+		// Constant-valued sites that stay refused.
+		"const_decl":             {src: "const k = 2 * 3", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_decl_local":       {src: "func f() int { const k = 1 + 2; return k }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_decl_len":         {src: "const k = len([3]int{1 + 1})", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_operand":          {src: "func f() int { return 2*3 + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_operand_paren":    {src: "func f() int { return (2 * 3) + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_array_len":        {src: "var a [1 + 1]int", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_array_len_nested": {src: "var a [len([2]int{1 + 1})]int", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_key":              {src: "var s = []int{1 + 1: 5}", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_shift_count":      {src: "func f(x int) int { return x << (1 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_generic_context":  {src: "func f[T ~int](x T) T { return x * (2 + 3) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_div_zero":         {src: "func f() int { return 2 * 0 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_rem":              {src: "func f() int { return 2 % 1 }", tok: token.REM, muts: []mutator.Type{ab}, want: "(0*(1-(1<<_zzBit(1)-1)) + 2*(1<<_zzBit(1)-1))"},
+		"const_unrepresentable":  {src: "func f() uint8 { return 255 - 1 }", tok: token.SUB, muts: []mutator.Type{ab}},
+		"const_string":           {src: "func f() string { return \"a\" + \"b\" }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_complex":          {src: "func f() complex128 { return 1i * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_named_bool":       {src: "type nb bool\nfunc f() nb { return 1 < 2 }", tok: token.LSS, muts: []mutator.Type{cn}},
+		"const_foreign_mutator":  {src: "func f() int { return 1 + 2 }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
+		"const_float_return":     {src: "func f() float64 { return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_binary":     {src: "func f(x float64) float64 { return x * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_float_variadic":   {src: "func g(r ...float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_generic":    {src: "func g[T ~float64](r T) T { return r }\nfunc f() float64 { return g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_builtin":    {src: "func f(s []float64) []float64 { return append(s, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_call_fun":   {src: "func g() func(float64) { return nil }\nfunc f() { g()(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_arity":      {src: "func g(a, b, c, d, e float64) {}\nfunc f() { g(1, 2, 3, 4, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_iface":      {src: "func g(v any) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_no_uses":    {src: "func g(r float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, bareInfo: true},
+		"const_no_files":         {src: "func f() int { return 1 + 2 }", tok: token.ADD, muts: []mutator.Type{ab}, noFiles: true},
+		"const_float_define":     {src: "func f() float64 { r := 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_map":        {src: "func f(m map[int]float64) { m[1] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float_lhs_call":   {src: "func f(s []float64, i func() int) { s[i()] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_float32":          {src: "func g(r float32) {}\nfunc f() { g(1e38 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(g)"},
+		"const_float32_overflow": {src: "func g(r float32) {}\nfunc f() { g(3e38 / 2) }", tok: token.QUO, muts: []mutator.Type{ab}},
 		// A helper returns plain bool, which a named bool context rejects.
 		"named_bool_ordered": {src: "type nb bool\nfunc f(a, b int) nb { return a < b }", tok: token.LSS, muts: []mutator.Type{cn}},
 		"named_bool_xor":     {src: "type nb bool\nfunc f(a, b int) nb { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}},
@@ -299,6 +354,9 @@ func TestNewRewriter(t *testing.T) {
 			src := []byte("package p\n\n" + tc.src + "\n")
 			fset := token.NewFileSet()
 			f, info := typeCheck(t, fset, "p.go", src)
+			if tc.bareInfo {
+				info.Uses = nil
+			}
 			var node ast.Node
 			seen := 0
 			ast.Inspect(f, func(n ast.Node) bool {
@@ -324,7 +382,11 @@ func TestNewRewriter(t *testing.T) {
 			inner := func(n ast.Node) string {
 				return string(src[fset.Position(n.Pos()).Offset:fset.Position(n.End()).Offset])
 			}
-			got, err := schemata.NewRewriter(info, testPrefix, &schemata.HelperSet{})(site, inner)
+			files := []*ast.File{f}
+			if tc.noFiles {
+				files = nil
+			}
+			got, err := schemata.NewRewriter(info, files, testPrefix, &schemata.HelperSet{})(site, inner)
 			if tc.want == "" {
 				if !errors.Is(err, schemata.ErrUnsupported) {
 					t.Errorf("got %q, %v; want ErrUnsupported", got, err)

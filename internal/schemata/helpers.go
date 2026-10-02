@@ -229,9 +229,14 @@ func (h *HelperSet) Use(name string) {
 }
 
 // AddRaw appends a per-site helper declaration, already carrying the prefix.
-// It may refer to the Active and Reached helpers, which every file declares.
+// It may refer to the Active and Reached helpers, which every file declares,
+// and to helpers passed to Use, but not to any import: the file imports only
+// what the fixed helpers need. Code identical to code already added is
+// dropped, so that sites sharing a helper may each add it.
 func (h *HelperSet) AddRaw(code string) {
-	h.raw = append(h.raw, code)
+	if !slices.Contains(h.raw, code) {
+		h.raw = append(h.raw, code)
+	}
 }
 
 // File returns the helper file for package pkgName with every generated
@@ -240,9 +245,9 @@ func (h *HelperSet) AddRaw(code string) {
 // collide with the file's imports. It declares Active and Reached, the
 // helpers passed to Use (in a fixed order, whatever the order of the calls)
 // and the AddRaw code, and imports only what those need. The result is
-// gofmt-formatted; if the AddRaw code does not parse, it is returned
-// unformatted so that the compiler reports the error against it.
-func (h *HelperSet) File(pkgName, prefix string) []byte {
+// gofmt-formatted. If it does not format -- AddRaw code that does not parse
+// -- the error is returned with the unformatted source, for the message.
+func (h *HelperSet) File(pkgName, prefix string) ([]byte, error) {
 	var body bytes.Buffer
 	var imports []string
 	for _, d := range helperDefs {
@@ -270,10 +275,10 @@ func (h *HelperSet) File(pkgName, prefix string) []byte {
 
 	src, err := format.Source(out.Bytes())
 	if err != nil {
-		return out.Bytes()
+		return out.Bytes(), fmt.Errorf("schemata: helper file for %s: %w", pkgName, err)
 	}
 
-	return src
+	return src, nil
 }
 
 // helperNames lists the names Use accepts, for messages.
