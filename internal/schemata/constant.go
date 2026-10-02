@@ -159,6 +159,14 @@ func constantForm(info *types.Info, e ast.Expr, s Site, prefix string, h *Helper
 	if kv, ok := ctx.(*ast.KeyValueExpr); ok && ast.Unparen(kv.Key) == e {
 		return "", fmt.Errorf("%w: constant composite literal key", ErrUnsupported)
 	}
+	// In a conversion T(c) the shift form's untyped 1 takes the type T, which
+	// for a type parameter is not an integer type the shift accepts, whatever
+	// type go/types records for c.
+	if call, ok := ctx.(*ast.CallExpr); ok && info.Types[call.Fun].IsType() {
+		if _, basic := info.Types[call.Fun].Type.Underlying().(*types.Basic); !basic {
+			return "", fmt.Errorf("%w: constant converted to %v", ErrUnsupported, info.Types[call.Fun].Type)
+		}
+	}
 	c, err := foldSite(info, e, s)
 	if err != nil {
 		return "", err
@@ -512,9 +520,12 @@ func witnessCallee(info *types.Info, e ast.Expr, call *ast.CallExpr, b *types.Ba
 	if i < 0 || call.Ellipsis.IsValid() {
 		return nil, fmt.Errorf("%w: float constant not a plain call argument", ErrUnsupported)
 	}
-	id := calleeIdent(call.Fun)
-	if id == nil || info.Uses == nil {
-		return nil, fmt.Errorf("%w: float constant's callee is not a name", ErrUnsupported)
+	if info.Uses == nil {
+		return nil, fmt.Errorf("%w: no Uses to check a float constant's callee", ErrUnsupported)
+	}
+	id := calleeIdent(info, call.Fun)
+	if id == nil {
+		return nil, fmt.Errorf("%w: float constant's callee is not a name or a qualified name", ErrUnsupported)
 	}
 	switch obj := info.Uses[id].(type) {
 	case *types.Func:
@@ -540,15 +551,21 @@ func witnessCallee(info *types.Info, e ast.Expr, call *ast.CallExpr, b *types.Ba
 	return sig, nil
 }
 
-// calleeIdent returns the identifier a callee made only of identifiers and
-// selectors names, or nil.
-func calleeIdent(fun ast.Expr) *ast.Ident {
+// calleeIdent returns the identifier naming a callee that is a plain or
+// package-qualified name, or nil. Evaluating either a second time, as the
+// witness, has no effect and cannot panic. A method value or a field
+// (x.M, x.f) is refused: a nil x panics when the witness is evaluated, among
+// the arguments, where the original panics at the call, after all of them --
+// a later argument's effects would be lost.
+func calleeIdent(info *types.Info, fun ast.Expr) *ast.Ident {
 	switch f := ast.Unparen(fun).(type) {
 	case *ast.Ident:
 		return f
 	case *ast.SelectorExpr:
-		if callFree(f.X) {
-			return f.Sel
+		if x, ok := f.X.(*ast.Ident); ok {
+			if _, pkg := info.Uses[x].(*types.PkgName); pkg {
+				return f.Sel
+			}
 		}
 	}
 
@@ -567,12 +584,16 @@ func callFree(x ast.Expr) bool {
 	return false
 }
 
-// witnessLHS returns the left side assigned e by the plain assignment st, if
-// it can be passed as &lhs: addressable, of the type b the constant took, and
-// evaluated twice without effect.
+// witnessLHS returns the left side assigned e by the single plain assignment
+// st, if it can be passed as &lhs: addressable, of the type b the constant
+// took, and identifiers and selectors only. The witness is the original
+// text, so the lhs must hold no site (no index, no call), whose rendered
+// form the assignment would evaluate but the witness would not; and with a
+// single assignment of a constant, nothing runs between a nil dereference in
+// the witness and the one the original makes when it stores.
 func witnessLHS(info *types.Info, e ast.Expr, st *ast.AssignStmt, b *types.Basic) (ast.Expr, error) {
 	i := slices.IndexFunc(st.Rhs, func(r ast.Expr) bool { return ast.Unparen(r) == e })
-	if st.Tok != token.ASSIGN || i < 0 || len(st.Lhs) != len(st.Rhs) {
+	if st.Tok != token.ASSIGN || i < 0 || len(st.Lhs) != 1 || len(st.Rhs) != 1 {
 		return nil, fmt.Errorf("%w: float constant not the value of a plain assignment", ErrUnsupported)
 	}
 	lhs := st.Lhs[i]
@@ -582,28 +603,9 @@ func witnessLHS(info *types.Info, e ast.Expr, st *ast.AssignStmt, b *types.Basic
 		return nil, fmt.Errorf("%w: float constant assigned to a non-addressable operand", ErrUnsupported)
 	case tv.Type == nil || !types.Identical(tv.Type.Underlying(), b):
 		return nil, fmt.Errorf("%w: float constant assigned to a %v", ErrUnsupported, tv.Type)
-	case !effectFree(lhs):
-		return nil, fmt.Errorf("%w: float constant assigned to an operand with a call", ErrUnsupported)
+	case !callFree(lhs):
+		return nil, fmt.Errorf("%w: float constant assigned to more than a name or selector", ErrUnsupported)
 	}
 
 	return lhs, nil
-}
-
-// effectFree reports whether x contains no call and no receive.
-func effectFree(x ast.Expr) bool {
-	free := true
-	ast.Inspect(x, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.CallExpr:
-			free = false
-		case *ast.UnaryExpr:
-			if n.Op == token.ARROW {
-				free = false
-			}
-		}
-
-		return free
-	})
-
-	return free
 }

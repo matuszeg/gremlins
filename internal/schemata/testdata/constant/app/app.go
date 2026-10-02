@@ -52,7 +52,7 @@ func Mix() any {
 
 func Method() any {
 	var b foo.Box
-	b.Put(3.0 - 0.5)
+	b.Put(3.0 - 0.5) // refused -: a method value witness can panic out of order
 	return b.R
 }
 
