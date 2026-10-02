@@ -230,12 +230,13 @@ func testSchemaVerdicts(t *testing.T, fx schemaFixture) {
 		opts []engine.ExecutorDealerOption
 		want mutator.Status
 	}{
-		"killed":        {key: "Add/ARITHMETIC_BASE", want: mutator.Killed},
-		"lived":         {key: "Scale/ARITHMETIC_BASE", want: mutator.Lived},
-		"not_covered":   {key: "Unused/ARITHMETIC_BASE", want: mutator.NotCovered},
-		"run_timed_out": {key: "Pause/CONDITIONALS_BOUNDARY", want: mutator.RunTimedOut},
-		"increment":     {key: "Inc/INCREMENT_DECREMENT", want: mutator.Killed},
-		"negative":      {key: "Neg/INVERT_NEGATIVES", want: mutator.Killed},
+		"killed":         {key: "Add/ARITHMETIC_BASE", want: mutator.Killed},
+		"lived":          {key: "Scale/ARITHMETIC_BASE", want: mutator.Lived},
+		"not_covered":    {key: "Unused/ARITHMETIC_BASE", want: mutator.NotCovered},
+		"run_timed_out":  {key: "Pause/CONDITIONALS_BOUNDARY", want: mutator.RunTimedOut},
+		"increment":      {key: "Inc/INCREMENT_DECREMENT", want: mutator.Killed},
+		"negative":       {key: "Neg/INVERT_NEGATIVES", want: mutator.Killed},
+		"exit_0_in_test": {key: "Quit/ARITHMETIC_BASE", want: mutator.Killed},
 		"killed_in_dependent": {
 			key:  "Scale/ARITHMETIC_BASE",
 			set:  map[string]any{configuration.UnleashCrossPackageKey: true},
@@ -305,7 +306,7 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 	cmd := cmds[0]
 	wantArgs := []string{
 		fx.build.Binaries[calcPkg], "-test.count=1", "-test.timeout", "1s", "-test.failfast",
-		"-test.run", "^(TestAdd|TestScale)$", "-test.cpu", "2",
+		"-test.paniconexit0", "-test.run", "^(TestAdd|TestScale)$", "-test.cpu", "2",
 	}
 	if !slices.Equal(cmd.Args, wantArgs) {
 		t.Errorf("args = %q, want %q", cmd.Args, wantArgs)

@@ -30,3 +30,7 @@ func Inc(x int) int {
 
 // Neg is pinned by TestNeg.
 func Neg(x int) int { return -x }
+
+// Quit is checked by TestQuit, which exits 0 when the result is wrong: go
+// test fails a binary whose test calls os.Exit(0), so its mutant is killed.
+func Quit(a, b int) int { return a % b }

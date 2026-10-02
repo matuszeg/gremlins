@@ -1,6 +1,9 @@
 package calc
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestAdd(t *testing.T) {
 	if Add(2, 3) != 5 {
@@ -27,5 +30,11 @@ func TestInc(t *testing.T) {
 func TestNeg(t *testing.T) {
 	if Neg(1) != -1 {
 		t.Error("Neg(1) != -1")
+	}
+}
+
+func TestQuit(t *testing.T) {
+	if Quit(7, 2) != 1 {
+		os.Exit(0)
 	}
 }

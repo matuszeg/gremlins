@@ -198,7 +198,7 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		lines := strings.Split(string(raw), "\n")
-		if want := "-test.count=1 -test.timeout 3s -test.run ^(TestA|TestB)$"; lines[0] != want {
+		if want := "-test.count=1 -test.timeout 3s -test.paniconexit0 -test.run ^(TestA|TestB)$"; lines[0] != want {
 			t.Errorf("args = %q, want %q", lines[0], want)
 		}
 		if lines[1] != dir {
@@ -218,7 +218,7 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatalf("nullRun: %v", err)
 		}
 		raw, _ := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
-		if got, want := strings.TrimSpace(string(raw)), "-test.count=1 -test.timeout 3s"; got != want {
+		if got, want := strings.TrimSpace(string(raw)), "-test.count=1 -test.timeout 3s -test.paniconexit0"; got != want {
 			t.Errorf("args = %q, want %q", got, want)
 		}
 	})
