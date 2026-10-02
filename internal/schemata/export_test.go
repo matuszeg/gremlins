@@ -19,3 +19,12 @@ package schemata
 // ConstMutation exposes constMutation to the external tests, which hold it
 // against the engine's table.
 var ConstMutation = constMutation
+
+// RewriterFactory exposes rewriterFactory, for tests that force a rewrite.
+type RewriterFactory = rewriterFactory
+
+// RewritePackageWith exposes rewritePackage with an injected rewriter.
+var RewritePackageWith = rewritePackage
+
+// BinaryNames exposes binaryNames.
+var BinaryNames = binaryNames
