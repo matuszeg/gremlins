@@ -126,7 +126,7 @@ func runParity(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withS
 	d := engine.NewExecutorDealer(mod, wdd, time.Second)
 	var calls atomic.Int32
 	prepare := func(ctx context.Context, m gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-		testPkgs func(string) []string, allowance time.Duration, nullRun func(bin, pkgDir string) error,
+		testPkgs func(string) []string, allowance time.Duration, nullRun schemata.NullRunFunc,
 	) (schemata.Plan, error) {
 		calls.Add(1)
 

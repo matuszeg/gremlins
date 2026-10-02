@@ -129,10 +129,8 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 		return plan, nil
 	}
 
-	nullRun := func(bin, pkgDir string) error {
-		return d.nullRun(ctx, bin, pkgDir, targets.testsAt(pkgDir))
-	}
-	plan, err := mu.prepare(ctx, mu.module, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance, nullRun)
+	plan, err := mu.prepare(ctx, mu.module, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance,
+		d.schemaNullRun(ctx, workDir, targets))
 	if err != nil {
 		return plan, err
 	}
@@ -251,11 +249,32 @@ func (t schemaTargets) testsAt(dir string) []string {
 	return t.tests[pkg]
 }
 
+// schemaNullRun is Prepare's null run: each binary runs, in its package's
+// directory of the module root, the tests targets selects there, with the
+// overlay that points the module root's rewritten files at the schema copy's
+// -- the one a mutant's run gets for its worker copy -- written into tmpDir.
+func (m MutantExecutorDealer) schemaNullRun(ctx context.Context, tmpDir string, targets schemaTargets) schemata.NullRunFunc {
+	overlays := m.overlays
+	if overlays == nil {
+		overlays = newOverlayCache()
+	}
+
+	return func(b *schemata.Build, bin, pkgDir string) error {
+		overlay, err := overlays.get(b, m.mod.Root, tmpDir)
+		if err != nil {
+			return fmt.Errorf("%s in %s: %w", filepath.Base(bin), pkgDir, err)
+		}
+
+		return m.nullRun(ctx, bin, pkgDir, overlay, targets.testsAt(pkgDir))
+	}
+}
+
 // nullRun runs the test binary bin in pkgDir with no mutant switched on, the
-// tests named in tests (all of them when empty), and the bounds a mutant's run
-// gets. A run that does not pass is an error whose first line says how it
-// ended and, when the output shows it, which test failed.
-func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir string, tests []string) error {
+// tests named in tests (all of them when empty), and the bounds and overlay a
+// mutant's run gets; an empty overlay adds none. A run that does not pass is
+// an error whose first line says how it ended and, when the output shows it,
+// which test failed.
+func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir, overlay string, tests []string) error {
 	bound := m.testExecutionTime + schemaBackstopGrace
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
@@ -267,6 +286,9 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir string, t
 	cmd := m.execContext(ctx, bin, args...)
 	cmd.Dir = pkgDir
 	cmd.Env = withoutMutant(os.Environ())
+	if overlay != "" {
+		cmd.Env = append(cmd.Env, overlayGOFLAGS(overlay))
+	}
 	out := &headWriter{limit: nullRunOutputLimit}
 	cmd.Stdout = out
 	cmd.Stderr = out

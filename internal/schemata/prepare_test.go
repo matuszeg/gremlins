@@ -29,6 +29,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -134,18 +135,22 @@ type nullRuns struct {
 	mu    sync.Mutex
 	calls map[string]int // by package directory
 	dirs  map[string]string
-	fail  func(pkgDir string, call int) error
+	// builds is the build each binary's null run was handed.
+	builds map[string]*schemata.Build
+	fail   func(pkgDir string, call int) error
 }
 
-func (n *nullRuns) run(bin, pkgDir string) error {
+func (n *nullRuns) run(b *schemata.Build, bin, pkgDir string) error {
 	n.mu.Lock()
 	if n.calls == nil {
 		n.calls = map[string]int{}
 		n.dirs = map[string]string{}
+		n.builds = map[string]*schemata.Build{}
 	}
 	n.calls[pkgDir]++
 	call := n.calls[pkgDir]
 	n.dirs[bin] = pkgDir
+	n.builds[bin] = b
 	n.mu.Unlock()
 	if n.fail != nil {
 		if err := n.fail(pkgDir, call); err != nil {
@@ -286,6 +291,11 @@ func TestPrepare(t *testing.T) {
 		}
 		if !strings.HasPrefix(bin, workDir) || !strings.HasPrefix(plan.Build.Dir, workDir) {
 			t.Errorf("build output %s / %s is outside workDir %s", bin, plan.Build.Dir, workDir)
+		}
+		// The null run gets the build, for the overlay its go commands need.
+		got := runs.builds[bin]
+		if got == nil || got.Dir != plan.Build.Dir || got.Binaries[p] != bin || !slices.Equal(got.Rewritten, plan.Build.Rewritten) {
+			t.Errorf("null run of %s was handed build %+v, want %+v", p, got, plan.Build)
 		}
 	}
 	// The fixture is not vacuous: b's binary fails in the schema copy, where

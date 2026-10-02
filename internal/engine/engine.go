@@ -119,7 +119,7 @@ func WithViability(v Viability) Option {
 
 // PrepareFunc has the signature of schemata.Prepare.
 type PrepareFunc func(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-	testPkgs func(pkg string) []string, allowance time.Duration, nullRun func(bin, pkgDir string) error,
+	testPkgs func(pkg string) []string, allowance time.Duration, nullRun schemata.NullRunFunc,
 ) (schemata.Plan, error)
 
 // WithPrepare overrides the schemata.Prepare a --schemata run calls (mainly
