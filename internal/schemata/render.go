@@ -57,6 +57,9 @@ type siteNode struct {
 	start, end int
 	children   []*siteNode
 	rendered   string
+	// fallback is set when the rewrite failed and rendered is the site's
+	// original text, with its nested sites rendered.
+	fallback bool
 }
 
 // Render returns src, the bytes of file, with every site replaced by its
@@ -72,20 +75,27 @@ type siteNode struct {
 // into fset, so a node from a different FileSet whose position happens to
 // fall inside file cannot be detected and is spliced as if it were file's.
 func Render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []SiteError) {
+	out, _, errs := render(fset, file, src, sites, rw)
+
+	return out, errs
+}
+
+// render is Render, also returning the rendered containment forest.
+func render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []*siteNode, []SiteError) {
 	if file == nil || file.Size() != len(src) {
 		errs := make([]SiteError, 0, len(sites))
 		for _, s := range sites {
 			errs = append(errs, SiteError{Site: s, Err: errSourceSize})
 		}
 
-		return src, errs
+		return src, nil, errs
 	}
 	roots, errs := buildForest(fset, file, sites)
 	for _, r := range roots {
 		errs = renderNode(fset, file, src, r, rw, errs)
 	}
 
-	return []byte(splice(src, 0, len(src), roots)), errs
+	return []byte(splice(src, 0, len(src), roots)), roots, errs
 }
 
 // buildForest nests each site under the smallest site containing it.
@@ -156,9 +166,11 @@ func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, 
 	case err != nil:
 		errs = append(errs, SiteError{Site: n.site, Err: err})
 		text = original
+		n.fallback = true
 	case strings.Count(text, "\n") != strings.Count(string(src[n.start:n.end]), "\n"):
 		errs = append(errs, SiteError{Site: n.site, Err: errNewlineChanged})
 		text = original
+		n.fallback = true
 	}
 	n.rendered = text
 
