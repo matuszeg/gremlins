@@ -284,6 +284,7 @@ func TestNewRewriter(t *testing.T) {
 		// A helper returns plain bool, which a named bool context rejects.
 		"named_bool_ordered": {src: "type nb bool\nfunc f(a, b int) nb { return a < b }", tok: token.LSS, muts: []mutator.Type{cn}},
 		"named_bool_xor":     {src: "type nb bool\nfunc f(a, b int) nb { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}},
+		"generic_map_nested": {src: "type MapC interface{ ~map[string]int }\nfunc f[M interface{ MapC }](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
 		"generic_map_inc":    {src: "func f[M ~map[string]int](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
 		"foreign_mutator":    {src: "func f(a, b int) int { return a + b }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
 		"duplicate_mutator":  {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, muts: []mutator.Type{cn, cn}},

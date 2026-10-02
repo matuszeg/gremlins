@@ -354,16 +354,12 @@ func (r *rewriter) incDec(s Site, st *ast.IncDecStmt, inner func(ast.Node) strin
 	if err := satisfies(t, numberConstraint); err != nil {
 		return "", err
 	}
+	if r.info.Types[st.X].Addressable() {
+		return r.call("IncDec", id, "&"+inner(st.X), inc), nil
+	}
 	ix, ok := ast.Unparen(st.X).(*ast.IndexExpr)
-	if !ok {
-		return r.call("IncDec", id, "&"+inner(st.X), inc), nil
-	}
-	isMap, err := r.mapIndex(ix)
-	if err != nil {
-		return "", err
-	}
-	if !isMap {
-		return r.call("IncDec", id, "&"+inner(st.X), inc), nil
+	if !ok || !r.isMap(ix.X) {
+		return "", fmt.Errorf("%w: %s operand neither addressable nor a map entry", ErrUnsupported, st.Tok)
 	}
 	m := inner(ix.X)
 	k := strings.Trim(inner(srcRange{ix.Lbrack + 1, ix.Rbrack}), " \t")
@@ -371,39 +367,18 @@ func (r *rewriter) incDec(s Site, st *ast.IncDecStmt, inner func(ast.Node) strin
 	return r.call("IncDecMap", id, m, k, inc), nil
 }
 
-// mapIndex reports whether ix indexes a map. An operand of type-parameter
-// type is a map only if some type in its constraint is; that case is
-// refused, as no one helper takes both a map and a slice.
-func (r *rewriter) mapIndex(ix *ast.IndexExpr) (bool, error) {
-	t := r.info.Types[ix.X].Type
+// isMap reports whether x has a map type. An operand of type-parameter
+// type is refused even when its core type is a map: inferring IncDecMap's
+// type arguments from it is not something this prototype attempts.
+func (r *rewriter) isMap(x ast.Expr) bool {
+	t := r.info.Types[x].Type
 	if t == nil {
-		return false, fmt.Errorf("%w: indexed operand without type information", ErrUnsupported)
+		return false
 	}
-	tp, ok := t.(*types.TypeParam)
-	if !ok {
-		_, isMap := t.Underlying().(*types.Map)
+	if _, ok := t.(*types.TypeParam); ok {
+		return false
+	}
+	_, ok := t.Underlying().(*types.Map)
 
-		return isMap, nil
-	}
-	iface, ok := tp.Constraint().Underlying().(*types.Interface)
-	if !ok {
-		return false, fmt.Errorf("%w: type parameter %v without an interface constraint", ErrUnsupported, tp)
-	}
-	for i := range iface.NumEmbeddeds() {
-		u, ok := iface.EmbeddedType(i).(*types.Union)
-		if !ok {
-			if _, isMap := iface.EmbeddedType(i).Underlying().(*types.Map); isMap {
-				return false, fmt.Errorf("%w: map-typed type parameter %v", ErrUnsupported, tp)
-			}
-
-			continue
-		}
-		for j := range u.Len() {
-			if _, isMap := u.Term(j).Type().Underlying().(*types.Map); isMap {
-				return false, fmt.Errorf("%w: map-typed type parameter %v", ErrUnsupported, tp)
-			}
-		}
-	}
-
-	return false, nil
+	return ok
 }
