@@ -1,0 +1,288 @@
+/*
+ * Copyright 2026 The Gremlins Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+package schemata
+
+import (
+	"bytes"
+	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"testing"
+)
+
+// binarySites returns one Site per binary expression in f whose operator is
+// in ops, in source order.
+func binarySites(f *ast.File, ops ...token.Token) []Site {
+	var sites []Site
+	ast.Inspect(f, func(n ast.Node) bool {
+		be, ok := n.(*ast.BinaryExpr)
+		if !ok {
+			return true
+		}
+		for _, op := range ops {
+			if be.Op == op {
+				sites = append(sites, Site{Node: be, Tok: be.Op})
+			}
+		}
+
+		return true
+	})
+
+	return sites
+}
+
+// wrap is the toy Rewriter: it wraps the site as W(<inner text>).
+func wrap(s Site, inner func(ast.Node) string) (string, error) {
+	return "W(" + inner(s.Node) + ")", nil
+}
+
+func TestRender(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		src     string
+		ops     []token.Token
+		dup     bool        // pass the first site twice
+		rw      Rewriter    // nil means wrap
+		want    string      // expected output
+		wantErr []error     // expected SiteError causes, in order
+		errTok  token.Token // token of the site each SiteError must name
+	}{
+		"single": {
+			src:  "package p\nfunc f(a, b int) { x := a + b; _ = x }\n",
+			ops:  []token.Token{token.ADD},
+			want: "package p\nfunc f(a, b int) { x := W(a + b); _ = x }\n",
+		},
+		"nested_sites": {
+			src:  "package p\nfunc f(a, b, c int) {\n\tif a+b < c {\n\t}\n}\n",
+			ops:  []token.Token{token.ADD, token.LSS},
+			want: "package p\nfunc f(a, b, c int) {\n\tif W(W(a+b) < c) {\n\t}\n}\n",
+		},
+		"siblings": {
+			src:  "package p\nfunc f(a, b, c, d int) { g(a+b, c-d) }\n",
+			ops:  []token.Token{token.ADD, token.SUB},
+			want: "package p\nfunc f(a, b, c, d int) { g(W(a+b), W(c-d)) }\n",
+		},
+		"inner_on_operand": {
+			src: "package p\nfunc f(a, b, c int) bool { return a+b < c }\n",
+			ops: []token.Token{token.ADD, token.LSS},
+			rw: func(s Site, inner func(ast.Node) string) (string, error) {
+				be, ok := s.Node.(*ast.BinaryExpr)
+				if !ok {
+					return "", ErrUnsupported
+				}
+
+				return "L(" + inner(be.X) + "," + inner(be.Y) + ")", nil
+			},
+			want: "package p\nfunc f(a, b, c int) bool { return L(L(a,b),c) }\n",
+		},
+		"inner_reaches_into_nested_site": {
+			src: "package p\nfunc f(a, b, c int) bool { return a+b < c }\n",
+			ops: []token.Token{token.ADD, token.LSS},
+			rw: func(s Site, inner func(ast.Node) string) (string, error) {
+				if s.Tok == token.ADD {
+					return wrap(s, inner)
+				}
+				be, ok := s.Node.(*ast.BinaryExpr)
+				if !ok {
+					return "", ErrUnsupported
+				}
+				x, ok := be.X.(*ast.BinaryExpr)
+				if !ok {
+					return "", ErrUnsupported
+				}
+				// x.Y lies strictly inside the nested a+b site; nil has no range.
+				return "R(" + inner(be.X) + "|" + inner(x.Y) + "|" + inner(nil) + ")", nil
+			},
+			want: "package p\nfunc f(a, b, c int) bool { return R(W(a+b)|b|) }\n",
+		},
+		"multi_line_site_kept_on_its_lines": {
+			src:  "package p\nfunc f(a, b int) int {\n\treturn a +\n\t\tb\n}\n",
+			ops:  []token.Token{token.ADD},
+			want: "package p\nfunc f(a, b int) int {\n\treturn W(a +\n\t\tb)\n}\n",
+		},
+		"rewriter_error_leaves_original": {
+			src: "package p\nfunc f(a, b, c int) {\n\tif a+b < c {\n\t}\n}\n",
+			ops: []token.Token{token.ADD, token.LSS},
+			rw: func(s Site, inner func(ast.Node) string) (string, error) {
+				if s.Tok == token.LSS {
+					return "", ErrUnsupported
+				}
+
+				return wrap(s, inner)
+			},
+			want:    "package p\nfunc f(a, b, c int) {\n\tif W(a+b) < c {\n\t}\n}\n",
+			wantErr: []error{ErrUnsupported},
+			errTok:  token.LSS,
+		},
+		"inserted_newline_rejected": {
+			src: "package p\nfunc f(a, b, c int) { g(a+b < c) }\n",
+			ops: []token.Token{token.ADD, token.LSS},
+			rw: func(s Site, inner func(ast.Node) string) (string, error) {
+				if s.Tok == token.LSS {
+					return "W(\n" + inner(s.Node) + ")", nil
+				}
+
+				return wrap(s, inner)
+			},
+			want:    "package p\nfunc f(a, b, c int) { g(W(a+b) < c) }\n",
+			wantErr: []error{errNewlineChanged},
+			errTok:  token.LSS,
+		},
+		"duplicate_range_reported": {
+			src:     "package p\nfunc f(a, b int) { x := a + b; _ = x }\n",
+			ops:     []token.Token{token.ADD},
+			dup:     true,
+			want:    "package p\nfunc f(a, b int) { x := W(a + b); _ = x }\n",
+			wantErr: []error{errDuplicateSite},
+			errTok:  token.ADD,
+		},
+		"no_sites": {
+			src:  "package p\nfunc f(a, b int) int { return a * b }\n",
+			ops:  []token.Token{token.ADD},
+			want: "package p\nfunc f(a, b int) int { return a * b }\n",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "p.go", tc.src, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sites := binarySites(f, tc.ops...)
+			if tc.dup {
+				sites = append(sites, Site{Node: sites[0].Node, Tok: sites[0].Tok})
+			}
+			rw := tc.rw
+			if rw == nil {
+				rw = wrap
+			}
+			out, errs := Render(fset, []byte(tc.src), sites, rw)
+			if string(out) != tc.want {
+				t.Errorf("output mismatch\n got: %q\nwant: %q", out, tc.want)
+			}
+			if len(errs) != len(tc.wantErr) {
+				t.Fatalf("got %d SiteErrors %v, want %d", len(errs), errs, len(tc.wantErr))
+			}
+			for i, se := range errs {
+				if !errors.Is(se.Err, tc.wantErr[i]) {
+					t.Errorf("SiteError %d: got %v, want %v", i, se.Err, tc.wantErr[i])
+				}
+				if se.Site.Tok != tc.errTok {
+					t.Errorf("SiteError %d names site %v, want %v", i, se.Site.Tok, tc.errTok)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderPreservesLineNumbers(t *testing.T) {
+	t.Parallel()
+	src := "package p\n\n" +
+		"// keep me\n" +
+		"func f(a, b, c int) int {\n" +
+		"\tx := a + b\n" +
+		"\tif x < c &&\n" +
+		"\t\ta-c > 0 {\n" +
+		"\t\treturn x * c\n" +
+		"\t}\n" +
+		"\treturn 0 // tail\n" +
+		"}\n"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites := binarySites(f, token.ADD, token.LSS, token.LAND, token.SUB, token.GTR, token.MUL)
+	out, errs := Render(fset, []byte(src), sites, wrap)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected SiteErrors: %v", errs)
+	}
+	if got, want := bytes.Count(out, []byte("\n")), bytes.Count([]byte(src), []byte("\n")); got != want {
+		t.Fatalf("newline count %d, want %d\n%s", got, want, out)
+	}
+	wantLines := map[string]struct {
+		idx  int
+		line string
+	}{
+		"package":    {0, "package p"},
+		"blank":      {1, ""},
+		"comment":    {2, "// keep me"},
+		"func":       {3, "func f(a, b, c int) int {"},
+		"assign":     {4, "\tx := W(a + b)"},
+		"cond_head":  {5, "\tif W(W(x < c) &&"},
+		"cond_tail":  {6, "\t\tW(W(a-c) > 0)) {"},
+		"return_mul": {7, "\t\treturn W(x * c)"},
+		"close_if":   {8, "\t}"},
+		"tail":       {9, "\treturn 0 // tail"},
+		"close_func": {10, "}"},
+	}
+	lines := bytes.Split(out, []byte("\n"))
+	for name, wl := range wantLines {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := string(lines[wl.idx]); got != wl.line {
+				t.Errorf("line %d: got %q, want %q", wl.idx+1, got, wl.line)
+			}
+		})
+	}
+}
+
+// span is an ast.Node with an arbitrary range, for site shapes no parser
+// produces.
+type span struct{ pos, end token.Pos }
+
+func (s span) Pos() token.Pos { return s.pos }
+func (s span) End() token.Pos { return s.end }
+
+func TestRenderRejectsMalformedSites(t *testing.T) {
+	t.Parallel()
+	const src = "abcdefghij"
+	cases := map[string]struct {
+		spans   [][2]int // byte offsets [start, end)
+		want    string
+		wantErr error
+	}{
+		"partial_overlap":  {spans: [][2]int{{1, 5}, {3, 8}}, want: "aW(bcde)fghij", wantErr: errOverlap},
+		"outside_source":   {spans: [][2]int{{2, 4}, {8, 20}}, want: "abW(cd)efghij", wantErr: errBadRange},
+		"invalid_position": {spans: [][2]int{{2, 4}, {-1, 3}}, want: "abW(cd)efghij", wantErr: errBadRange},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fset := token.NewFileSet()
+			base := fset.AddFile("p.go", -1, len(src)+20).Base()
+			var sites []Site
+			for _, sp := range tc.spans {
+				var n span
+				if sp[0] >= 0 {
+					n = span{pos: token.Pos(base + sp[0]), end: token.Pos(base + sp[1])}
+				}
+				sites = append(sites, Site{Node: n})
+			}
+			out, errs := Render(fset, []byte(src), sites, wrap)
+			if string(out) != tc.want {
+				t.Errorf("got %q, want %q", out, tc.want)
+			}
+			if len(errs) != 1 || !errors.Is(errs[0].Err, tc.wantErr) {
+				t.Errorf("got SiteErrors %v, want one %v", errs, tc.wantErr)
+			}
+		})
+	}
+}
