@@ -173,7 +173,7 @@ func TestRender(t *testing.T) {
 			if rw == nil {
 				rw = wrap
 			}
-			out, errs := Render(fset, []byte(tc.src), sites, rw)
+			out, errs := Render(fset, fset.File(f.Pos()), []byte(tc.src), sites, rw)
 			if string(out) != tc.want {
 				t.Errorf("output mismatch\n got: %q\nwant: %q", out, tc.want)
 			}
@@ -210,7 +210,7 @@ func TestRenderPreservesLineNumbers(t *testing.T) {
 		t.Fatal(err)
 	}
 	sites := binarySites(f, token.ADD, token.LSS, token.LAND, token.SUB, token.GTR, token.MUL)
-	out, errs := Render(fset, []byte(src), sites, wrap)
+	out, errs := Render(fset, fset.File(f.Pos()), []byte(src), sites, wrap)
 	if len(errs) != 0 {
 		t.Fatalf("unexpected SiteErrors: %v", errs)
 	}
@@ -260,14 +260,15 @@ func TestRenderRejectsMalformedSites(t *testing.T) {
 		wantErr error
 	}{
 		"partial_overlap":  {spans: [][2]int{{1, 5}, {3, 8}}, want: "aW(bcde)fghij", wantErr: errOverlap},
-		"outside_source":   {spans: [][2]int{{2, 4}, {8, 20}}, want: "abW(cd)efghij", wantErr: errBadRange},
+		"outside_source":   {spans: [][2]int{{2, 4}, {8, 20}}, want: "abW(cd)efghij", wantErr: errForeignFile},
 		"invalid_position": {spans: [][2]int{{-1, 3}, {2, 4}}, want: "abW(cd)efghij", wantErr: errBadRange},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			fset := token.NewFileSet()
-			base := fset.AddFile("p.go", -1, len(src)).Base()
+			file := fset.AddFile("p.go", -1, len(src))
+			base := file.Base()
 			var sites []Site
 			for _, sp := range tc.spans {
 				var n span
@@ -276,7 +277,7 @@ func TestRenderRejectsMalformedSites(t *testing.T) {
 				}
 				sites = append(sites, Site{Node: n})
 			}
-			out, errs := Render(fset, []byte(src), sites, wrap)
+			out, errs := Render(fset, file, []byte(src), sites, wrap)
 			if string(out) != tc.want {
 				t.Errorf("got %q, want %q", out, tc.want)
 			}
@@ -289,22 +290,37 @@ func TestRenderRejectsMalformedSites(t *testing.T) {
 
 func TestRenderRejectsSitesFromAnotherFile(t *testing.T) {
 	t.Parallel()
-	const (
-		aSrc = "package p\nvar x = 1 + 2\n"
-		// b.go is longer than a.go, but its site's offsets [16,19) fall
-		// inside a.go: unchecked, they would splice a.go's "= 1".
-		bSrc = "package p\nvar y=3+4\n// padding padding\n"
-	)
+	const aSrc = "package p\nvar x = 1 + 2\n"
 	cases := map[string]struct {
-		src     string // the bytes passed to Render as a.go's
-		useA    bool   // include a.go's site (first)
-		useB    bool   // include b.go's site
+		bSrc    string   // the other file in the FileSet
+		src     string   // the bytes passed to Render as a.go's
+		order   []string // which file's site comes first: "a" or "b"
 		want    string
-		wantErr int // number of errForeignFile SiteErrors
+		wantErr []error
 	}{
-		"foreign_site_reported": {src: aSrc, useA: true, useB: true, want: "package p\nvar x = W(1 + 2)\n", wantErr: 1},
-		"only_foreign_site":     {src: aSrc, useB: true, want: aSrc, wantErr: 1},
-		"size_mismatch":         {src: aSrc + "// extra\n", useA: true, want: aSrc + "// extra\n", wantErr: 1},
+		// b.go is longer, but its site's offsets [16,19) fall inside a.go:
+		// unchecked, they would splice a.go's "= 1".
+		"foreign_site_reported": {
+			bSrc: "package p\nvar y=3+4\n// padding padding\n", src: aSrc, order: []string{"a", "b"},
+			want: "package p\nvar x = W(1 + 2)\n", wantErr: []error{errForeignFile},
+		},
+		"only_foreign_site": {
+			bSrc: "package p\nvar y=3+4\n// padding padding\n", src: aSrc, order: []string{"b"},
+			want: aSrc, wantErr: []error{errForeignFile},
+		},
+		// b.go is exactly a.go's length and its site has a.go's offsets.
+		"same_size_foreign_site_first": {
+			bSrc: "package p\nvar y = 3 + 4\n", src: aSrc, order: []string{"b", "a"},
+			want: "package p\nvar x = W(1 + 2)\n", wantErr: []error{errForeignFile},
+		},
+		"same_size_only_foreign_site": {
+			bSrc: "package p\nvar y = 3 + 4\n", src: aSrc, order: []string{"b"},
+			want: aSrc, wantErr: []error{errForeignFile},
+		},
+		"size_mismatch": {
+			bSrc: "package p\nvar y = 3 + 4\n", src: aSrc + "// extra\n", order: []string{"a"},
+			want: aSrc + "// extra\n", wantErr: []error{errSourceSize},
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -314,27 +330,32 @@ func TestRenderRejectsSitesFromAnotherFile(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fb, err := parser.ParseFile(fset, "b.go", bSrc, 0)
+			fb, err := parser.ParseFile(fset, "b.go", tc.bSrc, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
 			var sites []Site
-			if tc.useA {
-				sites = append(sites, binarySites(fa, token.ADD)...)
+			for _, which := range tc.order {
+				f := fa
+				if which == "b" {
+					f = fb
+				}
+				sites = append(sites, binarySites(f, token.ADD)...)
 			}
-			if tc.useB {
-				sites = append(sites, binarySites(fb, token.ADD)...)
-			}
-			out, errs := Render(fset, []byte(tc.src), sites, wrap)
+			out, errs := Render(fset, fset.File(fa.Pos()), []byte(tc.src), sites, wrap)
 			if string(out) != tc.want {
 				t.Errorf("got %q, want %q", out, tc.want)
 			}
-			if len(errs) != tc.wantErr {
-				t.Fatalf("got SiteErrors %v, want %d", errs, tc.wantErr)
+			if len(errs) != len(tc.wantErr) {
+				t.Fatalf("got SiteErrors %v, want %v", errs, tc.wantErr)
 			}
-			for _, se := range errs {
-				if !errors.Is(se.Err, errForeignFile) {
-					t.Errorf("got %v, want %v", se.Err, errForeignFile)
+			for i, se := range errs {
+				if !errors.Is(se.Err, tc.wantErr[i]) {
+					t.Errorf("SiteError %d: got %v, want %v", i, se.Err, tc.wantErr[i])
+				}
+				// A foreign-file error must name b.go's site, never a.go's.
+				if got := fset.File(se.Site.Node.Pos()).Name(); errors.Is(se.Err, errForeignFile) && got != "b.go" {
+					t.Errorf("SiteError %d names a site in %s, want b.go", i, got)
 				}
 			}
 		})
