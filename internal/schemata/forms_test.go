@@ -216,7 +216,7 @@ func TestFormsBehave(t *testing.T) {
 
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}
-	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
+	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, nil, []*ast.File{f}, prefix, h))
 	for _, e := range errs {
 		t.Errorf("site at %s not rewritten: %v", fset.Position(e.Site.Node.Pos()), e.Err)
 	}
@@ -325,18 +325,22 @@ func TestNewRewriter(t *testing.T) {
 		"const_float_nested_lhs": {src: "type c struct{ r float64 }\ntype b struct{ c c }\nfunc f(v b) float64 { v.c.r = 1.5 * 2; return v.c.r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&v.c.r)"},
 		"const_float_assign":     {src: "func f() float64 { var r float64; r = 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&r)"},
 		// Constant-valued sites that stay refused.
-		"const_decl":                {src: "const k = 2 * 3", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_decl_local":          {src: "func f() int { const k = 1 + 2; return k }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "placed by duplicating f"},
-		"const_decl_len":            {src: "const k = len([3]int{1 + 1})", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_operand":             {src: "func f() int { return 2*3 + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_operand_paren":       {src: "func f() int { return (2 * 3) + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_array_len":           {src: "var a [1 + 1]int", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_array_len_nested":    {src: "var a [len([2]int{1 + 1})]int", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_key":                 {src: "var s = []int{1 + 1: 5}", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_shift_count":         {src: "func f(x int) int { return x << (1 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_generic_context":     {src: "func f[T ~int](x T) T { return x * (2 + 3) }", tok: token.ADD, muts: []mutator.Type{ab}},
-		"const_div_zero":            {src: "func f() int { return 2 * 0 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_rem":                 {src: "func f() int { return 2 % 1 }", tok: token.REM, muts: []mutator.Type{ab}, want: "(0*(1-(1<<_zzBit(1)-1)) + 2*(1<<_zzBit(1)-1))"},
+		"const_decl":             {src: "const k = 2 * 3", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_decl_local":       {src: "func f() int { const k = 1 + 2; return k }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "placed by duplicating f"},
+		"const_decl_len":         {src: "const k = len([3]int{1 + 1})", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_operand":          {src: "func f() int { return 2*3 + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_operand_paren":    {src: "func f() int { return (2 * 3) + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_array_len":        {src: "var a [1 + 1]int", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_array_len_nested": {src: "var a [len([2]int{1 + 1})]int", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_key":              {src: "var s = []int{1 + 1: 5}", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_shift_count":      {src: "func f(x int) int { return x << (1 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_generic_context":  {src: "func f[T ~int](x T) T { return x * (2 + 3) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_div_zero":         {src: "func f() int { return 2 * 0 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		"const_rem":              {src: "func f() int { return 2 % 1 }", tok: token.REM, muts: []mutator.Type{ab}, want: "(0*(1-(1<<_zzBit(1)-1)) + 2*(1<<_zzBit(1)-1))"},
+		// The mutant 4294967296 * 2 is too large for a 32-bit uint, whatever the
+		// host's: the target's sizes decide.
+		"const_fits_target_amd64":   {src: "func f() uint { return 4294967296 / 2 }", tok: token.QUO, muts: []mutator.Type{ab}, goarch: "amd64", want: "(2147483648*(1-(1<<_zzBit(1)-1)) + 8589934592*(1<<_zzBit(1)-1))"},
+		"const_exceeds_target_386":  {src: "func f() uint { return 4294967296 / 2 }", tok: token.QUO, muts: []mutator.Type{ab}, goarch: "386", refusal: "does not fit uint"},
 		"const_unrepresentable":     {src: "func f() uint8 { return 255 - 1 }", tok: token.SUB, muts: []mutator.Type{ab}},
 		"const_string":              {src: "func f() string { return \"a\" + \"b\" }", tok: token.ADD, muts: []mutator.Type{ab}},
 		"const_complex":             {src: "func f() complex128 { return 1i * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
@@ -396,6 +400,8 @@ type rewriterCase struct {
 	bareInfo bool
 	// noFiles gives NewRewriter no files to find a site's context in.
 	noFiles bool
+	// goarch, if set, is the GOARCH whose type sizes NewRewriter gets.
+	goarch string
 }
 
 // TestNewRewriterBitwiseLogical is TestNewRewriter for the INVERT_BITWISE
@@ -475,7 +481,13 @@ func runRewriterCases(t *testing.T, cases map[string]rewriterCase) {
 			if tc.noFiles {
 				files = nil
 			}
-			got, err := schemata.NewRewriter(info, files, testPrefix, &schemata.HelperSet{})(site, inner)
+			var sizes types.Sizes
+			if tc.goarch != "" {
+				if sizes = types.SizesFor("gc", tc.goarch); sizes == nil {
+					t.Fatalf("no sizes for GOARCH %s", tc.goarch)
+				}
+			}
+			got, err := schemata.NewRewriter(info, sizes, files, testPrefix, &schemata.HelperSet{})(site, inner)
 			if tc.want == "" {
 				if !errors.Is(err, schemata.ErrUnsupported) || !strings.Contains(err.Error(), tc.refusal) {
 					t.Errorf("got %q, %v; want ErrUnsupported %q", got, err, tc.refusal)

@@ -132,7 +132,7 @@ func renderFixture(t *testing.T, name string, mts []mutator.Type) *stmtFixture {
 
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}
-	out, errs := schemata.Render(fx.fset, fx.fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
+	out, errs := schemata.Render(fx.fset, fx.fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, nil, []*ast.File{f}, prefix, h))
 	for _, e := range errs {
 		t.Errorf("site at %s not rewritten: %v", fx.fset.Position(e.Site.Node.Pos()), e.Err)
 	}

@@ -88,17 +88,20 @@ func (s srcRange) End() token.Pos { return s.end }
 // would. A constant-valued site takes one of the constant forms instead
 // (see constantForm), which depend on the context the site is in: files are
 // the package's syntax, where that context is looked up. info must hold the
-// Types and Uses of the package the sites come from. A site outside those
+// Types and Uses of the package the sites come from; sizes are the target
+// platform's (the package's TypesSizes), against which a constant's mutant
+// values are held to fit their type, nil meaning the host's. A site outside those
 // forms, or one whose operand types the helper cannot take, is refused with
 // ErrUnsupported.
-func NewRewriter(info *types.Info, files []*ast.File, prefix string, h *HelperSet) Rewriter {
-	r := &rewriter{info: info, files: files, prefix: prefix, h: h}
+func NewRewriter(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *HelperSet) Rewriter {
+	r := &rewriter{info: info, sizes: sizes, files: files, prefix: prefix, h: h}
 
 	return r.rewrite
 }
 
 type rewriter struct {
 	info   *types.Info
+	sizes  types.Sizes
 	files  []*ast.File
 	prefix string
 	h      *HelperSet

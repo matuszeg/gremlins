@@ -86,8 +86,8 @@ func pkgSites(pkg *packages.Package) []schemata.Site {
 // every site whose token is tok into a call to an undefined helper, which
 // does not type-check.
 func breakTok(tok token.Token) schemata.RewriterFactory {
-	return func(info *types.Info, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
-		rw := schemata.NewRewriter(info, files, prefix, h)
+	return func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+		rw := schemata.NewRewriter(info, sizes, files, prefix, h)
 
 		return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
 			if e, ok := s.Node.(*ast.BinaryExpr); ok && s.Tok == tok {
@@ -102,8 +102,8 @@ func breakTok(tok token.Token) schemata.RewriterFactory {
 // refuseTok returns a rewriter factory that wraps NewRewriter but refuses
 // every site whose token is tok.
 func refuseTok(tok token.Token) schemata.RewriterFactory {
-	return func(info *types.Info, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
-		rw := schemata.NewRewriter(info, files, prefix, h)
+	return func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+		rw := schemata.NewRewriter(info, sizes, files, prefix, h)
 
 		return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
 			if s.Tok == tok {
@@ -118,8 +118,8 @@ func refuseTok(tok token.Token) schemata.RewriterFactory {
 // brokenHelper returns a rewriter factory that wraps NewRewriter but adds a
 // helper declaration that does not type-check: an error in the helper file,
 // inside no site.
-func brokenHelper(info *types.Info, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
-	rw := schemata.NewRewriter(info, files, prefix, h)
+func brokenHelper(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+	rw := schemata.NewRewriter(info, sizes, files, prefix, h)
 
 	return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
 		h.AddRaw("var " + prefix + "Broken int = \"not an int\"")

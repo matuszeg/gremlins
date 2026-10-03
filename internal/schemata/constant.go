@@ -82,7 +82,7 @@ func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (st
 	if fn != nil {
 		return "", r.dupSite(s, e, fn)
 	}
-	out, err := constantForm(r.info, e, s, r.prefix, r.h, ctx, inner)
+	out, err := constantForm(r.info, r.sizes, e, s, r.prefix, r.h, ctx, inner)
 	if err != nil {
 		return "", err
 	}
@@ -164,7 +164,7 @@ func (r *rewriter) context(e ast.Expr) (ast.Node, *ast.FuncDecl, error) {
 //
 // Anything else is refused with ErrUnsupported, as is a site whose mutant
 // cannot be folded (a division by zero) or does not fit the type.
-func constantForm(info *types.Info, e ast.Expr, s Site, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
+func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, s Site, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
 	if x, ok := ctx.(ast.Expr); ok && info.Types[x].Value != nil {
 		return "", fmt.Errorf("%w: operand of a constant expression", ErrUnsupported)
 	}
@@ -188,7 +188,7 @@ func constantForm(info *types.Info, e ast.Expr, s Site, prefix string, h *Helper
 	case b.Info()&types.IsBoolean != 0:
 		return boolForm(info, e, c, prefix, h)
 	case b.Info()&types.IsInteger != 0:
-		return intForm(info, e, c, b, prefix, h, inner)
+		return intForm(info, sizes, e, c, b, prefix, h, inner)
 	case b.Kind() == types.Float32 || b.Kind() == types.Float64:
 		return floatForm(info, e, c, b, prefix, h, ctx, inner)
 	}
@@ -388,12 +388,12 @@ func basicKind(t types.Type) types.BasicKind {
 }
 
 // intForm is the shift form. Each value must fit the context's type b.
-func intForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix string, h *HelperSet, inner func(ast.Node) string) (string, error) {
+func intForm(info *types.Info, sizes types.Sizes, e ast.Expr, c folded, b *types.Basic, prefix string, h *HelperSet, inner func(ast.Node) string) (string, error) {
 	vals := append([]constant.Value{c.c0}, c.cs...)
 	lits := make([]string, len(vals))
 	for i, v := range vals {
 		v = constant.ToInt(v)
-		if v.Kind() != constant.Int || !fitsInt(v, b) {
+		if v.Kind() != constant.Int || !fitsInt(v, b, sizes) {
 			return "", fmt.Errorf("%w: value %v does not fit %v", ErrUnsupported, vals[i], b)
 		}
 		lits[i] = v.ExactString()
@@ -425,9 +425,12 @@ func bitTerm(prefix string, id int) string {
 }
 
 // fitsInt reports whether the integer v is representable in b, an integer
-// type of the target platform.
-func fitsInt(v constant.Value, b *types.Basic) bool {
-	sizes := types.SizesFor("gc", build.Default.GOARCH)
+// type of the platform sizes describes -- the target's, which int, uint and
+// uintptr depend on. With no sizes it assumes the host's.
+func fitsInt(v constant.Value, b *types.Basic, sizes types.Sizes) bool {
+	if sizes == nil {
+		sizes = types.SizesFor("gc", build.Default.GOARCH)
+	}
 	if sizes == nil {
 		sizes = types.SizesFor("gc", "amd64")
 	}

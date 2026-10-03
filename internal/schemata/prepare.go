@@ -401,7 +401,7 @@ func loadPackages(ctx context.Context, modRoot, tags string, dirs []string) ([]*
 	patterns = slices.Compact(patterns)
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes |
-			packages.NeedTypesInfo | packages.NeedModule | packages.NeedDeps | packages.NeedImports,
+			packages.NeedTypesInfo | packages.NeedTypesSizes | packages.NeedModule | packages.NeedDeps | packages.NeedImports,
 		Context: ctx,
 		Dir:     modRoot,
 	}
