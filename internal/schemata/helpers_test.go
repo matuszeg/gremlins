@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -563,4 +564,206 @@ func TestUseRejectsUnknownHelper(t *testing.T) {
 		}
 	}()
 	(&schemata.HelperSet{}).Use("Lss")
+}
+
+// escapeSets are the three groups of fixed helpers, each instantiated by a
+// fixture of its own: the comparison, arithmetic and increment helpers, the
+// bitwise ones, and the op= statement ones.
+var escapeSets = map[string][]string{
+	"default": {
+		"Bit", "Xor", "LSS", "LEQ", "GTR", "GEQ", "ADD", "SUB", "MUL", "QUO", "REM", "NEG", "POS",
+		"IncDec", "IncDecMap",
+	},
+	"bitwise": {"AND", "OR", "XOR", "ANDNOT", "SHL", "SHR"},
+	"assignment": {
+		"ADDAssign", "ADDAssignMap", "ADDAssignStr", "ADDAssignStrMap", "SUBAssign", "SUBAssignMap",
+		"MULAssign", "MULAssignMap", "QUOAssign", "QUOAssignMap", "REMAssign", "REMAssignMap",
+		"ANDAssign", "ANDAssignMap", "ORAssign", "ORAssignMap", "XORAssign", "XORAssignMap",
+		"ANDNOTAssign", "ANDNOTAssignMap", "SHLAssign", "SHLAssignMap", "SHLAssignX", "SHLAssignXMap",
+		"SHRAssign", "SHRAssignMap", "SHRAssignX", "SHRAssignXMap",
+	},
+}
+
+// escapeFixture returns a main that calls every helper of the set with
+// concrete types, so that each generic helper is instantiated and compiled.
+// Operands come from the command line so that nothing is constant-folded.
+func escapeFixture(set string) string {
+	var b strings.Builder
+	b.WriteString("package main\n\nimport \"os\"\n\nfunc main() {\n")
+	b.WriteString("\tn := len(os.Args)\n\tf := float64(n)\n\ts := os.Args[0]\n\tu := uint8(n)\n")
+	b.WriteString("\tmi := map[string]int{\"k\": n}\n\tmu := map[string]uint8{\"k\": u}\n\tms := map[string]string{\"k\": s}\n\tmf := map[string]float64{\"k\": f}\n")
+	b.WriteString("\t_, _, _, _, _, _, _, _ = n, f, s, u, mi, mu, ms, mf\n")
+	call := func(format string, args ...any) { b.WriteString("\t" + fmt.Sprintf(format, args...) + "\n") }
+	for _, name := range escapeSets[set] {
+		h := testPrefix + name
+		ids := strings.Repeat("0, ", assignIDCount(name))
+		switch {
+		case name == "Bit":
+			call("_ = %s(0)", h)
+		case name == "Xor":
+			call("_ = %s(0, n < 1)", h)
+		case slices.Contains([]string{"LSS", "LEQ", "GTR", "GEQ"}, name):
+			call("_ = %s(0, 0, n, n)", h)
+			call("_ = %s(0, 0, f, f)", h)
+			call("_ = %s(0, 0, s, s)", h)
+		case slices.Contains([]string{"ADD", "SUB", "MUL", "QUO", "REM"}, name):
+			ids = "0, "
+			if name == "SUB" {
+				ids = "0, 0, "
+			}
+			call("_ = %s(%sn, n)", h, ids)
+			if name != "REM" {
+				call("_ = %s(%sf, f)", h, ids)
+			}
+		case name == "NEG":
+			call("_ = %s(0, 0, n)", h)
+			call("_ = %s(0, 0, f)", h)
+		case name == "POS":
+			call("_ = %s(0, n)", h)
+			call("_ = %s(0, f)", h)
+		case name == "IncDec":
+			call("%s(0, &n, true)", h)
+			call("%s(0, &f, false)", h)
+		case name == "IncDecMap":
+			call("%s(0, mi, \"k\", true)", h)
+			call("%s(0, mf, \"k\", false)", h)
+		case slices.Contains([]string{"AND", "OR", "XOR", "ANDNOT"}, name):
+			call("_ = %s(0, n, n)", h)
+			call("_ = %s(0, u, u)", h)
+		case name == "SHL" || name == "SHR":
+			call("_ = %s(0, n, n)", h)
+			call("_ = %s(0, u, n)", h)
+		default:
+			call("%s", assignCall(h, name, ids))
+		}
+	}
+	b.WriteString("}\n")
+
+	return b.String()
+}
+
+// assignIDCount is the number of id parameters of the op= helper name: two
+// for every one but the string and shift-count variants, which have one. The
+// other helpers' calls spell their ids out.
+func assignIDCount(name string) int {
+	if strings.HasSuffix(strings.TrimSuffix(name, "Map"), "Str") || strings.Contains(name, "AssignX") {
+		return 1
+	}
+
+	return 2
+}
+
+// assignCall is a call of the op= helper h, on a pointer or, for a Map
+// helper, a map entry, with operands of a type the helper accepts.
+func assignCall(h, name, ids string) string {
+	base := strings.TrimSuffix(name, "Map")
+	isMap := base != name
+	switch {
+	case strings.HasSuffix(base, "Str"):
+		if isMap {
+			return fmt.Sprintf("%s(%sms, \"k\", s)", h, ids)
+		}
+
+		return fmt.Sprintf("%s(%s&s, s)", h, ids)
+	case strings.HasSuffix(base, "AssignX"):
+		if isMap {
+			return fmt.Sprintf("%s(%smu, \"k\", n)", h, ids)
+		}
+
+		return fmt.Sprintf("%s(%s&u, n)", h, ids)
+	}
+	if isMap {
+		return fmt.Sprintf("%s(%smi, \"k\", n)", h, ids)
+	}
+
+	return fmt.Sprintf("%s(%s&n, n)", h, ids)
+}
+
+// escapeLine is a -gcflags=-m=1 diagnostic: "file.go:12:34: message".
+var escapeLine = regexp.MustCompile(`^(?:\./)?([^:\s]+\.go):(\d+):\d+: (.*)$`)
+
+// allocations returns the lines of -m=1 output that report an allocation in
+// file: "escapes to heap" and "moved to heap". "leaking param" is not one --
+// it says an argument's value flows out, which allocates nothing.
+func allocations(out, file string) []string {
+	var found []string
+	for _, line := range strings.Split(out, "\n") {
+		m := escapeLine.FindStringSubmatch(strings.TrimSpace(line))
+		if m == nil || filepath.Base(m[1]) != file {
+			continue
+		}
+		if strings.Contains(m[3], "escapes to heap") || strings.Contains(m[3], "moved to heap") {
+			found = append(found, line)
+		}
+	}
+
+	return found
+}
+
+// TestHelpersDoNotEscape builds each helper set's fixture with
+// -gcflags=-m=1 and requires the compiler to report no heap allocation at
+// any position of the helper file: a helper runs on every evaluation of a
+// mutated operator, and an allocation there is a cost on user hot paths.
+func TestHelpersDoNotEscape(t *testing.T) {
+	t.Parallel()
+	for set, names := range escapeSets {
+		t.Run(set, func(t *testing.T) {
+			t.Parallel()
+			h := &schemata.HelperSet{}
+			for _, n := range names {
+				h.Use(n)
+			}
+			dir := writeModule(t, map[string][]byte{
+				"main.go":    []byte(escapeFixture(set)),
+				"helpers.go": helperFile(t, h, "main", testPrefix),
+			})
+			out, err := goCmd(t, dir, nil, "build", "-gcflags=-m=1", "-o", filepath.Join(dir, "fixture"), ".")
+			if err != nil {
+				t.Fatalf("build: %v\n%s\n%s", err, out, escapeFixture(set))
+			}
+			if !bytes.Contains(out, []byte("helpers.go:")) {
+				t.Fatalf("no diagnostic mentions helpers.go: the test proves nothing:\n%s", out)
+			}
+			if got := allocations(string(out), "helpers.go"); len(got) > 0 {
+				t.Errorf("helper allocations:\n%s", strings.Join(got, "\n"))
+			}
+		})
+	}
+}
+
+// TestAllocationsParsing checks the parser the escape test rests on: an
+// allocation line is found, a leaking parameter and a line of another file
+// are not.
+func TestAllocationsParsing(t *testing.T) {
+	t.Parallel()
+	out := strings.Join([]string{
+		"# fixture",
+		"./helpers.go:10:6: leaking param content: m",
+		"./helpers.go:12:3: moved to heap: x",
+		"./helpers.go:14:9: func literal escapes to heap",
+		"./main.go:5:2: n escapes to heap",
+		"./helpers.go:16:2: inlining call to os.Getenv",
+	}, "\n")
+	got := allocations(out, "helpers.go")
+	if len(got) != 2 || !strings.Contains(got[0], "moved to heap") || !strings.Contains(got[1], "func literal escapes") {
+		t.Errorf("allocations = %q", got)
+	}
+}
+
+// TestEscapeCheckSeesAnAllocation builds a helper file with a per-site
+// helper that does allocate, and requires the escape test's check to report
+// it: a check that cannot fail would let a real regression through.
+func TestEscapeCheckSeesAnAllocation(t *testing.T) {
+	t.Parallel()
+	h := &schemata.HelperSet{}
+	h.AddRaw("func " + testPrefix + "Leak(x int) *int { return &x }")
+	main := "package main\n\nimport \"os\"\n\nvar sink *int\n\nfunc main() { sink = " + testPrefix + "Leak(len(os.Args)) }\n"
+	dir := writeModule(t, map[string][]byte{"main.go": []byte(main), "helpers.go": helperFile(t, h, "main", testPrefix)})
+	out, err := goCmd(t, dir, nil, "build", "-gcflags=-m=1", "-o", filepath.Join(dir, "fixture"), ".")
+	if err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	if got := allocations(string(out), "helpers.go"); len(got) != 1 || !strings.Contains(got[0], "moved to heap: x") {
+		t.Errorf("allocations = %q, want the moved parameter x\n%s", got, out)
+	}
 }
