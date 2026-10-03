@@ -59,7 +59,7 @@ const (
 	kindUnary                     // helper(ids..., x) vs tok x
 	kindXor                       // Xor(id, l tok r) vs l tok r
 	kindIncDec                    // IncDec(id, &v, inc) vs v tok
-	kindIncDecMap                 // IncDecMap(id, m, k, inc) vs m[k] tok
+	kindIncDecMap                 // IncDecMap(id, m, k, inc) vs m[k] tok, m a map[string]int or, if named, a myMap
 	kindBit                       // Bit(id) vs 1 when active, else 0
 )
 
@@ -71,6 +71,7 @@ type site struct {
 	tok      token.Token
 	operands string // fixture variable holding the operand table
 	wrap     string // optional conversion applied to Xor's operand
+	named    bool   // IncDecMap on a named map type
 	muts     []mutator.Type
 	zero     bool
 }
@@ -80,7 +81,7 @@ func helperSites() []site {
 	ordered := map[token.Token]string{token.LSS: "LSS", token.LEQ: "LEQ", token.GTR: "GTR", token.GEQ: "GEQ"}
 	cmpTypes := []mutator.Type{mutator.ConditionalsBoundary, mutator.ConditionalsNegation}
 	for _, tok := range []token.Token{token.LSS, token.LEQ, token.GTR, token.GEQ} {
-		for _, ops := range []string{"ordI", "ordF", "ordN"} {
+		for _, ops := range []string{"ordI", "ordF", "ordN", "ordS"} {
 			sites = append(sites, site{helper: ordered[tok], kind: kindBinary, tok: tok, operands: ops, muts: cmpTypes})
 		}
 		sites = append(sites, site{helper: ordered[tok], kind: kindBinary, tok: tok, operands: "ordI", muts: cmpTypes, zero: true})
@@ -90,8 +91,8 @@ func helperSites() []site {
 		tok    token.Token
 		ops    []string
 	}{
-		{"ADD", token.ADD, []string{"ordI", "ordF", "ordN"}},
-		{"SUB", token.SUB, []string{"ordI", "ordF"}},
+		{"ADD", token.ADD, []string{"ordI", "ordF", "ordN", "addU"}},
+		{"SUB", token.SUB, []string{"ordI", "ordF", "addU"}},
 		{"MUL", token.MUL, []string{"nzI", "nzF"}}, // MUL's mutant divides
 		{"QUO", token.QUO, []string{"nzI", "nzF"}},
 		{"REM", token.REM, []string{"nzI"}},
@@ -150,6 +151,7 @@ func helperSites() []site {
 		sites = append(sites,
 			site{helper: "IncDec", kind: kindIncDec, tok: tok, operands: "unI", muts: id, zero: true},
 			site{helper: "IncDecMap", kind: kindIncDecMap, tok: tok, operands: "unI", muts: id},
+			site{helper: "IncDecMap", kind: kindIncDecMap, tok: tok, operands: "unI", muts: id, named: true},
 			site{helper: "IncDecMap", kind: kindIncDecMap, tok: tok, operands: "unI", muts: id, zero: true})
 	}
 	sites = append(sites,
@@ -162,10 +164,13 @@ func helperSites() []site {
 const fixtureOperands = `
 type myInt int
 type myBool bool
+type myMap map[string]int
 
 var (
 	ordI = [][2]int{{3, 5}, {5, 3}, {5, 5}, {-2, 7}, {0, 0}}
 	ordF = [][2]float64{{3, 5}, {5, 3}, {5, 5}, {-2, 7}, {0, 0}, {math.NaN(), 1}, {1, math.NaN()}, {math.NaN(), math.NaN()}}
+	ordS = [][2]string{{"a", "b"}, {"b", "a"}, {"a", "a"}, {"", ""}, {"ab", "a"}}
+	addU = [][2]uint8{{3, 5}, {5, 3}, {200, 100}, {250, 10}, {0, 1}}
 	ordN = [][2]myInt{{3, 5}, {5, 3}, {5, 5}, {-2, 7}, {0, 0}}
 	nzI  = [][2]int{{3, 5}, {5, 3}, {5, 5}, {-2, 7}}
 	nzF  = [][2]float64{{3, 5}, {5, 3}, {5, 5}, {-2, 7}}
@@ -246,10 +251,14 @@ func fixtureMain(t *testing.T, sites []site) (string, [][]int) {
 			}
 		case kindIncDecMap:
 			inc := s.tok == token.INC
+			mapType := "map[string]int"
+			if s.named {
+				mapType = "myMap"
+			}
 			exprs = append(exprs, fmt.Sprintf(
-				"func() any { m := map[string]int{\"k\": p}; %s(%s, m, \"k\", %t); return m[\"k\"] }()", h, idArgs, inc))
+				"func() any { m := %s{\"k\": p}; %s(%s, m, \"k\", %t); return m[\"k\"] }()", mapType, h, idArgs, inc))
 			for _, tk := range toks {
-				exprs = append(exprs, fmt.Sprintf("func() any { m := map[string]int{\"k\": p}; m[\"k\"]%s; return m[\"k\"] }()", tk))
+				exprs = append(exprs, fmt.Sprintf("func() any { m := %s{\"k\": p}; m[\"k\"]%s; return m[\"k\"] }()", mapType, tk))
 			}
 		case kindBit:
 			// Bit has no token: the original is 0 and the mutant is 1.
@@ -360,8 +369,11 @@ func checkLines(t *testing.T, sites []site, ids [][]int, active int, out []byte)
 	lines := 0
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		f := strings.Fields(line)
+		if len(f) < 4 {
+			t.Fatalf("bad line %q", line)
+		}
 		si, err := strconv.Atoi(f[0])
-		if err != nil || len(f) < 4 {
+		if err != nil || si < 0 || si >= len(sites) || len(f) < 4+len(ids[si]) {
 			t.Fatalf("bad line %q", line)
 		}
 		lines++

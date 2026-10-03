@@ -22,37 +22,60 @@ import (
 	"strings"
 )
 
+const prefixBase = "_gremlins"
+
 // ChoosePrefix returns an identifier prefix that no identifier in files
 // starts with -- locals, fields and labels included -- so that nothing the
 // rewrite generates can collide with, shadow or be captured by a user name.
+// The candidates are "_gremlins", "_gremlins2", "_gremlins3", and so on.
 func ChoosePrefix(files []*ast.File) string {
-	var names []string
+	// taken holds the n of every candidate some identifier starts with; the
+	// base is candidate 1. One pass over the identifiers, none kept.
+	taken := map[int]bool{}
 	for _, f := range files {
 		ast.Inspect(f, func(n ast.Node) bool {
 			if id, ok := n.(*ast.Ident); ok {
-				names = append(names, id.Name)
+				markTaken(id.Name, taken)
 			}
 
 			return true
 		})
 	}
 	for i := 1; ; i++ {
-		p := "_gremlins"
-		if i > 1 {
-			p += strconv.Itoa(i)
-		}
-		if !anyHasPrefix(names, p) {
-			return p
+		if !taken[i] {
+			return candidatePrefix(i)
 		}
 	}
 }
 
-func anyHasPrefix(names []string, prefix string) bool {
-	for _, n := range names {
-		if strings.HasPrefix(n, prefix) {
-			return true
-		}
+func candidatePrefix(i int) string {
+	if i == 1 {
+		return prefixBase
 	}
 
-	return false
+	return prefixBase + strconv.Itoa(i)
+}
+
+// markTaken records in taken every candidate that name starts with: the base
+// and, for each leading run of digits after it, the candidate that number
+// names ("_gremlins23x" starts "_gremlins2" and "_gremlins23").
+func markTaken(name string, taken map[int]bool) {
+	rest, ok := strings.CutPrefix(name, prefixBase)
+	if !ok {
+		return
+	}
+	taken[1] = true
+	if rest == "" || rest[0] < '1' || rest[0] > '9' {
+		return // candidates carry no leading zero, and never 0 or 1
+	}
+	n := 0
+	for _, c := range rest {
+		if c < '0' || c > '9' || n > 1<<20 {
+			break
+		}
+		n = n*10 + int(c-'0')
+		if n >= 2 {
+			taken[n] = true
+		}
+	}
 }

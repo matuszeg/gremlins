@@ -66,7 +66,7 @@ var {{.}}Active = func() int { n, _ := {{.}}strconv.Atoi({{.}}os.Getenv("GREMLIN
 var {{.}}ReachedOnce {{.}}sync.Once
 
 // {{.}}Reached records, once per process, that the active mutant's site ran.
-// {{.}}sync.Once, not a bool: user code calls helpers from many goroutines, and a
+// A sync.Once, not a bool: user code calls helpers from many goroutines, and a
 // data race in generated code would be reported against the user's tests.
 func {{.}}Reached() {
 	{{.}}ReachedOnce.Do(func() {
