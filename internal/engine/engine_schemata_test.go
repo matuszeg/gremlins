@@ -248,3 +248,44 @@ func checkKept(t *testing.T, dir string, runnable int) {
 		t.Errorf("kept source lacks the rewritten calc.go: %v", err)
 	}
 }
+
+// TestSchemataParityRelativeTarget runs the parity fixture the way the CLI
+// does from the module root, `gremlins unleash ./calc`: gomodule.Init of a
+// relative target gives a relative module root, and every placed mutant must
+// still run against the schema binaries with the statuses of the legacy run.
+//
+// It is not parallel: it changes the working directory.
+func TestSchemataParityRelativeTarget(t *testing.T) {
+	t.Chdir("testdata/parity")
+	mod, err := gomodule.Init("./calc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(mod.Root) {
+		t.Fatalf("gomodule.Init(./calc) gave the absolute root %s: the test proves nothing", mod.Root)
+	}
+	prof := parityProfile(t, mod)
+
+	legacy, _, _ := runParity(t, mod, prof, false)
+	runnable := 0
+	for _, s := range legacy {
+		if s != mutator.NotCovered && s != mutator.Skipped {
+			runnable++
+		}
+	}
+	if runnable == 0 {
+		t.Fatalf("no runnable mutant from a relative target: %v", legacy)
+	}
+	withSchemata, res, _ := runParity(t, mod, prof, true)
+	for _, k := range slices.Sorted(maps.Keys(legacy)) {
+		if withSchemata[k] != legacy[k] {
+			t.Errorf("%s: %s with --schemata, %s without", k, withSchemata[k], legacy[k])
+		}
+	}
+	if res.Schemata == nil {
+		t.Fatal("the run with --schemata has no schemata summary")
+	}
+	if want := (report.SchemataSummary{Placed: runnable, PerMutant: 0}); *res.Schemata != want {
+		t.Errorf("schemata summary = %+v, want %+v", *res.Schemata, want)
+	}
+}

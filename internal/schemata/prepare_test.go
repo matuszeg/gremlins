@@ -542,3 +542,33 @@ func TestPrepareLineDirective(t *testing.T) {
 		}
 	}
 }
+
+// TestPrepareRelativeRoot runs Prepare over a module whose root is relative,
+// as gomodule.Init gives it for a relative target: go/packages reports
+// absolute directories, which must still find the mutants' packages.
+//
+// It is not parallel: it changes the working directory.
+func TestPrepareRelativeRoot(t *testing.T) {
+	t.Chdir(filepath.Join("testdata", "prepare"))
+	mod := gomodule.GoModule{Name: prepareMod, Root: ".", CallingDir: "."}
+	in := streamMutants(t, mod)
+	runs := &nullRuns{}
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, in, plan)
+	if len(plan.Placed) == 0 {
+		t.Error("nothing placed under a relative module root")
+	}
+	for _, n := range plan.Netted {
+		if strings.Contains(n.Reason, "no package loaded") {
+			t.Errorf("%s at %s netted: %s", n.Mutator.Type(), n.Mutator.Position(), n.Reason)
+		}
+	}
+	for bin, dir := range runs.dirs {
+		if !filepath.IsAbs(bin) || !filepath.IsAbs(dir) {
+			t.Errorf("null run of %s in %s: want absolute paths", bin, dir)
+		}
+	}
+}

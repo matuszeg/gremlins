@@ -115,6 +115,15 @@ func (s *schemaExecutor) Start(w *workerpool.Worker) {
 	}
 
 	sel := m.selectTests(m.mutant.Pkg())
+	// Absolute, like every path a binary run is given: it runs in a package
+	// directory, and the overlay's keys must name the files the go command
+	// sees.
+	rootDir, err = filepath.Abs(rootDir)
+	if err != nil {
+		s.fallBack(w, err.Error())
+
+		return
+	}
 	runs, err := s.plan(rootDir, sel)
 	if err == nil {
 		var overlay string
@@ -132,7 +141,13 @@ func (s *schemaExecutor) Start(w *workerpool.Worker) {
 	// The reach file sits in the work directory, outside every module copy,
 	// where no test walking its package's tree sees it; the worker's name
 	// keeps two workers judging one mutant apart.
-	reach := filepath.Join(m.wdDealer.WorkDir(), "schemata-reached-"+workerName+"-"+strconv.Itoa(s.id))
+	// Absolute: the binary runs in its package's directory.
+	reach, err := filepath.Abs(filepath.Join(m.wdDealer.WorkDir(), "schemata-reached-"+workerName+"-"+strconv.Itoa(s.id)))
+	if err != nil {
+		s.fallBack(w, err.Error())
+
+		return
+	}
 
 	defer m.wg.Done()
 	s.counts.judged.Add(1)
@@ -325,6 +340,10 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 	}
 	path := f.Name()
 	_, err = f.Write(data)
+	if err == nil {
+		// Absolute: it goes in GOFLAGS of a binary run in a package directory.
+		path, err = filepath.Abs(path)
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}

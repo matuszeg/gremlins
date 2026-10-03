@@ -80,12 +80,18 @@ const nullFailed = "null-mutant run failed: "
 // the build or the second null run of its own package or of a package
 // testPkgs names for it fails. Every mutant of runnable ends in exactly one
 // of Placed and Netted. Prepare writes nothing outside workDir, which the
-// caller removes. The error is the context's, when it ends first.
+// caller removes. A relative mod.Root is taken from the working directory.
+// The error is the context's, when it ends first.
 func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
 	testPkgs func(pkg string) []string, allowance time.Duration, nullRun NullRunFunc,
 ) (Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return Plan{}, err
+	}
+	// mod.Root is relative when the target was; go/packages reports
+	// absolute directories, and every path built here must match them.
+	if root, err := filepath.Abs(mod.Root); err == nil {
+		mod.Root = root
 	}
 	p := &preparer{mod: mod, muts: runnable, reasons: make([]string, len(runnable))}
 	if len(runnable) == 0 {

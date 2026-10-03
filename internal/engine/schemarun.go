@@ -30,6 +30,7 @@ import (
 	"sync"
 
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
+	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/procgroup"
@@ -82,7 +83,22 @@ func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, al
 	if d.schemaCounts == nil {
 		d.schemaCounts = &schemaCounts{}
 	}
-	plan, err := mu.prepareSchemata(ctx, d, runnable)
+	// GoModule.Root is relative whenever the target was (`gremlins unleash
+	// ./pkg`), while go/packages and the go command report absolute paths,
+	// and the test binaries run in package directories, where a relative
+	// path means something else. Every schemata path is built from the
+	// absolute root. The legacy executors read only the module's name and
+	// calling directory, so the dealer's copy changes nothing for them.
+	mod, err := absModule(mu.module)
+	if err != nil {
+		log.Errorf("schemata: %v; every mutant runs through go test\n", err)
+		res := mu.execute(ctx, feed(all), d.NewExecutor)
+		res.Schemata = &report.SchemataSummary{PerMutant: len(runnable)}
+
+		return res
+	}
+	d.mod = mod
+	plan, err := mu.prepareSchemata(ctx, d, mod, runnable)
 	if err != nil {
 		// Only the run's context ends Prepare early: the run is over.
 		log.Errorf("schemata: %v\n", err)
@@ -146,6 +162,10 @@ type keptMutant struct {
 
 // keepSchemata copies plan's build into dir, as SchemataKeepEnv describes.
 func keepSchemata(dir string, plan schemata.Plan) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
 	b := plan.Build
 	idx := keptIndex{Binaries: map[string]string{}, Source: filepath.Join(dir, "src")}
 	for _, pkg := range slices.Sorted(maps.Keys(b.Binaries)) {
@@ -189,9 +209,12 @@ func copyFile(src, dst string, perm os.FileMode) error {
 // prepareSchemata runs Prepare over runnable in a fresh directory of the
 // engine's work directory, which the caller of the engine removes, with the
 // test packages and null runs the executors' own test selection gives.
-func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, runnable []mutator.Mutator) (schemata.Plan, error) {
+func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, mod gomodule.GoModule, runnable []mutator.Mutator) (schemata.Plan, error) {
 	targets := d.schemaTargets(runnable)
 	workDir, err := os.MkdirTemp(d.wdDealer.WorkDir(), "schemata-*")
+	if err == nil {
+		workDir, err = filepath.Abs(workDir)
+	}
 	if err != nil {
 		reason := fmt.Sprintf("schemata: no build directory: %v", err)
 		log.Errorf("%s\n", reason)
@@ -203,7 +226,7 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 		return plan, nil
 	}
 
-	plan, err := mu.prepare(ctx, mu.module, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance,
+	plan, err := mu.prepare(ctx, mod, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance,
 		d.schemaNullRun(ctx, workDir, targets))
 	if err != nil {
 		return plan, err
@@ -213,6 +236,17 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 	}
 
 	return plan, nil
+}
+
+// absModule is mod with an absolute root.
+func absModule(mod gomodule.GoModule) (gomodule.GoModule, error) {
+	root, err := filepath.Abs(mod.Root)
+	if err != nil {
+		return mod, fmt.Errorf("module root %s: %w", mod.Root, err)
+	}
+	mod.Root = root
+
+	return mod, nil
 }
 
 // feed returns a closed channel holding muts, in order.
