@@ -75,6 +75,7 @@ func TestSchemataParity(t *testing.T) {
 		}
 	}
 	runnable := len(legacy) - seen[mutator.NotCovered] - seen[mutator.Skipped]
+	checkSharedLine(t, modRoot, legacy)
 
 	withSchemata, res, calls := runParity(t, mod, prof, true)
 	if calls != 1 {
@@ -180,4 +181,31 @@ func parityProfile(t *testing.T, mod gomodule.GoModule) coverage.Profile {
 	}
 
 	return prof
+}
+
+// checkSharedLine requires the fixture's Mix line to hold two operators whose
+// mutants the legacy run judges differently, one KILLED and one LIVED: the
+// parity on it then shows that each schema id switches its own operator and
+// not its neighbour on the line.
+func checkSharedLine(t *testing.T, modRoot string, legacy map[string]mutator.Status) {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(modRoot, "calc", "calc.go")) //nolint:gosec // G304: the fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := 0
+	for i, l := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(l, "func Mix(") {
+			line = i + 1
+		}
+	}
+	got := map[mutator.Status]int{}
+	for k, st := range legacy {
+		if strings.Contains(k, fmt.Sprintf("calc.go:%d:", line)) {
+			got[st]++
+		}
+	}
+	if line == 0 || got[mutator.Killed] != 1 || got[mutator.Lived] != 1 || len(got) != 2 {
+		t.Errorf("Mix (line %d) mutants by status = %v, want one KILLED and one LIVED", line, got)
+	}
 }
