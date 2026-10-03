@@ -588,9 +588,9 @@ func callFree(x ast.Expr) bool {
 // st, if it can be passed as &lhs: addressable, of the type b the constant
 // took, and identifiers and selectors only. The witness is the original
 // text, so the lhs must hold no site (no index, no call), whose rendered
-// form the assignment would evaluate but the witness would not; and with a
-// single assignment of a constant, nothing runs between a nil dereference in
-// the witness and the one the original makes when it stores.
+// form the assignment would evaluate but the witness would not; and it must
+// dereference no pointer, which the witness would do before the site records
+// its reach.
 func witnessLHS(info *types.Info, e ast.Expr, st *ast.AssignStmt, b *types.Basic) (ast.Expr, error) {
 	i := slices.IndexFunc(st.Rhs, func(r ast.Expr) bool { return ast.Unparen(r) == e })
 	if st.Tok != token.ASSIGN || i < 0 || len(st.Lhs) != 1 || len(st.Rhs) != 1 {
@@ -605,7 +605,37 @@ func witnessLHS(info *types.Info, e ast.Expr, st *ast.AssignStmt, b *types.Basic
 		return nil, fmt.Errorf("%w: float constant assigned to a %v", ErrUnsupported, tv.Type)
 	case !callFree(lhs):
 		return nil, fmt.Errorf("%w: float constant assigned to more than a name or selector", ErrUnsupported)
+	case !derefFree(info, lhs):
+		return nil, fmt.Errorf("%w: float constant assigned through a pointer", ErrUnsupported)
 	}
 
 	return lhs, nil
+}
+
+// derefFree reports whether evaluating &x, for x of identifiers and selectors
+// only, dereferences no pointer: no field selection in it goes through one,
+// implicitly or through an embedded field. A nil pointer there would panic
+// among the witness's arguments, before the site records its reach, where
+// the original panics at the store, after it. A package-qualified name
+// dereferences nothing; a selection the type information does not hold is
+// refused.
+func derefFree(info *types.Info, x ast.Expr) bool {
+	sel, ok := ast.Unparen(x).(*ast.SelectorExpr)
+	if !ok {
+		return true
+	}
+	if id, ok := ast.Unparen(sel.X).(*ast.Ident); ok && info.Uses != nil {
+		if _, pkg := info.Uses[id].(*types.PkgName); pkg {
+			return true
+		}
+	}
+	s, ok := info.Selections[sel]
+	if !ok || s.Kind() != types.FieldVal || s.Indirect() {
+		return false
+	}
+	if _, ptr := s.Recv().Underlying().(*types.Pointer); ptr {
+		return false
+	}
+
+	return derefFree(info, sel.X)
 }
