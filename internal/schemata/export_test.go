@@ -59,3 +59,6 @@ var (
 	OrderedConstraint = orderedConstraint
 	StringConstraint  = stringConstraint
 )
+
+// ErrNewlineChanged exposes errNewlineChanged.
+var ErrNewlineChanged = errNewlineChanged
