@@ -47,3 +47,33 @@ func TestMix(t *testing.T) {
 		t.Error("Mix(1, 2, 1) != 3")
 	}
 }
+
+func TestClamp(t *testing.T) {
+	if Clamp(0) != 0 {
+		t.Error("Clamp(0) != 0")
+	}
+}
+
+func TestBump(t *testing.T) {
+	if !Bump(5) {
+		t.Error("Bump(5) is false")
+	}
+}
+
+func TestFlip(t *testing.T) {
+	if Flip(0) != 0 {
+		t.Error("Flip(0) != 0")
+	}
+}
+
+func TestAcc(t *testing.T) {
+	if Acc(1, 2) != 3 {
+		t.Error("Acc(1, 2) != 3")
+	}
+}
+
+func TestGrow(t *testing.T) {
+	if Grow(1, 1) != 1 {
+		t.Error("Grow(1, 1) != 1")
+	}
+}

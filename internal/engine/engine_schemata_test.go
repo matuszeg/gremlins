@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -35,6 +36,7 @@ import (
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
+	"github.com/go-gremlins/gremlins/internal/deps"
 	"github.com/go-gremlins/gremlins/internal/engine"
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -46,18 +48,26 @@ import (
 
 // TestSchemataParity runs the engine over testdata/parity twice, without and
 // with --schemata, and expects every mutant to get the same status both ways,
-// with every runnable mutant judged against the schema binaries.
+// with every runnable mutant judged against the schema binaries. Both runs
+// use --cross-package and --test-selection, as the CLI wires them, so that
+// parity/other's test is the one that judges calc.Twice; the whole-suite
+// path is TestSchemataParityRelativeTarget's.
 //
-// It is not parallel: it captures the global log to read the report.
+// It is not parallel: it captures the global log to read the report, and
+// building the test map changes the working directory.
 func TestSchemataParity(t *testing.T) {
 	modRoot, err := filepath.Abs("testdata/parity")
 	if err != nil {
 		t.Fatal(err)
 	}
 	mod := gomodule.GoModule{Name: "parity", Root: modRoot, CallingDir: "."}
-	prof := parityProfile(t, mod)
+	selection := map[string]any{
+		configuration.UnleashCrossPackageKey:  true,
+		configuration.UnleashTestSelectionKey: true,
+	}
+	prof, opts := paritySelection(t, mod, selection)
 
-	legacy, legacyRes, legacyCalls := runParity(t, mod, prof, false)
+	legacy, legacyRes, legacyCalls := runParityWith(t, mod, prof, false, selection, opts...)
 	if legacyCalls != 0 {
 		t.Errorf("the run without --schemata called Prepare %d times", legacyCalls)
 	}
@@ -77,10 +87,12 @@ func TestSchemataParity(t *testing.T) {
 	}
 	runnable := len(legacy) - seen[mutator.NotCovered] - seen[mutator.Skipped]
 	checkSharedLine(t, modRoot, legacy)
+	checkEveryMutator(t, legacy)
+	checkFixtureSites(t, modRoot, legacy)
 
 	keep := filepath.Join(t.TempDir(), "kept")
 	t.Setenv("GREMLINS_SCHEMATA_KEEP", keep)
-	withSchemata, res, calls := runParity(t, mod, prof, true)
+	withSchemata, res, calls := runParityWith(t, mod, prof, true, selection, opts...)
 	checkKept(t, keep, runnable)
 	if calls != 1 {
 		t.Errorf("the run with --schemata called Prepare %d times, want 1", calls)
@@ -158,15 +170,17 @@ func runParity(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withS
 	return runParityWith(t, mod, prof, withSchemata, nil)
 }
 
-// runParityWith is runParity with extra settings.
-func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withSchemata bool, extra map[string]any) (map[string]mutator.Status, report.Results, int) {
+// runParityWith is runParity with extra settings and dealer options.
+func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withSchemata bool, extra map[string]any,
+	opts ...engine.ExecutorDealerOption,
+) (map[string]mutator.Status, report.Results, int) {
 	t.Helper()
 	settings := map[string]any{
 		configuration.UnleashSchemataKey:   withSchemata,
 		configuration.UnleashTimeoutMaxKey: "1s",
 	}
 	maps.Copy(settings, extra)
-	// The backend's mutator set: the five the schemata prototype rewrites.
+	// Every mutator, all of which the schemata engine rewrites.
 	for _, mt := range mutator.Types {
 		settings[configuration.MutantTypeEnabledKey(mt)] = slices.Contains(schemaMutators, mt)
 	}
@@ -175,7 +189,7 @@ func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, w
 
 	wdd := workdir.NewCachedDealer(t.TempDir(), mod.Root)
 	defer wdd.Clean()
-	d := engine.NewExecutorDealer(mod, wdd, time.Second)
+	d := engine.NewExecutorDealer(mod, wdd, time.Second, opts...)
 	var calls atomic.Int32
 	prepare := func(ctx context.Context, m gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
 		testPkgs func(string) []string, allowance time.Duration, nullRun schemata.NullRunFunc,
@@ -234,22 +248,106 @@ func parityProfile(t *testing.T, mod gomodule.GoModule) coverage.Profile {
 	return prof
 }
 
+// paritySelection gathers what cmd/unleash wires for --cross-package and
+// --test-selection over the fixture: the dependency graph, the test map, and
+// the coverage profile widened by the map's union, which is what makes a line
+// only another package's test executes covered.
+func paritySelection(t *testing.T, mod gomodule.GoModule, selection map[string]any) (coverage.Profile, []engine.ExecutorDealerOption) {
+	t.Helper()
+	prof := parityProfile(t, mod)
+	inRoot := func(name string, args ...string) *exec.Cmd {
+		cmd := exec.Command(name, args...) //nolint:gosec // G204: test code running go on its own fixture
+		cmd.Dir = mod.Root
+
+		return cmd
+	}
+	// BuildTestMap changes into the module root; t.Chdir puts it back.
+	t.Chdir(mod.Root)
+	viperSet(selection)
+	c := coverage.NewWithCmd(inRoot, t.TempDir(), mod, coverage.WithTestMapCacheDir(t.TempDir()))
+	viperReset()
+	graph, err := deps.New(inRoot, c.ScanPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	testMap, err := c.BuildTestMap()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return coverage.Merge(prof, testMap.Union()), []engine.ExecutorDealerOption{engine.WithDependents(graph), engine.WithTestSelection(testMap)}
+}
+
+// checkEveryMutator requires the legacy run to have killed one mutant of
+// every mutator and let another live: parity on a mutator is only evidence
+// when its schema form is seen to change a verdict and to leave one alone.
+func checkEveryMutator(t *testing.T, legacy map[string]mutator.Status) {
+	t.Helper()
+	for _, mt := range mutator.Types {
+		got := map[mutator.Status]int{}
+		for k, st := range legacy {
+			if strings.HasSuffix(k, " "+mt.String()) {
+				got[st]++
+			}
+		}
+		if got[mutator.Killed] == 0 || got[mutator.Lived] == 0 {
+			t.Errorf("%s mutants by status = %v, want at least one KILLED and one LIVED", mt, got)
+		}
+	}
+}
+
+// checkFixtureSites requires the legacy statuses the fixture's special sites
+// exist for: the package-level constant NOT COVERED, the function-local
+// constants (placed by duplicating their functions) and the line only
+// parity/other's test executes KILLED.
+func checkFixtureSites(t *testing.T, modRoot string, legacy map[string]mutator.Status) {
+	t.Helper()
+	testCases := map[string]struct {
+		file, prefix string
+		want         mutator.Status
+	}{
+		"package_const":      {file: "consts.go", prefix: "const Limit", want: mutator.NotCovered},
+		"local_const":        {file: "consts.go", prefix: "\tconst k", want: mutator.Killed},
+		"array_length_const": {file: "consts.go", prefix: "\tconst n", want: mutator.Killed},
+		"cross_package":      {file: "calc.go", prefix: "func Twice(", want: mutator.Killed},
+	}
+	for name, tc := range testCases {
+		line := fixtureLine(t, modRoot, tc.file, tc.prefix)
+		got := map[mutator.Status]int{}
+		for k, st := range legacy {
+			if strings.HasPrefix(k, fmt.Sprintf("calc/%s:%d:", tc.file, line)) {
+				got[st]++
+			}
+		}
+		if got[tc.want] == 0 || len(got) != 1 {
+			t.Errorf("%s (%s:%d) mutants by status = %v, want all %s", name, tc.file, line, got, tc.want)
+		}
+	}
+}
+
+// fixtureLine is the line of calc/file that starts with prefix, 0 if none.
+func fixtureLine(t *testing.T, modRoot, file, prefix string) int {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(modRoot, "calc", file)) //nolint:gosec // G304: the fixture
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, l := range strings.Split(string(src), "\n") {
+		if strings.HasPrefix(l, prefix) {
+			return i + 1
+		}
+	}
+
+	return 0
+}
+
 // checkSharedLine requires the fixture's Mix line to hold two operators whose
 // mutants the legacy run judges differently, one KILLED and one LIVED: the
 // parity on it then shows that each schema id switches its own operator and
 // not its neighbour on the line.
 func checkSharedLine(t *testing.T, modRoot string, legacy map[string]mutator.Status) {
 	t.Helper()
-	src, err := os.ReadFile(filepath.Join(modRoot, "calc", "calc.go")) //nolint:gosec // G304: the fixture
-	if err != nil {
-		t.Fatal(err)
-	}
-	line := 0
-	for i, l := range strings.Split(string(src), "\n") {
-		if strings.HasPrefix(l, "func Mix(") {
-			line = i + 1
-		}
-	}
+	line := fixtureLine(t, modRoot, "calc.go", "func Mix(")
 	got := map[mutator.Status]int{}
 	for k, st := range legacy {
 		if strings.Contains(k, fmt.Sprintf("calc.go:%d:", line)) {
@@ -263,7 +361,8 @@ func checkSharedLine(t *testing.T, modRoot string, legacy map[string]mutator.Sta
 
 // checkKept requires the build GREMLINS_SCHEMATA_KEEP kept in dir to index
 // runnable mutants, each with its id, position, type and package, and to hold
-// the binary and rewritten source the index names.
+// the binaries of calc and other and the rewritten source the index names,
+// with copies of the functions whose local constants are mutated.
 func checkKept(t *testing.T, dir string, runnable int) {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join(dir, "index.json")) //nolint:gosec // G304: the kept index
@@ -285,7 +384,7 @@ func checkKept(t *testing.T, dir string, runnable int) {
 		t.Errorf("kept index has %d mutants, want %d", len(idx.Mutants), runnable)
 	}
 	for _, m := range idx.Mutants {
-		if m.ID < 1 || !strings.Contains(m.Position, "calc.go:") || m.Type == "" || m.Package != "parity/calc" {
+		if m.ID < 1 || !strings.HasPrefix(m.Position, "calc/") || m.Type == "" || m.Package != "parity/calc" {
 			t.Errorf("kept index entry %+v is incomplete", m)
 		}
 	}
@@ -296,8 +395,22 @@ func checkKept(t *testing.T, dir string, runnable int) {
 	if fi, err := os.Stat(bin); err != nil || fi.Mode()&0o100 == 0 {
 		t.Errorf("kept binary %s: %v, mode %v", bin, err, fi)
 	}
+	// calc.Twice's mutant selects parity/other alone, through --cross-package.
+	if _, ok := idx.Binaries["parity/other"]; !ok {
+		t.Errorf("kept binaries %v lack parity/other's", idx.Binaries)
+	}
 	if _, err := os.Stat(filepath.Join(idx.Source, "calc", "calc.go")); err != nil {
 		t.Errorf("kept source lacks the rewritten calc.go: %v", err)
+	}
+	// The function-local constants are placed by copies of their functions.
+	consts, err := os.ReadFile(filepath.Join(idx.Source, "calc", "consts.go"))
+	if err != nil {
+		t.Fatalf("kept source lacks the rewritten consts.go: %v", err)
+	}
+	for _, fn := range []string{"Scaled", "Slots"} {
+		if !regexp.MustCompile(`func \w+_D\d+_` + fn + `\(`).Match(consts) {
+			t.Errorf("the rewritten consts.go has no copy of %s:\n%s", fn, consts)
+		}
 	}
 }
 

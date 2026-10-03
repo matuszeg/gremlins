@@ -51,11 +51,8 @@ const (
 	notestPkg = "schemaexec/notest"
 )
 
-// schemaMutators are the mutators the schemata prototype rewrites.
-var schemaMutators = []mutator.Type{
-	mutator.ArithmeticBase, mutator.ConditionalsBoundary, mutator.ConditionalsNegation,
-	mutator.IncrementDecrement, mutator.InvertNegatives,
-}
+// schemaMutators are the mutators the schemata engine rewrites: all of them.
+var schemaMutators = mutator.Types
 
 // fixtureMutant is one mutant of the fixture: its schema ID and position.
 type fixtureMutant struct {
