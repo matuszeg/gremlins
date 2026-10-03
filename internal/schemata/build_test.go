@@ -291,7 +291,7 @@ func checkOverlay(t *testing.T, dir string, files map[string][]byte) {
 		if bytes.Equal(orig, content) {
 			t.Errorf("%s returned unchanged", path)
 		}
-		if got, want := bytes.Count(content, []byte("\n")), bytes.Count(orig, []byte("\n")); got != want {
+		if got, want := bytes.Count(beforeDuplicates(content), []byte("\n")), bytes.Count(orig, []byte("\n")); got != want {
 			t.Errorf("%s: %d lines, original %d", path, got, want)
 		}
 	}

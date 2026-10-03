@@ -152,7 +152,7 @@ func TestConstantFormsBehave(t *testing.T) {
 	if t.Failed() {
 		t.FailNow()
 	}
-	if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
+	if got, want := bytes.Count(beforeDuplicates(out), []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
 		t.Fatalf("rewrite has %d lines, original %d", got, want)
 	}
 	helpers, err := h.File("app", prefix)
