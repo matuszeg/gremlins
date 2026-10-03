@@ -17,6 +17,7 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go/ast"
@@ -41,6 +42,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
+	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/schemata"
 )
@@ -713,4 +715,141 @@ func overlayPath(t *testing.T, env []string) string {
 	t.Fatalf("no -overlay in GOFLAGS %q", flags)
 
 	return ""
+}
+
+// TestSchemaErroredRunIsExplained runs a mutant whose package runs are
+// scripts standing in for the test binaries of calc and use, and checks that
+// a mutant booked ERRORED logs, for each run that made it so, the package,
+// its exit code, its failing tests and panics, and a bounded head of its
+// output, and that a mutant with any other verdict logs none of it.
+//
+// It is not parallel: the logger is a process-wide singleton.
+func TestSchemaErroredRunIsExplained(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs /bin/sh")
+	}
+	modRoot, err := filepath.Abs("testdata/schemaexec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No binary is built: every run is a script, so the build only names
+	// the binaries the scripts stand in for.
+	calcBin, useBin := filepath.Join(t.TempDir(), "calc.test"), filepath.Join(t.TempDir(), "use.test")
+	fx := schemaFixture{
+		mod:   gomodule.GoModule{Name: "schemaexec", Root: modRoot, CallingDir: "."},
+		build: schemata.Build{Binaries: map[string]string{calcPkg: calcBin, usePkg: useBin}},
+		muts:  map[string]fixtureMutant{"m": {id: 1, pos: token.Position{Filename: "calc.go", Line: 7, Column: 9}}},
+	}
+	const (
+		failing = `echo '=== RUN   TestAlone'; echo '--- PASS: TestAlone (0.00s)'; ` +
+			`echo '=== RUN   TestAdd'; echo '    calc_test.go:30: Add(2, 3) != 5'; echo '--- FAIL: TestAdd (0.00s)'; ` +
+			`echo 'stderr line' >&2; echo FAIL`
+		reach = `: > "$GREMLINS_REACHED"; `
+		// 200 numbered lines, then a failure past both bounds.
+		long = `i=1; while [ $i -le 200 ]; do printf 'line %03d\n' $i; i=$((i+1)); done; ` +
+			`echo '    --- FAIL: TestLate/sub (0.00s)'; echo '--- FAIL: TestLate (0.00s)'`
+		// 40 lines of 300 bytes: past 8 KiB within 60 lines, in line 28.
+		wide = `i=1; while [ $i -le 40 ]; do printf 'wide %03d %0290d\n' $i 0; i=$((i+1)); done`
+	)
+	testCases := map[string]struct {
+		scripts map[string]string
+		want    mutator.Status
+		logged  []string // substrings the log must hold
+		absent  []string // substrings it must not
+	}{
+		"failed_without_reach": {
+			scripts: map[string]string{calcBin: failing + "; exit 1", useBin: "exit 0"},
+			want:    mutator.Errored,
+			logged: []string{
+				"calc.go:7:9", calcPkg + " exited 1",
+				"    failing: --- FAIL: TestAdd (0.00s)\n",
+				"        === RUN   TestAlone\n", "        calc_test.go:30: Add(2, 3) != 5\n", "        stderr line\n",
+			},
+			// use passed: it made nothing ERRORED.
+			absent: []string{usePkg + " exited", "failing: --- PASS"},
+		},
+		"panicked_without_reach": {
+			scripts: map[string]string{calcBin: `echo 'panic: runtime error: index out of range [3]'; echo 'goroutine 7 [running]:'; exit 2`, useBin: "exit 0"},
+			want:    mutator.Errored,
+			logged:  []string{calcPkg + " exited 2", "    failing: panic: runtime error: index out of range [3]\n", "        goroutine 7 [running]:\n"},
+		},
+		"signalled": {
+			scripts: map[string]string{calcBin: `echo 'panic: boom'; kill -KILL $$`, useBin: "exit 0"},
+			want:    mutator.Errored,
+			logged:  []string{calcPkg + " exited -1", "    failing: panic: boom\n"},
+		},
+		"failed_without_reach_in_each": {
+			scripts: map[string]string{calcBin: failing + "; exit 1", useBin: `echo '--- FAIL: TestDouble (0.00s)'; exit 1`},
+			want:    mutator.Errored,
+			logged:  []string{calcPkg + " exited 1", usePkg + " exited 1", "    failing: --- FAIL: TestDouble (0.00s)\n"},
+		},
+		"head_bounded_by_lines": {
+			scripts: map[string]string{calcBin: long + "; exit 1", useBin: "exit 0"},
+			want:    mutator.Errored,
+			logged: []string{
+				"        line 001\n", "        line 060\n", "        [output truncated]\n",
+				// Past the head's bounds, the failures are still named.
+				"    failing: --- FAIL: TestLate/sub (0.00s)\n", "    failing: --- FAIL: TestLate (0.00s)\n",
+			},
+			absent: []string{"line 061", "line 200"},
+		},
+		"head_bounded_by_bytes": {
+			scripts: map[string]string{calcBin: wide + "; exit 1", useBin: "exit 0"},
+			want:    mutator.Errored,
+			logged:  []string{"        wide 001 ", "        [output truncated]\n"},
+			absent:  []string{"wide 029 ", "wide 040 "},
+		},
+		"killed": {
+			scripts: map[string]string{calcBin: reach + failing + "; exit 1", useBin: "exit 0"},
+			want:    mutator.Killed,
+			absent:  []string{"failing:", "TestAdd", "=== RUN", "exited"},
+		},
+		// calc fails without reach, use kills: the mutant is KILLED, and
+		// calc's failure, which is logged as ever, is not explained.
+		"unreached_failure_then_kill": {
+			scripts: map[string]string{calcBin: failing + "; exit 1", useBin: reach + "exit 1"},
+			want:    mutator.Killed,
+			logged:  []string{"failed without reaching the mutant (exit 1)"},
+			absent:  []string{"failing:", "=== RUN", "exited"},
+		},
+		"lived": {
+			scripts: map[string]string{calcBin: reach + failing + "; exit 0", useBin: "exit 0"},
+			want:    mutator.Lived,
+			absent:  []string{"failing:", "=== RUN", "exited"},
+		},
+		"not_covered": {
+			scripts: map[string]string{calcBin: failing + "; exit 0", useBin: "exit 0"},
+			want:    mutator.NotCovered,
+			absent:  []string{"failing:", "=== RUN", "exited"},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			sub := newSubstExec(t, tc.scripts)
+			d, _ := newSchemaDealer(t, fx, map[string]any{configuration.UnleashCrossPackageKey: true},
+				engine.WithExecContext(sub.exec),
+				engine.WithDependents(dependentsStub{calcPkg: {usePkg}}))
+			var buf bytes.Buffer
+			log.Reset()
+			log.Init(&buf, &buf)
+			defer log.Reset()
+
+			got := runSchemaMutant(t, d, fx, "m", &fx.build, workerpool.NewWorker(1, "w"))
+
+			if got.Status() != tc.want {
+				t.Fatalf("status = %s, want %s", got.Status(), tc.want)
+			}
+			out := buf.String()
+			for _, s := range tc.logged {
+				if !strings.Contains(out, s) {
+					t.Errorf("log lacks %q:\n%s", s, out)
+				}
+			}
+			for _, s := range tc.absent {
+				if strings.Contains(out, s) {
+					t.Errorf("log holds %q:\n%s", s, out)
+				}
+			}
+		})
+	}
 }

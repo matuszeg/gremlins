@@ -235,3 +235,68 @@ func TestOverlayCacheRemembersAFailure(t *testing.T) {
 		t.Errorf("a cached overlay changed: %q then %q", path, again)
 	}
 }
+
+// TestRunOutputExplain feeds runOutput in the given writes and checks the
+// account explain gives: failure lines found across write boundaries and
+// past the head, their number and length bounded, a last line without a
+// newline still read.
+func TestRunOutputExplain(t *testing.T) {
+	t.Parallel()
+	manyFails := strings.Repeat("--- FAIL: TestX (0.00s)\n", maxFailureLines+3)
+	longName := strings.Repeat("y", 2*maxFailureLineSize)
+	testCases := map[string]struct {
+		writes []string
+		logged []string
+		absent []string
+	}{
+		"split_across_writes": {
+			writes: []string{"ok\n--- FA", "IL: TestSplit (0.0", "0s)\npan", "ic: boom\n"},
+			logged: []string{"    failing: --- FAIL: TestSplit (0.00s)\n", "    failing: panic: boom\n", "        ok\n"},
+		},
+		"failures_bounded": {
+			writes: []string{manyFails},
+			logged: []string{"    failing: and 3 more\n"},
+		},
+		"failure_line_bounded": {
+			writes: []string{"--- FAIL: Test" + longName + "\n"},
+			logged: []string{"    failing: --- FAIL: Test" + longName[:maxFailureLineSize-len("--- FAIL: Test")] + "\n"},
+		},
+		"ends_mid_line": {
+			writes: []string{"start\npanic: no newline"},
+			logged: []string{"    failing: panic: no newline\n", "        panic: no newline\n"},
+			absent: []string{"truncated"},
+		},
+		"no_output": {
+			logged: []string{"p exited 1\n    no output\n"},
+			absent: []string{"failing", "output ("},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			o := newRunOutput()
+			for _, w := range tc.writes {
+				if n, err := o.Write([]byte(w)); n != len(w) || err != nil {
+					t.Fatalf("Write = %d, %v, want %d, nil", n, err, len(w))
+				}
+			}
+			got := o.explain("p", 1)
+			if !strings.HasPrefix(got, "p exited 1\n") {
+				t.Errorf("explanation does not start with the package and exit code:\n%s", got)
+			}
+			if n := strings.Count(got, "    failing: "); n > maxFailureLines+1 {
+				t.Errorf("%d failure lines, want at most %d and a count", n, maxFailureLines)
+			}
+			for _, s := range tc.logged {
+				if !strings.Contains(got, s) {
+					t.Errorf("explanation lacks %q:\n%s", s, got)
+				}
+			}
+			for _, s := range tc.absent {
+				if strings.Contains(got, s) {
+					t.Errorf("explanation holds %q:\n%s", s, got)
+				}
+			}
+		})
+	}
+}
