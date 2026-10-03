@@ -451,7 +451,8 @@ func snapshot(t *testing.T, dir string) map[string]string {
 }
 
 // TestBuildAllReportsMissingTestFiles checks that a package without tests
-// gets an error rather than a binary path that does not exist.
+// is recorded as having none, with neither an error nor a binary path that
+// does not exist.
 func TestBuildAllReportsMissingTestFiles(t *testing.T) {
 	t.Parallel()
 	modRoot, err := filepath.Abs("testdata/oldgo")
@@ -459,8 +460,8 @@ func TestBuildAllReportsMissingTestFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{"oldgo"}, 5*time.Minute)
-	if _, ok := b.Binaries["oldgo"]; ok || !errors.Is(errs["oldgo"], schemata.ErrNoTestBinary) {
-		t.Errorf("binary %v, error %v; want ErrNoTestBinary", b.Binaries, errs["oldgo"])
+	if _, ok := b.Binaries["oldgo"]; ok || errs["oldgo"] != nil || !b.NoTests["oldgo"] {
+		t.Errorf("binary %v, error %v, NoTests %v; want oldgo recorded as having no tests", b.Binaries, errs["oldgo"], b.NoTests)
 	}
 }
 
