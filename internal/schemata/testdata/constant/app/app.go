@@ -98,3 +98,12 @@ func Shift(x int) int { return x << (1 + 1) } // refused +: an untyped shift cou
 func Variadic() any { return foo.Sum(0.5 + 1) } // refused +: a variadic float argument
 
 func Generic() any { return foo.Pick(2.5 * 2) } // refused *: a generic callee
+
+func SetAnd() any { return foo.Set(6 & 3) }
+
+func SetShl() any { return foo.Set(1 << 4) }
+
+func Land() bool {
+	x := true && false
+	return x
+}

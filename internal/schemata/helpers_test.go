@@ -42,6 +42,7 @@ const testPrefix = "_zz"
 var allHelpers = []string{
 	"Active", "Reached", "Bit", "Xor", "LSS", "LEQ", "GTR", "GEQ",
 	"ADD", "SUB", "MUL", "QUO", "REM", "NEG", "POS", "IncDec", "IncDecMap",
+	"AND", "OR", "XOR", "ANDNOT", "SHL", "SHR",
 }
 
 // siteKind is the shape of the call the fixture makes for a site.
@@ -103,6 +104,20 @@ func helperSites() []site {
 		}
 		sites = append(sites, site{helper: a.helper, kind: kindBinary, tok: a.tok, operands: a.ops[0], muts: muts, zero: true})
 	}
+	ib := []mutator.Type{mutator.InvertBitwise}
+	bitwise := []struct {
+		helper string
+		tok    token.Token
+	}{
+		{"AND", token.AND}, {"OR", token.OR}, {"XOR", token.XOR}, {"ANDNOT", token.AND_NOT},
+		{"SHL", token.SHL}, {"SHR", token.SHR},
+	}
+	for _, bw := range bitwise {
+		for _, ops := range []string{"bitI", "bitU", "bitN"} {
+			sites = append(sites, site{helper: bw.helper, kind: kindBinary, tok: bw.tok, operands: ops, muts: ib})
+		}
+		sites = append(sites, site{helper: bw.helper, kind: kindBinary, tok: bw.tok, operands: "bitI", muts: ib, zero: true})
+	}
 	// unU: unary minus and plus are legal Go on unsigned operands too.
 	for _, ops := range []string{"unI", "unF", "unU"} {
 		sites = append(sites,
@@ -151,6 +166,9 @@ var (
 	unI  = []int{3, -2, 0, 5}
 	unF  = []float64{3, -2, 0, 5}
 	unU  = []uint8{3, 0, 200}
+	bitI = [][2]int{{12, 10}, {0, 7}, {255, 1}, {-6, 3}}
+	bitU = [][2]uint8{{12, 10}, {0, 7}, {255, 1}}
+	bitN = [][2]myInt{{12, 10}, {0, 7}, {255, 1}, {-6, 3}}
 )
 `
 

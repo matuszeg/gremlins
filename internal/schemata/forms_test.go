@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,10 +40,10 @@ import (
 	"github.com/go-gremlins/gremlins/internal/schemata"
 )
 
-// formsMutators are the mutators the schemata prototype rewrites.
+// formsMutators are the mutators with an expression form.
 var formsMutators = []mutator.Type{
 	mutator.ArithmeticBase, mutator.ConditionalsBoundary, mutator.ConditionalsNegation,
-	mutator.IncrementDecrement, mutator.InvertNegatives,
+	mutator.IncrementDecrement, mutator.InvertNegatives, mutator.InvertBitwise, mutator.InvertLogical,
 }
 
 // plainMutant is one mutant as the engine applies it: tok at pos becomes the
@@ -55,7 +56,10 @@ type plainMutant struct {
 }
 
 // discover finds the sites the engine would, restricted to formsMutators,
-// and numbers their mutants from 1 in source position order.
+// and numbers their mutants from 1 in source position order. The | of a type
+// union is left out: the engine's mutant there (~int & ~string) never
+// compiles, the rewriter refuses it (TestNewRewriter), and the fixtures
+// promise only mutants that compile.
 func discover(f *ast.File) ([]schemata.Site, []plainMutant) {
 	type found struct {
 		node ast.Node
@@ -63,10 +67,30 @@ func discover(f *ast.File) ([]schemata.Site, []plainMutant) {
 		tok  token.Token
 		mts  []mutator.Type
 	}
+	var typeExprs []ast.Node
+	ast.Inspect(f, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.InterfaceType:
+			typeExprs = append(typeExprs, n)
+		case *ast.TypeSpec:
+			if n.TypeParams != nil {
+				typeExprs = append(typeExprs, n.TypeParams)
+			}
+		case *ast.FuncType:
+			if n.TypeParams != nil {
+				typeExprs = append(typeExprs, n.TypeParams)
+			}
+		}
+
+		return true
+	})
 	var all []found
 	ast.Inspect(f, func(n ast.Node) bool {
 		tn, ok := engine.NewTokenNode(n)
 		if !ok {
+			return true
+		}
+		if slices.ContainsFunc(typeExprs, func(x ast.Node) bool { return x.Pos() <= n.Pos() && n.End() <= x.End() }) {
 			return true
 		}
 		mts, ok := engine.MutantTypesFor(tn)
@@ -253,18 +277,7 @@ func TestNewRewriter(t *testing.T) {
 	cn := mutator.ConditionalsNegation
 	id := mutator.IncrementDecrement
 	in := mutator.InvertNegatives
-	cases := map[string]struct {
-		src     string // a file body after "package p"
-		tok     token.Token
-		nth     int // which node with tok, in source order
-		siteTok token.Token
-		muts    []mutator.Type
-		want    string // empty: want ErrUnsupported
-		// bareInfo drops info.Uses, which the float witness form needs.
-		bareInfo bool
-		// noFiles gives NewRewriter no files to find a site's context in.
-		noFiles bool
-	}{
+	cases := map[string]rewriterCase{
 		"eql":             {src: "func f(a, b int) bool { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, want: "_zzXor(1, a == b)"},
 		"neq_iface":       {src: "func f(e error) bool { return e != nil }", tok: token.NEQ, muts: []mutator.Type{cn}, want: "_zzXor(1, e != nil)"},
 		"lss_both":        {src: "func f(a, b int) bool { return a < /* c */ b }", tok: token.LSS, muts: []mutator.Type{cb, cn}, want: "_zzLSS(1, 2, a, /* c */ b)"},
@@ -362,6 +375,68 @@ func TestNewRewriter(t *testing.T) {
 		"assign_stmt":        {src: "func f(a int) { a += 1 }", tok: token.ADD_ASSIGN, muts: []mutator.Type{mutator.InvertAssignments}},
 		"nested_outer":       {src: "func f(a, b, c int) bool { return a+b < c }", tok: token.LSS, muts: []mutator.Type{cb}, want: "_zzLSS(1, 0, a+b, c)"},
 	}
+	runRewriterCases(t, cases)
+}
+
+// rewriterCase is one row of a NewRewriter table: a site and the replacement
+// it must get.
+type rewriterCase struct {
+	src     string // a file body after "package p"
+	tok     token.Token
+	nth     int // which node with tok, in source order
+	siteTok token.Token
+	muts    []mutator.Type
+	want    string // empty: want ErrUnsupported
+	refusal string // with want empty, a text the refusal must contain
+	// bareInfo drops info.Uses, which the float witness form needs.
+	bareInfo bool
+	// noFiles gives NewRewriter no files to find a site's context in.
+	noFiles bool
+}
+
+// TestNewRewriterBitwiseLogical is TestNewRewriter for the INVERT_BITWISE
+// and INVERT_LOGICAL forms.
+func TestNewRewriterBitwiseLogical(t *testing.T) {
+	t.Parallel()
+	cn := mutator.ConditionalsNegation
+	ib := mutator.InvertBitwise
+	il := mutator.InvertLogical
+	cases := map[string]rewriterCase{
+		"and":                          {src: "func f(a, b int) int { return a & b }", tok: token.AND, muts: []mutator.Type{ib}, want: "_zzAND(1, a, b)"},
+		"or_untyped":                   {src: "type m uint16\nfunc f(a m) m { return a | 3 }", tok: token.OR, muts: []mutator.Type{ib}, want: "_zzOR(1, a, 3)"},
+		"xor":                          {src: "func f(a, b uint8) uint8 { return a ^ b }", tok: token.XOR, muts: []mutator.Type{ib}, want: "_zzXOR(1, a, b)"},
+		"andnot":                       {src: "func f(a, b int) int { return a &^ b }", tok: token.AND_NOT, muts: []mutator.Type{ib}, want: "_zzANDNOT(1, a, b)"},
+		"and_generic":                  {src: "func f[T ~int | ~uint8](a, b T) T { return a & b }", tok: token.AND, muts: []mutator.Type{ib}, want: "_zzAND(1, a, b)"},
+		"type_union":                   {src: "type u interface{ ~int | ~string }", tok: token.OR, muts: []mutator.Type{ib}},
+		"type_param_union":             {src: "func f[T ~int | ~uint](x T) T { return x }", tok: token.OR, muts: []mutator.Type{ib}},
+		"and_wrong_mutator":            {src: "func f(a, b int) int { return a & b }", tok: token.AND, muts: []mutator.Type{cn}},
+		"shl_mixed":                    {src: "func f(x uint64, n int) uint64 { return x << n }", tok: token.SHL, muts: []mutator.Type{ib}, want: "_zzSHL(1, x, n)"},
+		"shr_untyped_count":            {src: "func f(x int8) int8 { return x >> 2 }", tok: token.SHR, muts: []mutator.Type{ib}, want: "_zzSHR(1, x, 2)"},
+		"shl_rune_count":               {src: "func f(x int) int { return x << 'a' }", tok: token.SHL, muts: []mutator.Type{ib}, want: "_zzSHL(1, x, 'a')"},
+		"shl_float_count":              {src: "func f(x int) int { return x << 2.0 }", tok: token.SHL, muts: []mutator.Type{ib}},
+		"shl_untyped_left_int64_ctx":   {src: "func f(n uint) int64 { var x int64 = 1 << n; return x }", tok: token.SHL, muts: []mutator.Type{ib}, want: "_zzSHL[int64](1, 1, n)"},
+		"shl_untyped_left_foreign_ctx": {src: "import \"time\"\nfunc f(n uint) time.Duration { return 1 << n }", tok: token.SHL, muts: []mutator.Type{ib}, refusal: "shift of an untyped constant in a time.Duration context"},
+		"shl_untyped_left_named_ctx":   {src: "type m uint16\nfunc f(n uint) m { return 1 << n }", tok: token.SHL, muts: []mutator.Type{ib}},
+		"land":                         {src: "func f(a, b bool) bool { return a && b }", tok: token.LAND, muts: []mutator.Type{il}, want: "_zzXor(1, _zzXor(1, a) && _zzXor(1, b))"},
+		"lor_multiline":                {src: "func f(a, b bool) bool {\n\treturn a ||\n\t\tb\n}", tok: token.LOR, muts: []mutator.Type{il}, want: "_zzXor(1, _zzXor(1, a) || _zzXor(1,\n\t\tb))"},
+		"land_comparisons":             {src: "func f(i, j int) bool { return i == 1 && j == 2 }", tok: token.LAND, muts: []mutator.Type{il}, want: "_zzXor(1, _zzXor(1, i == 1) && _zzXor(1, j == 2))"},
+		"land_named_bool":              {src: "type nb bool\nfunc f(a nb, b []nb) nb { return a && !b[0] }", tok: token.LAND, muts: []mutator.Type{il}, want: "_zzXor(1, _zzXor(1, a) && _zzXor(1, !b[0]))"},
+		// An untyped operand would make Xor return bool, which a named
+		// bool context rejects.
+		"land_named_untyped":    {src: "type nb bool\nfunc f(a nb) nb { return a && true }", tok: token.LAND, muts: []mutator.Type{il}},
+		"lor_named_comparisons": {src: "type nb bool\nfunc f(i, j int) nb { return i == 1 || j == 2 }", tok: token.LOR, muts: []mutator.Type{il}},
+		"const_and":             {src: "func f() int { return 6 & 3 }", tok: token.AND, muts: []mutator.Type{ib}, want: "(2*(1-(1<<_zzBit(1)-1)) + 7*(1<<_zzBit(1)-1))"},
+		"const_shl_typed_count": {src: "const k uint8 = 4\nfunc f() int { return 1 << k }", tok: token.SHL, muts: []mutator.Type{ib}, want: "(16*(1-(1<<_zzBit(1)-1)) + 0*(1<<_zzBit(1)-1))"},
+		"const_shl_typed_left":  {src: "const k uint8 = 4\nfunc f() any { return k << 2 }", tok: token.SHL, muts: []mutator.Type{ib}, want: "((k)*0 + 16*(1-(1<<_zzBit(1)-1)) + 1*(1<<_zzBit(1)-1))"},
+		"const_shl_overflow":    {src: "func f() uint8 { return 255 >> 1 }", tok: token.SHR, muts: []mutator.Type{ib}},
+		"const_land":            {src: "func f() bool { return true && false }", tok: token.LAND, muts: []mutator.Type{il}, want: "_zzBool1(1, false, true)"},
+	}
+	runRewriterCases(t, cases)
+}
+
+// runRewriterCases runs each case's site through NewRewriter.
+func runRewriterCases(t *testing.T, cases map[string]rewriterCase) {
+	t.Helper()
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -402,8 +477,8 @@ func TestNewRewriter(t *testing.T) {
 			}
 			got, err := schemata.NewRewriter(info, files, testPrefix, &schemata.HelperSet{})(site, inner)
 			if tc.want == "" {
-				if !errors.Is(err, schemata.ErrUnsupported) {
-					t.Errorf("got %q, %v; want ErrUnsupported", got, err)
+				if !errors.Is(err, schemata.ErrUnsupported) || !strings.Contains(err.Error(), tc.refusal) {
+					t.Errorf("got %q, %v; want ErrUnsupported %q", got, err, tc.refusal)
 				}
 
 				return

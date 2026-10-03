@@ -58,4 +58,7 @@ func TestPrint(t *testing.T) {
 	show("Variadic", Variadic)
 	show("Generic", Generic)
 	show("K", func() any { return k })
+	show("SetAnd", SetAnd)
+	show("SetShl", SetShl)
+	show("Land", func() any { return Land() })
 }
