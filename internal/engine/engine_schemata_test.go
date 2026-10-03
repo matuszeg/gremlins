@@ -19,6 +19,7 @@ package engine_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -77,7 +78,10 @@ func TestSchemataParity(t *testing.T) {
 	runnable := len(legacy) - seen[mutator.NotCovered] - seen[mutator.Skipped]
 	checkSharedLine(t, modRoot, legacy)
 
+	keep := filepath.Join(t.TempDir(), "kept")
+	t.Setenv("GREMLINS_SCHEMATA_KEEP", keep)
 	withSchemata, res, calls := runParity(t, mod, prof, true)
+	checkKept(t, keep, runnable)
 	if calls != 1 {
 		t.Errorf("the run with --schemata called Prepare %d times, want 1", calls)
 	}
@@ -202,5 +206,45 @@ func checkSharedLine(t *testing.T, modRoot string, legacy map[string]mutator.Sta
 	}
 	if line == 0 || got[mutator.Killed] != 1 || got[mutator.Lived] != 1 || len(got) != 2 {
 		t.Errorf("Mix (line %d) mutants by status = %v, want one KILLED and one LIVED", line, got)
+	}
+}
+
+// checkKept requires the build GREMLINS_SCHEMATA_KEEP kept in dir to index
+// runnable mutants, each with its id, position, type and package, and to hold
+// the binary and rewritten source the index names.
+func checkKept(t *testing.T, dir string, runnable int) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "index.json")) //nolint:gosec // G304: the kept index
+	if err != nil {
+		t.Fatalf("no kept index: %v", err)
+	}
+	var idx struct {
+		Binaries map[string]string
+		Source   string
+		Mutants  []struct {
+			ID                      int
+			Position, Type, Package string
+		}
+	}
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		t.Fatal(err)
+	}
+	if len(idx.Mutants) != runnable {
+		t.Errorf("kept index has %d mutants, want %d", len(idx.Mutants), runnable)
+	}
+	for _, m := range idx.Mutants {
+		if m.ID < 1 || !strings.Contains(m.Position, "calc.go:") || m.Type == "" || m.Package != "parity/calc" {
+			t.Errorf("kept index entry %+v is incomplete", m)
+		}
+	}
+	bin, ok := idx.Binaries["parity/calc"]
+	if !ok || !strings.HasPrefix(bin, dir) {
+		t.Fatalf("kept binaries %v, want parity/calc's under %s", idx.Binaries, dir)
+	}
+	if fi, err := os.Stat(bin); err != nil || fi.Mode()&0o100 == 0 {
+		t.Errorf("kept binary %s: %v, mode %v", bin, err, fi)
+	}
+	if _, err := os.Stat(filepath.Join(idx.Source, "calc", "calc.go")); err != nil {
+		t.Errorf("kept source lacks the rewritten calc.go: %v", err)
 	}
 }
