@@ -122,7 +122,7 @@ func buildSchemaFixture(t *testing.T) schemaFixture {
 		}
 	}
 
-	files, _, dropped := schemata.RewritePackage(pkg, sites, "")
+	files, _, dropped := schemata.RewritePackage(context.Background(), pkg, sites, "")
 	if len(dropped) > 0 {
 		t.Fatalf("sites dropped: %v", dropped)
 	}

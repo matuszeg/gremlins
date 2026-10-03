@@ -199,7 +199,7 @@ func TestRewritePackage(t *testing.T) {
 			if factory == nil {
 				factory = schemata.NewRewriter
 			}
-			files, placed, dropped := schemata.RewritePackageWith(pkg, sites, "", factory)
+			files, placed, dropped := schemata.RewritePackageWith(context.Background(), pkg, sites, "", factory)
 
 			// placed + dropped is exactly the input, each site once.
 			var got []string
@@ -373,7 +373,7 @@ func TestBuildAll(t *testing.T) {
 				} else {
 					sites := pkgSites(pkg)
 					var dropped []schemata.SiteError
-					files, _, dropped = schemata.RewritePackage(pkg, sites, "")
+					files, _, dropped = schemata.RewritePackage(context.Background(), pkg, sites, "")
 					if len(dropped) > 0 {
 						t.Fatalf("%s: sites dropped: %v", p.importPath, dropped)
 					}
@@ -483,7 +483,7 @@ func TestBuildAllEmbedsOriginalSourcePaths(t *testing.T) {
 	})
 	pkg := loadPkg(t, modRoot, "./caller")
 	sites := pkgSites(pkg)
-	files, _, dropped := schemata.RewritePackage(pkg, sites, "")
+	files, _, dropped := schemata.RewritePackage(context.Background(), pkg, sites, "")
 	if len(dropped) > 0 {
 		t.Fatalf("sites dropped: %v", dropped)
 	}

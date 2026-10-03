@@ -18,6 +18,7 @@ package schemata_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"go/ast"
 	"go/token"
@@ -278,7 +279,7 @@ func TestRewritePackageDupTypeError(t *testing.T) {
 					}
 				}
 			}
-			files, placed, dropped := schemata.RewritePackageWith(pkg, sites, "", factory)
+			files, placed, dropped := schemata.RewritePackageWith(context.Background(), pkg, sites, "", factory)
 
 			var in, got, gotDropped []mutantKey
 			for _, s := range sites {

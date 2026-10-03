@@ -100,7 +100,11 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		return Plan{}, nil
 	}
 
-	rewritten, placedPkgs := p.rewrite(tags)
+	rewritten, placedPkgs := p.rewrite(ctx, tags)
+	// The loads end early when ctx does, netting what they did not finish.
+	if err := ctx.Err(); err != nil {
+		return Plan{}, err
+	}
 	var plan Plan
 	if len(placedPkgs) > 0 {
 		need := map[string][]string{}
@@ -174,13 +178,13 @@ func (p *preparer) file(i int) string {
 // rewrite loads the mutants' packages and rewrites each, netting what it
 // cannot place. It returns the rewritten files by import path and the
 // import paths of the packages with a placed site, in stream order.
-func (p *preparer) rewrite(tags string) (map[string]map[string][]byte, []string) {
+func (p *preparer) rewrite(ctx context.Context, tags string) (map[string]map[string][]byte, []string) {
 	p.pkgOf = make([]string, len(p.muts))
 	var dirs []string
 	for i := range p.muts {
 		dirs = append(dirs, filepath.Dir(p.file(i)))
 	}
-	pkgs, err := loadPackages(p.mod.Root, tags, dirs)
+	pkgs, err := loadPackages(ctx, p.mod.Root, tags, dirs)
 	if err != nil {
 		for i := range p.muts {
 			p.net(i, err.Error())
@@ -219,7 +223,7 @@ func (p *preparer) rewrite(tags string) (map[string]map[string][]byte, []string)
 	var placedPkgs []string
 	for _, lp := range order {
 		sites := p.sites(lp, groups[lp])
-		files, placed, dropped := RewritePackage(lp, sites, tags)
+		files, placed, dropped := RewritePackage(ctx, lp, sites, tags)
 		for _, d := range dropped {
 			for _, mu := range d.Site.Muts {
 				p.net(mu.ID-1, d.Err.Error())
@@ -370,8 +374,8 @@ func (p *preparer) netFailed(need map[string][]string, failed map[string]string)
 }
 
 // loadPackages loads the packages in dirs, under modRoot, with what
-// RewritePackage needs.
-func loadPackages(modRoot, tags string, dirs []string) ([]*packages.Package, error) {
+// RewritePackage needs, under ctx.
+func loadPackages(ctx context.Context, modRoot, tags string, dirs []string) ([]*packages.Package, error) {
 	var patterns []string
 	for _, d := range dirs {
 		rel, err := filepath.Rel(modRoot, d)
@@ -385,7 +389,8 @@ func loadPackages(modRoot, tags string, dirs []string) ([]*packages.Package, err
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes |
 			packages.NeedTypesInfo | packages.NeedModule | packages.NeedDeps | packages.NeedImports,
-		Dir: modRoot,
+		Context: ctx,
+		Dir:     modRoot,
 	}
 	if tags != "" {
 		cfg.BuildFlags = []string{"-tags", tags}
