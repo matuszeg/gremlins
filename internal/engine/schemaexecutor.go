@@ -372,7 +372,11 @@ func overlayGOFLAGS(overlay string) string {
 // runs the go command itself then builds what the binary was built from.
 type overlayCache struct {
 	files map[overlayKey]string
-	mu    sync.Mutex
+	// errs holds the failure of a worker copy's overlay: it is not tried
+	// again for each of the worker's mutants, which would each fail the
+	// same way and log it once more.
+	errs map[overlayKey]error
+	mu   sync.Mutex
 }
 
 type overlayKey struct {
@@ -381,11 +385,12 @@ type overlayKey struct {
 }
 
 func newOverlayCache() *overlayCache {
-	return &overlayCache{files: map[overlayKey]string{}}
+	return &overlayCache{files: map[overlayKey]string{}, errs: map[overlayKey]error{}}
 }
 
 // get returns the overlay file of build for the worker copy root, writing it
-// into tmpDir the first time it is asked for.
+// into tmpDir the first time it is asked for. A failure is remembered, and
+// returned again, for the same build and root.
 func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -393,6 +398,23 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 	if path, ok := c.files[key]; ok {
 		return path, nil
 	}
+	if err, ok := c.errs[key]; ok {
+		return "", err
+	}
+	path, err := writeOverlayFile(build, root, tmpDir)
+	if err != nil {
+		c.errs[key] = err
+
+		return "", err
+	}
+	c.files[key] = path
+
+	return path, nil
+}
+
+// writeOverlayFile writes into tmpDir the overlay file that points each file
+// of build.Rewritten under root at build's copy of it, and returns its path.
+func writeOverlayFile(build *schemata.Build, root, tmpDir string) (string, error) {
 	replace := make(map[string]string, len(build.Rewritten))
 	for _, rel := range build.Rewritten {
 		replace[filepath.Join(root, rel)] = filepath.Join(build.Src, rel)
@@ -423,7 +445,6 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 
 		return "", fmt.Errorf("overlay path %q has whitespace and cannot go in GOFLAGS", path)
 	}
-	c.files[key] = path
 
 	return path, nil
 }

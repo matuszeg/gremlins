@@ -226,6 +226,7 @@ func TestSchemaExecutor(t *testing.T) {
 	t.Run("cancel_bounds_output_drain", func(t *testing.T) { testSchemaCancelBoundsOutputDrain(t, fx) })
 	t.Run("concurrent_workers_isolated", func(t *testing.T) { testSchemaConcurrentWorkersIsolated(t, fx) })
 	t.Run("combine", func(t *testing.T) { testSchemaCombine(t, fx) })
+	t.Run("shared_directory_detected", func(t *testing.T) { testSchemaSharedDirectoryIsDetected(t, fx) })
 }
 
 // substExec records every command and runs, in place of each binary scripts
@@ -503,20 +504,34 @@ func testSchemaMissingBinaryFallsBack(t *testing.T, fx schemaFixture) {
 	}
 }
 
+// holdShutdownStatus sets --on-shutdown-status to value until the test ends.
+// The cancellation tests use a value other than the default, which is also
+// what a mutant that never ran gets, so that they show the setting is read.
+// The configuration is process-wide: the lock viperSet takes serialises these
+// tests with every other that sets it, and a leaf test must call this after
+// newSchemaDealer, which takes the same lock.
+func holdShutdownStatus(t *testing.T, value string) {
+	t.Helper()
+	viperSet(map[string]any{configuration.UnleashOnShutdownStatusKey: value})
+	t.Cleanup(viperReset)
+}
+
 // testSchemaRunCancelled checks that a run cancelled before the mutant starts
 // takes the shutdown status and starts nothing.
 func testSchemaRunCancelled(t *testing.T, fx schemaFixture) {
 	t.Parallel()
 	rec := &cmdRecorder{}
 	d, _ := newSchemaDealer(t, fx, nil, engine.WithExecContext(rec.exec))
+	holdShutdownStatus(t, "timed-out")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	d.SetRunCtx(ctx)
 
 	got := runSchemaMutant(t, d, fx, "Add/ARITHMETIC_BASE", &fx.build, workerpool.NewWorker(1, "w"))
 
-	if got.Status() != mutator.NotCovered {
-		t.Errorf("status = %s, want the default shutdown status NOT COVERED", got.Status())
+	// Not the default: NOT COVERED is also what a mutant that never ran gets.
+	if got.Status() != mutator.TimedOut {
+		t.Errorf("status = %s, want the configured shutdown status TIMED OUT", got.Status())
 	}
 	if n := len(rec.all()); n != 0 {
 		t.Errorf("%d commands started after the run was cancelled", n)
@@ -528,6 +543,7 @@ func testSchemaRunCancelled(t *testing.T, fx schemaFixture) {
 func testSchemaCancelledMidRun(t *testing.T, fx schemaFixture) {
 	t.Parallel()
 	d, _ := newSchemaDealer(t, fx, nil)
+	holdShutdownStatus(t, "lived")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	d.SetRunCtx(ctx)
@@ -535,8 +551,10 @@ func testSchemaCancelledMidRun(t *testing.T, fx schemaFixture) {
 
 	got := runSchemaMutant(t, d, fx, "Pause/CONDITIONALS_BOUNDARY", &fx.build, workerpool.NewWorker(1, "w"))
 
-	if got.Status() != mutator.NotCovered {
-		t.Errorf("status = %s, want the default shutdown status NOT COVERED", got.Status())
+	// Neither the default nor what the run's own timeout (RUNNER TIMED OUT)
+	// or its backstop (TIMED OUT) would give.
+	if got.Status() != mutator.Lived {
+		t.Errorf("status = %s, want the configured shutdown status LIVED", got.Status())
 	}
 }
 
@@ -556,6 +574,7 @@ func testSchemaCancelBoundsOutputDrain(t *testing.T, fx schemaFixture) {
 			t.Parallel()
 			sub := newSubstExec(t, map[string]string{fx.build.Binaries[calcPkg]: tc.body})
 			d, _ := newSchemaDealer(t, fx, nil, engine.WithExecContext(sub.exec))
+			holdShutdownStatus(t, "timed-out")
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			d.SetRunCtx(ctx)
@@ -568,8 +587,8 @@ func testSchemaCancelBoundsOutputDrain(t *testing.T, fx schemaFixture) {
 			if el := time.Since(start); el > cancelAfter+2*time.Second+500*time.Millisecond {
 				t.Errorf("the run ended %s after the cancel, want within outputDrainGrace", el-cancelAfter)
 			}
-			if got.Status() != mutator.NotCovered {
-				t.Errorf("status = %s, want the default shutdown status NOT COVERED", got.Status())
+			if got.Status() != mutator.TimedOut {
+				t.Errorf("status = %s, want the configured shutdown status TIMED OUT", got.Status())
 			}
 		})
 	}
@@ -601,7 +620,16 @@ func testSchemaConcurrentWorkersIsolated(t *testing.T, fx schemaFixture) {
 	}
 
 	d, _ := newSchemaDealer(t, fx, nil)
-	viperSet(map[string]any{configuration.UnleashWorkersKey: 4})
+	if concurrent := runConcurrently(t, d, fx, keys, 4); !maps.Equal(concurrent, serial) {
+		t.Errorf("concurrent statuses %v, want the serial ones %v", concurrent, serial)
+	}
+}
+
+// runConcurrently runs the fixture mutants keys at once on a pool of workers
+// workers and returns each one's status.
+func runConcurrently(t *testing.T, d *engine.MutantExecutorDealer, fx schemaFixture, keys []string, workers int) map[string]mutator.Status {
+	t.Helper()
+	viperSet(map[string]any{configuration.UnleashWorkersKey: workers})
 	pool := workerpool.Initialize("schema")
 	viperReset()
 	outCh := make(chan mutator.Mutator, len(keys))
@@ -618,12 +646,47 @@ func testSchemaConcurrentWorkersIsolated(t *testing.T, fx schemaFixture) {
 	wg.Wait()
 	pool.Stop()
 	close(outCh)
-	concurrent := map[string]mutator.Status{}
+	got := map[string]mutator.Status{}
 	for m := range outCh {
-		concurrent[stubs[m]] = m.Status()
+		got[stubs[m]] = m.Status()
 	}
-	if !maps.Equal(concurrent, serial) {
-		t.Errorf("concurrent statuses %v, want the serial ones %v", concurrent, serial)
+
+	return got
+}
+
+// sharedDealer deals one working directory to every worker, as a broken
+// isolation would.
+type sharedDealer struct {
+	workdir.Dealer
+	dir string
+}
+
+func (s sharedDealer) Get(string) (string, error) { return s.dir, nil }
+
+// testSchemaSharedDirectoryIsDetected holds the isolation test to its claim:
+// with two workers dealt one directory, the fixture's TestAlone probe sees
+// the other's marker, and a mutant whose verdict is otherwise NOT COVERED
+// fails instead.
+func testSchemaSharedDirectoryIsDetected(t *testing.T, fx schemaFixture) {
+	t.Parallel()
+	wdd := workdir.NewCachedDealer(t.TempDir(), fx.mod.Root)
+	t.Cleanup(wdd.Clean)
+	viperSet(map[string]any{configuration.UnleashTimeoutMaxKey: "1s"})
+	dir, err := wdd.Get("shared") // made before the workers ask, which would each make a copy
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := engine.NewExecutorDealer(fx.mod, sharedDealer{wdd, dir}, 0)
+	viperReset()
+	keys := []string{"Unused/ARITHMETIC_BASE", "Unused/INVERT_NEGATIVES"}
+
+	got := runConcurrently(t, d, fx, keys, 2)
+
+	if len(got) != len(keys) {
+		t.Fatalf("statuses %v for %v", got, keys)
+	}
+	if got[keys[0]] == mutator.NotCovered && got[keys[1]] == mutator.NotCovered {
+		t.Errorf("two workers sharing a directory both got NOT COVERED: the probe sees no sharing")
 	}
 }
 
