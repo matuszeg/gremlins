@@ -49,6 +49,7 @@ const (
 	calcPkg   = "schemaexec/calc"
 	usePkg    = "schemaexec/use"
 	notestPkg = "schemaexec/notest"
+	gorunPkg  = "schemaexec/gorun"
 )
 
 // schemaMutators are the mutators the schemata engine rewrites: all of them.
@@ -69,8 +70,8 @@ type schemaFixture struct {
 }
 
 // buildSchemaFixture discovers the mutants of the calc package, rewrites it
-// and builds the test binaries of calc and use from the schema copy; notest,
-// which has no test files, is built too and has none.
+// and builds the test binaries of calc, use and gorun from the schema copy;
+// notest, which has no test files, is built too and has none.
 func buildSchemaFixture(t *testing.T) schemaFixture {
 	t.Helper()
 	modRoot, err := filepath.Abs("testdata/schemaexec")
@@ -125,7 +126,7 @@ func buildSchemaFixture(t *testing.T) schemaFixture {
 		t.Fatalf("sites dropped: %v", dropped)
 	}
 	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "",
-		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg, notestPkg}, 5*time.Minute)
+		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg, notestPkg, gorunPkg}, 5*time.Minute)
 	for p, err := range errs {
 		if err != nil {
 			t.Fatalf("build %s: %v", p, err)
@@ -351,6 +352,18 @@ func testSchemaVerdicts(t *testing.T, fx schemaFixture) {
 			opts: []engine.ExecutorDealerOption{engine.WithDependents(dependentsStub{calcPkg: {notestPkg}})},
 			want: mutator.Lived,
 		},
+		// gorun's test runs go run from the directory runtime.Caller names
+		// in the binary: the build copy, which the worker's overlay must
+		// cover too, or the program is built without the mutant.
+		"killed_through_go_run_in_caller_dir": {
+			key: "Unused/ARITHMETIC_BASE",
+			set: map[string]any{
+				configuration.UnleashCrossPackageKey: true,
+				configuration.UnleashTimeoutMaxKey:   "2m",
+			},
+			opts: []engine.ExecutorDealerOption{engine.WithDependents(dependentsStub{calcPkg: {gorunPkg}})},
+			want: mutator.Killed,
+		},
 		"selected_tests_do_not_reach": {
 			key: "Scale/ARITHMETIC_BASE",
 			opts: []engine.ExecutorDealerOption{engine.WithTestSelection(selectorStub{
@@ -464,6 +477,7 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 	want := map[string]string{}
 	for _, rel := range fx.build.Rewritten {
 		want[filepath.Join(root, rel)] = filepath.Join(fx.build.Src, rel)
+		want[filepath.Join(fx.build.Dir, rel)] = filepath.Join(fx.build.Src, rel)
 	}
 	if len(want) == 0 || !maps.Equal(o.Replace, want) {
 		t.Errorf("overlay = %v, want %v", o.Replace, want)
