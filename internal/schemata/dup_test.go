@@ -132,6 +132,18 @@ func TestRenderDup(t *testing.T) {
 			want: "func f() int {if _zzActive == 1 { _zzReached(); return _zz_D1_f() };\n\treturn func() int { const k = 2 * 3; return k }()\n}\n" +
 				"\n//line :3:1\nfunc _zz_D1_f() int {\n\treturn func() int { const k = 2 / 3; return k }()\n}\n",
 		},
+		// recover only in a closure the function defers, or a shadowing
+		// local named recover: the function is still duplicated.
+		"recover_in_closure": {
+			src: "func f() (r int) { defer func() { _ = recover() }(); const k = 1 + 2; return k }\n", tok: token.ADD, muts: []mutator.Type{ab},
+			want: "func f() (r int) {if _zzActive == 1 { _zzReached(); return _zz_D1_f() }; defer func() { _ = recover() }(); const k = 1 + 2; return k }\n" +
+				"\n//line :3:1\nfunc _zz_D1_f() (r int) { defer func() { _ = recover() }(); const k = 1 - 2; return k }\n",
+		},
+		"recover_shadowed": {
+			src: "func f() int { recover := func() int { return 0 }; const k = 1 + 2; return k + recover() }\n", tok: token.ADD, muts: []mutator.Type{ab},
+			want: "func f() int {if _zzActive == 1 { _zzReached(); return _zz_D1_f() }; recover := func() int { return 0 }; const k = 1 + 2; return k + recover() }\n" +
+				"\n//line :3:1\nfunc _zz_D1_f() int { recover := func() int { return 0 }; const k = 1 - 2; return k + recover() }\n",
+		},
 		"noinline": {
 			src: "//go:noinline\nfunc f() int { const k = 2 * 3; return k }\n", tok: token.MUL, muts: []mutator.Type{ab},
 			want: "//go:noinline\nfunc f() int {if _zzActive == 1 { _zzReached(); return _zz_D1_f() }; const k = 2 * 3; return k }\n" +
@@ -155,6 +167,7 @@ func TestDupRefusals(t *testing.T) {
 		"package_key":          {src: "var s = []int{1 + 1: 5}\n", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "constant composite literal key"},
 		"signature_array_len":  {src: "func f(a [1 + 1]int) int { return len(a) }\n", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "constant site in an array length"},
 		"blank_type_param":     {src: "func f[_ any]() int { const k = 1 + 2; return k }\n", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "blank type parameter"},
+		"recover_direct":       {src: "var sink int\n\nfunc handler() { const k = 1 + 2; if recover() != nil { sink = k } }\n", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "calls recover"},
 		"line_directive":       {src: "//line other.go:10\nfunc f() int { const k = 1 + 2; return k }\n", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "line directive"},
 	}
 	runDupCases(t, cases)

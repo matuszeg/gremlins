@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"go/types"
 	"slices"
 	"strconv"
 	"strings"
@@ -73,6 +74,9 @@ func (r *rewriter) dupSite(s Site, e ast.Expr, fn *ast.FuncDecl) error {
 			}
 		}
 	}
+	if r.callsRecover(fn.Body) {
+		return fmt.Errorf("%w: compile-time site in a function that calls recover", ErrUnsupported)
+	}
 	if fn.Type.TypeParams != nil {
 		for _, f := range fn.Type.TypeParams.List {
 			for _, n := range f.Names {
@@ -99,6 +103,31 @@ func (r *rewriter) dupSite(s Site, e ast.Expr, fn *ast.FuncDecl) error {
 	}
 
 	return d
+}
+
+// callsRecover reports whether body calls the builtin recover outside any
+// nested function literal. Such a function may be deferred itself, and
+// recover stops a panic only when called directly by the deferred function:
+// through the jump, the copy's recover would be a frame too deep and return
+// nil. A recover inside a closure the function defers is unaffected. Without
+// Uses to resolve the name, any call of a function named recover counts.
+func (r *rewriter) callsRecover(body *ast.BlockStmt) bool {
+	found := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			id, ok := ast.Unparen(n.Fun).(*ast.Ident)
+			if ok && id.Name == "recover" && (r.info.Uses == nil || r.info.Uses[id] == types.Universe.Lookup("recover")) {
+				found = true
+			}
+		}
+
+		return !found
+	})
+
+	return found
 }
 
 // textEdit replaces del bytes at off with text.
