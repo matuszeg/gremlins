@@ -32,7 +32,6 @@ import (
 
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
-	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/procgroup"
@@ -184,7 +183,7 @@ func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) 
 		if !ok {
 			return nil, fmt.Errorf("no schema test binary for %s", pkg)
 		}
-		dir, ok := packageDir(rootDir, s.legacy.module, pkg)
+		dir, ok := s.legacy.module.PackageDir(rootDir, pkg)
 		if !ok {
 			return nil, fmt.Errorf("%s is not a package of module %s", pkg, s.legacy.module.Name)
 		}
@@ -192,20 +191,6 @@ func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) 
 	}
 
 	return runs, nil
-}
-
-// packageDir maps an import path of mod to its directory under rootDir, a
-// copy of the module root.
-func packageDir(rootDir string, mod gomodule.GoModule, pkg string) (string, bool) {
-	if pkg == mod.Name {
-		return rootDir, true
-	}
-	rel, ok := strings.CutPrefix(pkg, mod.Name+"/")
-	if !ok || rel == "" {
-		return "", false
-	}
-
-	return filepath.Join(rootDir, filepath.FromSlash(rel)), true
 }
 
 // runAll runs every package in order, as legacy's one go test over the

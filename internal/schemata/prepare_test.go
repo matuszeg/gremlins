@@ -389,6 +389,21 @@ func TestPrepareNets(t *testing.T) {
 			wantNetted: map[string]string{b: "no mutation site"},
 			wantPlaced: []string{a},
 		},
+		// Only that package's mutants are netted: the other's are placed.
+		"a mutant in a directory outside the module root": {
+			mutate: func(in []mutator.Mutator) []mutator.Mutator {
+				outside := filepath.Join(os.TempDir(), "gremlins-outside-the-module", "x.go")
+				for i, m := range in {
+					if m.Pkg() == b {
+						in[i] = movedMutant{Mutator: m, file: outside}
+					}
+				}
+
+				return in
+			},
+			wantNetted: map[string]string{b: "is not under the module root"},
+			wantPlaced: []string{a},
+		},
 		"a mutant whose import path is not its directory's": {
 			mutate: func(in []mutator.Mutator) []mutator.Mutator {
 				for i, m := range in {
@@ -636,17 +651,22 @@ func TestPrepareStopsLoadingWhenCancelled(t *testing.T) {
 	}
 }
 
-// movedMutant reports a different line or package than the mutant it wraps.
+// movedMutant reports a different line, package or file than the mutant it
+// wraps.
 type movedMutant struct {
 	mutator.Mutator
 	line int
 	pkg  string
+	file string
 }
 
 func (m movedMutant) Position() token.Position {
 	p := m.Mutator.Position()
 	if m.line != 0 {
 		p.Line = m.line
+	}
+	if m.file != "" {
+		p.Filename = m.file
 	}
 
 	return p

@@ -363,7 +363,7 @@ func (m MutantExecutorDealer) schemaTargets(runnable []mutator.Mutator) schemaTa
 			slices.Sort(tests)
 			t.tests[pkg] = slices.Compact(tests)
 		}
-		if dir, ok := packageDir(m.mod.Root, m.mod, pkg); ok {
+		if dir, ok := m.mod.PackageDir(m.mod.Root, pkg); ok {
 			t.dirs[filepath.Clean(dir)] = pkg
 		}
 	}
