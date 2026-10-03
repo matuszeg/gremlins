@@ -111,14 +111,61 @@ func TestSchemataParity(t *testing.T) {
 	}
 }
 
+// TestSchemataSaysWhyItWasNotUsed runs --schemata where no schema build can
+// be made, in a dry run and in integration mode, and requires the summary
+// and the report line to say why placed is 0, not just print it.
+//
+// It is not parallel: it captures the global log to read the report.
+func TestSchemataSaysWhyItWasNotUsed(t *testing.T) {
+	modRoot, err := filepath.Abs("testdata/parity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := gomodule.GoModule{Name: "parity", Root: modRoot, CallingDir: "."}
+	prof := parityProfile(t, mod)
+	testCases := map[string]struct {
+		extra   map[string]any
+		wantWhy string
+	}{
+		"dry_run":          {extra: map[string]any{configuration.UnleashDryRunKey: true}, wantWhy: "dry run"},
+		"integration_mode": {extra: map[string]any{configuration.UnleashIntegrationMode: true}, wantWhy: "integration mode"},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			_, res, calls := runParityWith(t, mod, prof, true, tc.extra)
+			if calls != 0 {
+				t.Errorf("Prepare was called %d times", calls)
+			}
+			if res.Schemata == nil || res.Schemata.Placed != 0 || res.Schemata.NotUsed != tc.wantWhy {
+				t.Fatalf("schemata summary = %+v, want nothing placed and NotUsed %q", res.Schemata, tc.wantWhy)
+			}
+			out := &bytes.Buffer{}
+			log.Init(out, &bytes.Buffer{})
+			defer log.Reset()
+			_ = report.Do(res)
+			if want := "Schemata: not used (" + tc.wantWhy + ")\n"; !strings.Contains(out.String(), want) {
+				t.Errorf("report does not contain %q:\n%s", want, out.String())
+			}
+		})
+	}
+}
+
 // runParity runs the engine over mod and returns each mutant's status keyed by
 // position and type, the results, and how many times Prepare was called.
 func runParity(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withSchemata bool) (map[string]mutator.Status, report.Results, int) {
+	t.Helper()
+
+	return runParityWith(t, mod, prof, withSchemata, nil)
+}
+
+// runParityWith is runParity with extra settings.
+func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, withSchemata bool, extra map[string]any) (map[string]mutator.Status, report.Results, int) {
 	t.Helper()
 	settings := map[string]any{
 		configuration.UnleashSchemataKey:   withSchemata,
 		configuration.UnleashTimeoutMaxKey: "1s",
 	}
+	maps.Copy(settings, extra)
 	// The backend's mutator set: the five the schemata prototype rewrites.
 	for _, mt := range mutator.Types {
 		settings[configuration.MutantTypeEnabledKey(mt)] = slices.Contains(schemaMutators, mt)

@@ -71,11 +71,15 @@ func (mu *Engine) executeSchemata(ctx context.Context) report.Results {
 	case !ok:
 		log.Errorf("schemata: the executor dealer cannot run schema binaries; every mutant runs through go test\n")
 		summary.PerMutant = len(runnable)
-	case d.dryRun || len(runnable) == 0:
+	case d.dryRun:
 		// No mutant runs, so there is nothing to build.
+		summary.NotUsed = "dry run"
+	case len(runnable) == 0:
+		// Nothing to build for.
 	case d.integrationMode:
 		log.Infoln("schemata has no effect in integration mode: every mutant runs the whole module")
 		summary.PerMutant = len(runnable)
+		summary.NotUsed = "integration mode"
 	default:
 		return mu.executePlaced(ctx, d, all, runnable)
 	}
@@ -314,16 +318,6 @@ func nettedByReason(netted []schemata.NetEntry) []string {
 	return lines
 }
 
-// selection is the test selection the dealer's executors make.
-func (m MutantExecutorDealer) selection() testSelection {
-	return testSelection{
-		testMap:         m.testMap,
-		dependents:      m.dependents,
-		crossPackage:    m.crossPackage,
-		integrationMode: m.integrationMode,
-	}
-}
-
 // schemaTargets is what the executors of a run's mutants will run, gathered
 // before any of them does, so that Prepare builds and null-checks exactly it.
 type schemaTargets struct {
@@ -339,7 +333,7 @@ type schemaTargets struct {
 // schemaTargets gathers what the executors of runnable will select, from the
 // same testSelection.forMutant their selectTests calls.
 func (m MutantExecutorDealer) schemaTargets(runnable []mutator.Mutator) schemaTargets {
-	sel := m.selection()
+	sel := m.testSelection
 	t := schemaTargets{pkgs: map[string][]string{}, tests: map[string][]string{}, dirs: map[string]string{}}
 	whole := map[string]bool{}
 	for _, mut := range runnable {

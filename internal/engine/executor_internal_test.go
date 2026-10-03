@@ -96,7 +96,7 @@ func TestGetTestArgs(t *testing.T) {
 				buildTags:         tc.buildTags,
 				testExecutionTime: tc.testExecutionTime,
 				testCPU:           tc.testCPU,
-				integrationMode:   tc.integrationMode,
+				testSelection:     testSelection{integrationMode: tc.integrationMode},
 			}
 
 			sel := testRun{pkgs: []string{tc.pkg}, tests: tc.tests}
