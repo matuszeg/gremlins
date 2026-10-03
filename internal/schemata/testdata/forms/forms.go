@@ -82,6 +82,12 @@ func Commented(a, b int) bool { return a < /* gap */ b }
 
 func Nested(a, b, c int) bool { return a+b < c }
 
+// NestedEq has a site (a+1) inside an operand of another (==).
+func NestedEq(a, b int) bool { return a+1 == b }
+
+// GAddOne adds an untyped constant to a type-parameter operand.
+func GAddOne[T num](x T) T { return x + 1 }
+
 func bump(p *int) int {
 	*p = *p + 5
 	return 3
