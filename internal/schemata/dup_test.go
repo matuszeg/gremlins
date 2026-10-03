@@ -199,7 +199,7 @@ func runDupCases(t *testing.T, cases map[string]dupCase) {
 				site.Muts = append(site.Muts, schemata.Mutant{ID: i + 1, Type: mt})
 			}
 			out, errs := schemata.Render(fset, fset.File(f.Pos()), src, []schemata.Site{site},
-				schemata.NewRewriter(info, []*ast.File{f}, testPrefix, &schemata.HelperSet{}))
+				schemata.NewRewriter(info, nil, []*ast.File{f}, testPrefix, &schemata.HelperSet{}))
 			if tc.want == "" {
 				if len(errs) != 1 || !errors.Is(errs[0].Err, schemata.ErrUnsupported) || !strings.Contains(errs[0].Err.Error(), tc.refusal) {
 					t.Errorf("errors %v; want one ErrUnsupported holding %q", errs, tc.refusal)
@@ -264,8 +264,8 @@ func TestRewritePackageDupTypeError(t *testing.T) {
 			}
 			factory := schemata.RewriterFactory(schemata.NewRewriter)
 			if tc.breakMutant != nil {
-				factory = func(info *types.Info, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
-					rw := schemata.NewRewriter(info, files, prefix, h)
+				factory = func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+					rw := schemata.NewRewriter(info, sizes, files, prefix, h)
 
 					return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
 						out, err := rw(s, inner)

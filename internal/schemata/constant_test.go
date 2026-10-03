@@ -128,7 +128,7 @@ func TestConstantFormsBehave(t *testing.T) {
 	sites, plain := discover(f)
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}
-	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
+	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, nil, []*ast.File{f}, prefix, h))
 	want := refusedMarkers(t, src)
 	refused := map[token.Pos]bool{}
 	refusedLines := map[int]bool{}

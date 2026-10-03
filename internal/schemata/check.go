@@ -61,7 +61,7 @@ var (
 const minGoVersion = "go1.21"
 
 // rewriterFactory makes the Rewriter for one rendering round of a package.
-type rewriterFactory func(info *types.Info, files []*ast.File, prefix string, h *HelperSet) Rewriter
+type rewriterFactory func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *HelperSet) Rewriter
 
 // HelperFileName is the name of the helper file generated into a package
 // whose identifier prefix is prefix.
@@ -74,7 +74,8 @@ func HelperFileName(prefix string) string {
 // included -- with tags, before anything is written: files maps absolute
 // paths in pkg's directory to their new content, for an overlay or a copy.
 //
-// pkg must be loaded with at least NeedTypes, NeedTypesInfo and NeedSyntax,
+// pkg must be loaded with at least NeedTypes, NeedTypesInfo and NeedSyntax --
+// and NeedTypesSizes, or constants are held to the host's integer sizes --
 // and sites must come from pkg.Fset. Each type error is attributed to the
 // innermost placed site whose rendered text contains it; those sites are
 // dropped and the package rendered again from its original source, until it
@@ -137,7 +138,7 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 	}
 	for round := 0; round < rounds; round++ {
 		h := &HelperSet{}
-		rw := newRW(pkg.TypesInfo, pkg.Syntax, prefix, h)
+		rw := newRW(pkg.TypesInfo, pkg.TypesSizes, pkg.Syntax, prefix, h)
 		overlay := map[string][]byte{}
 		spans := map[string][]renderedSpan{}
 		for _, f := range files {
