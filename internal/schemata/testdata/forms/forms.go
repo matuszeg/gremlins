@@ -176,3 +176,48 @@ func Closures() []int {
 	}
 	return out
 }
+
+type mask uint16
+
+type flag bool
+
+func BitInt(a, b int) []int { return []int{a & b, a | b, a ^ b, a &^ b} }
+
+func BitU8(a, b uint8) []uint8 { return []uint8{a & b, a | b, a ^ b, a &^ b} }
+
+func BitMask(a, b mask) []mask { return []mask{a & b, a | b, a ^ b, a &^ b} }
+
+func ShiftU64(x uint64, n int) []uint64 { return []uint64{x << n, x >> n} }
+
+func ShiftI8(x int8, n uint) []int8 { return []int8{x << n, x >> n} }
+
+// ShlUntypedLeft shifts an untyped constant, which takes the type int64
+// from its context.
+func ShlUntypedLeft(n uint) int64 {
+	var x int64 = 1 << n
+	return x
+}
+
+var ticks int
+
+func tick(b bool) bool {
+	ticks++
+	return b
+}
+
+// LandShort and LorShort count whether the right operand was evaluated.
+func LandShort(a, b bool) (bool, int) {
+	ticks = 0
+	r := a && tick(b)
+	return r, ticks
+}
+
+func LorShort(a, b bool) (bool, int) {
+	ticks = 0
+	r := a || tick(b)
+	return r, ticks
+}
+
+func LandNamed(a, b flag) flag { return a && b }
+
+func MaskTest(a, b int, c bool) bool { return a&b == 0 && c }

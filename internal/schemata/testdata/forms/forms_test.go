@@ -53,4 +53,28 @@ func TestPrint(t *testing.T) {
 	show("IncNilMap", func() any { IncNilMap(); return nil })
 	show("GInc", func() any { return []any{GInc([]int{1, 2}), GInc([]float64{1, 2.5})} })
 	show("Closures", func() any { return Closures() })
+	show("BitInt", func() any { return [][]int{BitInt(12, 10), BitInt(0, 7), BitInt(-6, 3)} })
+	show("BitU8", func() any { return [][]uint8{BitU8(12, 10), BitU8(255, 1)} })
+	show("BitMask", func() any { return [][]mask{BitMask(12, 10), BitMask(0xff00, 0x0ff0)} })
+	show("ShiftU64", func() any { return [][]uint64{ShiftU64(12, 2), ShiftU64(1<<63, 63)} })
+	show("ShiftI8", func() any { return [][]int8{ShiftI8(12, 2), ShiftI8(-64, 1), ShiftI8(3, 9)} })
+	show("ShlUntypedLeft", func() any { return []int64{ShlUntypedLeft(0), ShlUntypedLeft(40)} })
+	show("LandShort", func() any {
+		var out []any
+		for _, p := range [][2]bool{{true, true}, {true, false}, {false, true}, {false, false}} {
+			r, n := LandShort(p[0], p[1])
+			out = append(out, r, n)
+		}
+		return out
+	})
+	show("LorShort", func() any {
+		var out []any
+		for _, p := range [][2]bool{{true, true}, {true, false}, {false, true}, {false, false}} {
+			r, n := LorShort(p[0], p[1])
+			out = append(out, r, n)
+		}
+		return out
+	})
+	show("LandNamed", func() any { return []flag{LandNamed(true, true), LandNamed(true, false), LandNamed(false, true)} })
+	show("MaskTest", func() any { return []bool{MaskTest(4, 3, true), MaskTest(4, 4, true), MaskTest(4, 3, false)} })
 }

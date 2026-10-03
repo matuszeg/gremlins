@@ -64,6 +64,12 @@ var arithHelpers = map[token.Token]string{
 	token.ADD: "ADD", token.MUL: "MUL", token.QUO: "QUO", token.REM: "REM",
 }
 
+// bitwiseHelpers names the INVERT_BITWISE helper of each bitwise operator.
+var bitwiseHelpers = map[token.Token]string{
+	token.AND: "AND", token.OR: "OR", token.XOR: "XOR", token.AND_NOT: "ANDNOT",
+	token.SHL: "SHL", token.SHR: "SHR",
+}
+
 // srcRange is a source range that is not itself a node, passed to inner to read
 // the text between and around a site's operands.
 type srcRange struct{ pos, end token.Pos }
@@ -71,8 +77,9 @@ type srcRange struct{ pos, end token.Pos }
 func (s srcRange) Pos() token.Pos { return s.pos }
 func (s srcRange) End() token.Pos { return s.end }
 
-// NewRewriter returns the Rewriter for the default mutators' sites:
-// comparisons, binary and unary arithmetic, and ++/-- statements. Each site
+// NewRewriter returns the Rewriter for the expression mutators' sites:
+// comparisons, binary and unary arithmetic, bitwise operators and shifts,
+// && and ||, and ++/-- statements. Each site
 // becomes one call to a fixed helper prefixed with prefix, recorded in h,
 // whose arguments are the site's operands -- each appearing exactly once, in
 // their original order, with their original line breaks -- so that with no
@@ -109,6 +116,10 @@ func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) 
 	case *ast.BinaryExpr:
 		if err := checkTok(s, n.Op); err != nil {
 			return "", err
+		}
+		// The | of a type union is a BinaryExpr too, but no value.
+		if !r.info.Types[n].IsValue() {
+			return "", fmt.Errorf("%w: %s not in a value expression", ErrUnsupported, n.Op)
 		}
 		if r.info.Types[n].Value != nil {
 			return r.constant(s, n, inner)
@@ -194,7 +205,7 @@ func (r *rewriter) call(name string, ids []int, args ...string) string {
 }
 
 func (r *rewriter) binary(s Site, e *ast.BinaryExpr, inner func(ast.Node) string) (string, error) {
-	switch e.Op { //nolint:exhaustive // only the default mutators' operators have forms; default refuses the rest
+	switch e.Op { //nolint:exhaustive // only the expression mutators' operators have forms; default refuses the rest
 	case token.EQL, token.NEQ:
 		id, err := ids(s, mutator.ConditionalsNegation)
 		if err != nil {
@@ -243,9 +254,137 @@ func (r *rewriter) binary(s Site, e *ast.BinaryExpr, inner func(ast.Node) string
 		}
 
 		return r.call(arithHelpers[e.Op], id, operandText(e, inner)...), nil
+	case token.AND, token.OR, token.XOR, token.AND_NOT:
+		id, err := ids(s, mutator.InvertBitwise)
+		if err != nil {
+			return "", err
+		}
+		if err := r.operands(e, integerConstraint); err != nil {
+			return "", err
+		}
+
+		return r.call(bitwiseHelpers[e.Op], id, operandText(e, inner)...), nil
+	case token.SHL, token.SHR:
+		id, err := ids(s, mutator.InvertBitwise)
+		if err != nil {
+			return "", err
+		}
+
+		return r.shift(e, id, inner)
+	case token.LAND, token.LOR:
+		id, err := ids(s, mutator.InvertLogical)
+		if err != nil {
+			return "", err
+		}
+		if err := r.logicalOperands(e); err != nil {
+			return "", err
+		}
+		// l && r is Xor(id, Xor(id, l) && Xor(id, r)): with the mutant
+		// active, !(!l && !r), which is l || r and, like it, evaluates r
+		// only when l is false; and l || r likewise becomes l && r.
+		ops := operandText(e, inner)
+		x, y := r.call("Xor", id, ops[0]), r.call("Xor", id, ops[1])
+
+		return r.call("Xor", id, x+" "+e.Op.String()+" "+y), nil
 	default:
 		return "", fmt.Errorf("%w: binary %s", ErrUnsupported, e.Op)
 	}
+}
+
+// shift rewrites a non-constant shift. Its result has the left operand's
+// type, which the helper's T is inferred from, and its count may be of any
+// integer type U. A constant left operand (1 << n) takes the type of the
+// context, which inference would not give it, so the helper is instantiated
+// with that type explicitly -- if it is a predeclared integer type, the only
+// kind this can spell without an import.
+func (r *rewriter) shift(e *ast.BinaryExpr, id []int, inner func(ast.Node) string) (string, error) {
+	l, c := r.info.Types[e.X], r.info.Types[e.Y]
+	if l.Type == nil || c.Type == nil {
+		return "", fmt.Errorf("%w: operand without type information", ErrUnsupported)
+	}
+	// An untyped constant count is inferred as its default type: int or
+	// rune, both integers; a float (x << 2.0, legal Go) would not be.
+	if k := basicKind(c.Type); untyped(c.Type) && k != types.UntypedInt && k != types.UntypedRune {
+		return "", fmt.Errorf("%w: shift count of type %v", ErrUnsupported, c.Type)
+	} else if !untyped(c.Type) {
+		if err := satisfies(c.Type, integerConstraint); err != nil {
+			return "", err
+		}
+	}
+	name := bitwiseHelpers[e.Op]
+	if l.Value == nil {
+		if err := satisfies(l.Type, integerConstraint); err != nil {
+			return "", err
+		}
+
+		return r.call(name, id, operandText(e, inner)...), nil
+	}
+	t, ok := r.info.Types[e].Type.(*types.Basic)
+	if !ok || t.Info()&types.IsInteger == 0 || t.Info()&types.IsUntyped != 0 {
+		return "", fmt.Errorf("%w: shift of an untyped constant in a %s context", ErrUnsupported, r.info.Types[e].Type)
+	}
+	out := r.call(name, id, operandText(e, inner)...)
+
+	return r.prefix + name + "[" + t.Name() + "]" + strings.TrimPrefix(out, r.prefix+name), nil
+}
+
+// logicalOperands refuses a && or || whose rewrite would not have its type.
+// Xor returns its operand's type, which for an untyped operand (a
+// comparison, a constant) is bool: in a context of a named boolean type the
+// rewrite would then not compile. go/types records the context's type even
+// for such an operand, so whether an operand is typed is read from its
+// syntax instead.
+func (r *rewriter) logicalOperands(e *ast.BinaryExpr) error {
+	t := r.info.Types[e].Type
+	if t == nil {
+		return fmt.Errorf("%w: operand without type information", ErrUnsupported)
+	}
+	if types.Identical(t, types.Typ[types.Bool]) || types.Identical(t, types.Typ[types.UntypedBool]) {
+		return nil
+	}
+	if !r.typedBool(e.X) || !r.typedBool(e.Y) {
+		return fmt.Errorf("%w: %s of type %v with an operand that may be untyped", ErrUnsupported, e.Op, t)
+	}
+
+	return nil
+}
+
+// typedBool reports whether the boolean x is certainly typed: a variable, a
+// typed constant, a field, a call, an index, a dereference, a type
+// assertion, or ! or a logical operator over such operands.
+func (r *rewriter) typedBool(x ast.Expr) bool {
+	switch x := ast.Unparen(x).(type) {
+	case *ast.Ident:
+		return r.typedObject(x)
+	case *ast.SelectorExpr:
+		if _, ok := r.info.Selections[x]; ok {
+			return true
+		}
+
+		return r.typedObject(x.Sel)
+	case *ast.CallExpr:
+		return !r.info.Types[x.Fun].IsBuiltin()
+	case *ast.IndexExpr, *ast.StarExpr, *ast.TypeAssertExpr:
+		return true
+	case *ast.UnaryExpr:
+		return x.Op == token.NOT && r.typedBool(x.X)
+	case *ast.BinaryExpr:
+		return (x.Op == token.LAND || x.Op == token.LOR) && r.typedBool(x.X) && r.typedBool(x.Y)
+	}
+
+	return false
+}
+
+// typedObject reports whether id names a variable or a typed constant.
+func (r *rewriter) typedObject(id *ast.Ident) bool {
+	switch obj := r.info.Uses[id].(type) {
+	case *types.Var:
+		return true
+	case *types.Const:
+		return !untyped(obj.Type())
+	}
+
+	return false
 }
 
 // operandText splits e's text at its operator: the left operand with the

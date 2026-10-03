@@ -32,7 +32,7 @@ import (
 )
 
 // constMutations mirrors the engine's rewrite table for the operators of the
-// default mutators' expression sites: a constant site's mutated values are
+// expression mutators' sites: a constant site's mutated values are
 // folded from it, so it must rewrite exactly as the engine does (the tests
 // hold it to engine.TokenMutation).
 var constMutations = map[mutator.Type]map[token.Token]token.Token{
@@ -48,6 +48,11 @@ var constMutations = map[mutator.Type]map[token.Token]token.Token{
 		token.GTR: token.LEQ, token.LEQ: token.GTR, token.LSS: token.GEQ,
 	},
 	mutator.InvertNegatives: {token.SUB: token.ADD},
+	mutator.InvertBitwise: {
+		token.AND: token.OR, token.OR: token.AND, token.XOR: token.AND, token.AND_NOT: token.AND,
+		token.SHL: token.SHR, token.SHR: token.SHL,
+	},
+	mutator.InvertLogical: {token.LAND: token.LOR, token.LOR: token.LAND},
 }
 
 func constMutation(mt mutator.Type, tok token.Token) (token.Token, bool) {
@@ -202,7 +207,7 @@ func foldSite(info *types.Info, e ast.Expr, s Site) (folded, error) {
 	switch e := e.(type) {
 	case *ast.BinaryExpr:
 		op = e.Op
-		switch op { //nolint:exhaustive // only the default mutators' operators fold; default refuses the rest
+		switch op { //nolint:exhaustive // only the expression mutators' operators fold; default refuses the rest
 		case token.ADD, token.MUL, token.QUO, token.REM:
 			mts = []mutator.Type{mutator.ArithmeticBase}
 		case token.SUB:
@@ -211,6 +216,10 @@ func foldSite(info *types.Info, e ast.Expr, s Site) (folded, error) {
 			mts = []mutator.Type{mutator.ConditionalsBoundary, mutator.ConditionalsNegation}
 		case token.EQL, token.NEQ:
 			mts = []mutator.Type{mutator.ConditionalsNegation}
+		case token.AND, token.OR, token.XOR, token.AND_NOT, token.SHL, token.SHR:
+			mts = []mutator.Type{mutator.InvertBitwise}
+		case token.LAND, token.LOR:
+			mts = []mutator.Type{mutator.InvertLogical}
 		}
 	case *ast.UnaryExpr:
 		op = e.Op
@@ -250,7 +259,7 @@ func foldSite(info *types.Info, e ast.Expr, s Site) (folded, error) {
 
 // fold evaluates e with its operator replaced by op, as go/types folds a
 // constant expression: exactly, with integer division when the operands'
-// type is an integer type.
+// type is an integer type, and bitwise operators and shifts on integers.
 func fold(info *types.Info, e ast.Expr, op token.Token) (constant.Value, error) {
 	switch e := e.(type) {
 	case *ast.UnaryExpr:
@@ -264,6 +273,16 @@ func fold(info *types.Info, e ast.Expr, op token.Token) (constant.Value, error) 
 		x, y := info.Types[e.X].Value, info.Types[e.Y].Value
 		if x == nil || y == nil {
 			return nil, fmt.Errorf("%w: operand without a constant value", ErrUnsupported)
+		}
+		switch op { //nolint:exhaustive // the comparisons and the rest are handled below
+		case token.LAND, token.LOR:
+			if x.Kind() != constant.Bool || y.Kind() != constant.Bool {
+				return nil, fmt.Errorf("%w: logical operands %v and %v", ErrUnsupported, x, y)
+			}
+
+			return constant.BinaryOp(x, op, y), nil
+		case token.AND, token.OR, token.XOR, token.AND_NOT, token.SHL, token.SHR:
+			return foldBitwise(x, op, y)
 		}
 		if op.IsOperator() && op.Precedence() == token.EQL.Precedence() {
 			return constant.MakeBool(constant.Compare(x, op, y)), nil
@@ -291,6 +310,29 @@ func fold(info *types.Info, e ast.Expr, op token.Token) (constant.Value, error) 
 	return nil, fmt.Errorf("%w: constant %T", ErrUnsupported, e)
 }
 
+// foldBitwise folds a bitwise operator or a shift. Its operands are
+// integers, or untyped constants of integer value; a shift count is
+// non-negative and, in a program that type-checks, small.
+func foldBitwise(x constant.Value, op token.Token, y constant.Value) (constant.Value, error) {
+	x, y = constant.ToInt(x), constant.ToInt(y)
+	if x.Kind() != constant.Int || y.Kind() != constant.Int {
+		return nil, fmt.Errorf("%w: bitwise operands %v and %v", ErrUnsupported, x, y)
+	}
+	if op != token.SHL && op != token.SHR {
+		return constant.BinaryOp(x, op, y), nil
+	}
+	n, exact := constant.Uint64Val(y)
+	if !exact || n > maxShiftCount {
+		return nil, fmt.Errorf("%w: shift count %v", ErrUnsupported, y)
+	}
+
+	return constant.Shift(x, op, uint(n)), nil
+}
+
+// maxShiftCount bounds a folded shift's count, as go/types bounds a constant
+// shift's: anything it accepts is far below.
+const maxShiftCount = 1 << 12
+
 func numeric(v constant.Value) bool {
 	return v.Kind() == constant.Int || v.Kind() == constant.Float
 }
@@ -305,13 +347,17 @@ func integerOperation(info *types.Info, e *ast.BinaryExpr) bool {
 }
 
 // operationOperand returns the operand of e whose type the operation has:
-// the typed one, or, both untyped, the one of larger kind (int < rune <
-// float < complex, which is the order of the untyped basic kinds).
+// a shift's left operand; else the typed one, or, both untyped, the one of
+// larger kind (int < rune < float < complex, which is the order of the
+// untyped basic kinds).
 func operationOperand(info *types.Info, e ast.Expr) ast.Expr {
 	switch e := e.(type) {
 	case *ast.UnaryExpr:
 		return e.X
 	case *ast.BinaryExpr:
+		if e.Op == token.SHL || e.Op == token.SHR {
+			return e.X
+		}
 		lt, rt := info.Types[e.X].Type, info.Types[e.Y].Type
 		switch {
 		case !untyped(lt):

@@ -170,6 +170,12 @@ func {{.}}IncDecMap[M ~map[K]V, K comparable, V {{.}}Number](id int, m M, k K, i
 	}
 }
 `),
+	arith("AND", "Integer", "&", "|"),
+	arith("OR", "Integer", "|", "&"),
+	arith("XOR", "Integer", "^", "&"),
+	arith("ANDNOT", "Integer", "&^", "&"),
+	shift("SHL", "<<", ">>"),
+	shift("SHR", ">>", "<<"),
 }
 
 // ordered is a comparison helper: idB is CONDITIONALS_BOUNDARY, idN is
@@ -190,10 +196,25 @@ func {{.}}`+name+`[T {{.}}cmp.Ordered](idB, idN int, l, r T) bool {
 `)
 }
 
-// arith is an ARITHMETIC_BASE helper for one binary operator.
+// arith is the helper of a binary operator with one mutant at its sites:
+// ARITHMETIC_BASE, or INVERT_BITWISE for a bitwise operator.
 func arith(name, constraint, op, mutated string) helperDef {
 	return def(name, true, []string{constraint}, nil, `
 func {{.}}`+name+`[T {{.}}`+constraint+`](id int, l, r T) T {
+	if id != 0 && {{.}}Active == id {
+		{{.}}Reached()
+		return l `+mutated+` r
+	}
+	return l `+op+` r
+}
+`)
+}
+
+// shift is an INVERT_BITWISE helper for a shift, whose count may be of any
+// integer type.
+func shift(name, op, mutated string) helperDef {
+	return def(name, true, []string{"Integer"}, nil, `
+func {{.}}`+name+`[T {{.}}Integer, U {{.}}Integer](id int, l T, r U) T {
 	if id != 0 && {{.}}Active == id {
 		{{.}}Reached()
 		return l `+mutated+` r
