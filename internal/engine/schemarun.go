@@ -19,6 +19,7 @@ package engine
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -102,6 +103,13 @@ func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, al
 
 		return d.NewExecutor(mut, outCh, wg)
 	})
+	if dir := os.Getenv(SchemataKeepEnv); dir != "" {
+		if err := keepSchemata(dir, plan); err != nil {
+			log.Errorf("schemata: cannot keep the build in %s: %v\n", dir, err)
+		} else {
+			log.Infof("schemata: build kept in %s\n", dir)
+		}
+	}
 	// Counted, not taken from the plan: a placed mutant counts as placed only
 	// once its executor has judged it against the binaries.
 	res.Schemata = &report.SchemataSummary{
@@ -110,6 +118,72 @@ func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, al
 	}
 
 	return res
+}
+
+// SchemataKeepEnv names the environment variable that keeps a --schemata
+// run's build: set to a directory, the run copies into it, before its work
+// directory is removed, every test binary (bin/), every rewritten or added
+// source file (src/, relative to the module root) and index.json, which maps
+// each placed mutant's id to its position, type and package, and each package
+// to its kept binary. A kept binary runs a mutant as the run did: in its
+// package's directory, with GREMLINS_MUTANT=<id>, and GREMLINS_REACHED=<file>
+// to learn whether the mutant's site ran.
+const SchemataKeepEnv = "GREMLINS_SCHEMATA_KEEP"
+
+// keptIndex is the index.json of a kept schema build.
+type keptIndex struct {
+	Binaries map[string]string `json:"binaries"`
+	Source   string            `json:"source"`
+	Mutants  []keptMutant      `json:"mutants"`
+}
+
+type keptMutant struct {
+	Position string `json:"position"`
+	Type     string `json:"type"`
+	Package  string `json:"package"`
+	ID       int    `json:"id"`
+}
+
+// keepSchemata copies plan's build into dir, as SchemataKeepEnv describes.
+func keepSchemata(dir string, plan schemata.Plan) error {
+	b := plan.Build
+	idx := keptIndex{Binaries: map[string]string{}, Source: filepath.Join(dir, "src")}
+	for _, pkg := range slices.Sorted(maps.Keys(b.Binaries)) {
+		dst := filepath.Join(dir, "bin", filepath.Base(b.Binaries[pkg]))
+		if err := copyFile(b.Binaries[pkg], dst, 0o700); err != nil {
+			return err
+		}
+		idx.Binaries[pkg] = dst
+	}
+	for _, rel := range b.Rewritten {
+		if err := copyFile(filepath.Join(b.Dir, rel), filepath.Join(idx.Source, rel), 0o600); err != nil {
+			return err
+		}
+	}
+	for _, p := range plan.Placed {
+		idx.Mutants = append(idx.Mutants, keptMutant{
+			ID: p.ID, Position: p.Mutator.Position().String(), Type: p.Mutator.Type().String(), Package: p.Mutator.Pkg(),
+		})
+	}
+	data, err := json.MarshalIndent(idx, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filepath.Join(dir, "index.json"), data, 0o600)
+}
+
+// copyFile copies src to dst with mode perm, making dst's directory.
+func copyFile(src, dst string, perm os.FileMode) error {
+	data, err := os.ReadFile(src) //nolint:gosec // G304: a file of the run's own build
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+
+	return os.WriteFile(dst, data, perm)
 }
 
 // prepareSchemata runs Prepare over runnable in a fresh directory of the

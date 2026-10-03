@@ -129,6 +129,7 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 			continue
 		}
 		plan.Placed = append(plan.Placed, Placed{Mutator: m, ID: i + 1})
+		log.Infof("schemata: id %d = %s %s\n", i+1, m.Position(), m.Type())
 	}
 	log.Infof("schemata: %d mutants placed, %d netted\n", len(plan.Placed), len(plan.Netted))
 
