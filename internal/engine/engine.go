@@ -214,11 +214,14 @@ func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.F
 
 	pkg := mu.pkgName(fileName, file.Name.Name)
 	position := set.Position(node.TokPos)
+	// The token is read once, before the first of its mutants is handed out:
+	// the mutants share the node, and a worker applying one rewrites it.
+	tok := node.Tok()
 	for _, mt := range mutantTypes {
 		if !configuration.Get[bool](configuration.MutantTypeEnabledKey(mt)) {
 			continue
 		}
-		if !mu.viable(position, node.Tok(), mt) {
+		if !mu.viable(position, tok, mt) {
 			continue
 		}
 		mutantType := mt
