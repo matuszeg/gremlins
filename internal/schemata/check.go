@@ -19,6 +19,7 @@ package schemata
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -82,9 +83,10 @@ func HelperFileName(prefix string) string {
 // error inside no placed site drops every site of the package with
 // ErrUnattributable. Every input mutant ends in exactly one of placed and
 // dropped: a site some of whose mutants are dropped is in both, each with its
-// own. When no site is placed, files is empty.
-func RewritePackage(pkg *packages.Package, sites []Site, tags string) (map[string][]byte, []Site, []SiteError) {
-	return rewritePackage(pkg, sites, tags, NewRewriter)
+// own. When no site is placed, files is empty. The type-checks load packages
+// under ctx; once it ends, every site still placed is dropped.
+func RewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, tags string) (map[string][]byte, []Site, []SiteError) {
+	return rewritePackage(ctx, pkg, sites, tags, NewRewriter)
 }
 
 // sourceFile is one file of the package that holds a site.
@@ -111,7 +113,7 @@ type mutantKey struct {
 	id   int
 }
 
-func rewritePackage(pkg *packages.Package, sites []Site, tags string, newRW rewriterFactory) (map[string][]byte, []Site, []SiteError) {
+func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, tags string, newRW rewriterFactory) (map[string][]byte, []Site, []SiteError) {
 	if len(sites) == 0 {
 		return nil, nil, nil
 	}
@@ -158,7 +160,7 @@ func rewritePackage(pkg *packages.Package, sites []Site, tags string, newRW rewr
 		}
 		overlay[helperPath] = helper
 
-		typeErrs, err := typeCheck(pkg.Dir, overlay, tags)
+		typeErrs, err := typeCheck(ctx, pkg.Dir, overlay, tags)
 		if err != nil {
 			return nil, nil, dropAll(dropped, liveSites(files), fmt.Errorf("%w: %w", ErrUnattributable, err))
 		}
@@ -338,8 +340,8 @@ type typeError struct {
 }
 
 // typeCheck loads the package in dir -- with its tests -- with overlay laid
-// over its files, and returns every error of the loaded packages.
-func typeCheck(dir string, overlay map[string][]byte, tags string) ([]typeError, error) {
+// over its files, under ctx, and returns every error of the loaded packages.
+func typeCheck(ctx context.Context, dir string, overlay map[string][]byte, tags string) ([]typeError, error) {
 	cfg := &packages.Config{
 		// NeedDeps type-checks the dependencies from source. Without it the
 		// loader asks `go list -export` for their export data, which
@@ -347,6 +349,7 @@ func typeCheck(dir string, overlay map[string][]byte, tags string) ([]typeError,
 		// reports its type errors again, without a position.
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps | packages.NeedTypes | packages.NeedSyntax,
+		Context: ctx,
 		Dir:     dir,
 		Tests:   true,
 		Overlay: overlay,

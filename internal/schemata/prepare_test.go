@@ -523,6 +523,24 @@ func TestPrepareBuildSet(t *testing.T) {
 	}
 }
 
+// TestPrepareStopsLoadingWhenCancelled cancels Prepare while it loads and
+// type-checks the fixture's packages and requires it to return the
+// context's error within two seconds: the loads must honour the context.
+func TestPrepareStopsLoadingWhenCancelled(t *testing.T) {
+	t.Parallel()
+	mod := prepareModule(t)
+	in := streamMutants(t, mod)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	runs := &nullRuns{}
+	_, err := schemata.Prepare(ctx, mod, t.TempDir(), "", in, ownPackage, time.Minute, runs.run)
+	if el := time.Since(start); !errors.Is(err, context.Canceled) || el > 2*time.Second {
+		t.Errorf("Prepare cancelled during its loads: err = %v after %s, want context.Canceled within 2s", err, el)
+	}
+}
+
 // movedMutant reports a different line or package than the mutant it wraps.
 type movedMutant struct {
 	mutator.Mutator
