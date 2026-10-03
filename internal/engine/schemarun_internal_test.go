@@ -189,34 +189,11 @@ func writeScript(t *testing.T, body string) string {
 func TestSchemaNullRun(t *testing.T) {
 	t.Setenv("GREMLINS_MUTANT", "7")
 	t.Setenv("GREMLINS_REACHED", "/nowhere")
-	dealer := MutantExecutorDealer{execContext: exec.CommandContext, testExecutionTime: 3 * time.Second}
+	dealer := MutantExecutorDealer{execContext: exec.CommandContext, testExecutionTime: 3 * time.Second, wdDealer: wdStub{dir: t.TempDir()}}
 	cpuDealer := dealer
 	cpuDealer.testCPU = 2
 
-	t.Run("invocation", func(t *testing.T) {
-		out := filepath.Join(t.TempDir(), "out")
-		bin := writeScript(t, `{ echo "$@"; pwd; env; } > `+out)
-		dir := t.TempDir()
-		if err := cpuDealer.nullRun(context.Background(), bin, dir, "", []string{"TestA", "TestB"}); err != nil {
-			t.Fatalf("nullRun: %v", err)
-		}
-		raw, err := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
-		if err != nil {
-			t.Fatal(err)
-		}
-		lines := strings.Split(string(raw), "\n")
-		if want := "-test.count=1 -test.timeout 3s -test.failfast -test.paniconexit0 -test.run ^(TestA|TestB)$ -test.cpu 2"; lines[0] != want {
-			t.Errorf("args = %q, want %q", lines[0], want)
-		}
-		if lines[1] != dir {
-			t.Errorf("dir = %s, want %s", lines[1], dir)
-		}
-		for _, l := range lines[2:] {
-			if strings.HasPrefix(l, "GREMLINS_MUTANT=") || strings.HasPrefix(l, "GREMLINS_REACHED=") {
-				t.Errorf("the null run's environment has %s", l)
-			}
-		}
-	})
+	t.Run("invocation", func(t *testing.T) { testNullRunInvocation(t, cpuDealer) })
 
 	t.Run("whole_suite", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out")
@@ -387,6 +364,43 @@ func TestSchemaNullRunLeavesTheModuleTree(t *testing.T) {
 	if _, err := os.Stat(out); !os.IsNotExist(err) {
 		_ = os.Remove(out)
 		t.Errorf("the null run wrote %s into the module tree: %v", out, err)
+	}
+}
+
+// testNullRunInvocation checks the null run's flags, directory and
+// environment.
+func testNullRunInvocation(t *testing.T, d MutantExecutorDealer) {
+	t.Helper()
+	out := filepath.Join(t.TempDir(), "out")
+	bin := writeScript(t, `{ echo "$@"; pwd; env; } > `+out)
+	dir := t.TempDir()
+	work := t.TempDir()
+	d.wdDealer = wdStub{dir: work}
+	if err := d.nullRun(context.Background(), bin, dir, "", []string{"TestA", "TestB"}); err != nil {
+		t.Fatalf("nullRun: %v", err)
+	}
+	raw, err := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	if want := "-test.count=1 -test.timeout 3s -test.failfast -test.paniconexit0 -test.run ^(TestA|TestB)$ -test.cpu 2"; lines[0] != want {
+		t.Errorf("args = %q, want %q", lines[0], want)
+	}
+	if lines[1] != dir {
+		t.Errorf("dir = %s, want %s", lines[1], dir)
+	}
+	gotmp := ""
+	for _, l := range lines[2:] {
+		if strings.HasPrefix(l, "GREMLINS_MUTANT=") || strings.HasPrefix(l, "GREMLINS_REACHED=") {
+			t.Errorf("the null run's environment has %s", l)
+		}
+		if v, ok := strings.CutPrefix(l, "GOTMPDIR="); ok {
+			gotmp = v
+		}
+	}
+	if gotmp != work {
+		t.Errorf("GOTMPDIR = %q, want the work directory %s, as a mutant's run", gotmp, work)
 	}
 }
 
