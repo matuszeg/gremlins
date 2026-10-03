@@ -74,7 +74,8 @@ type Build struct {
 // files RewritePackage returned for it, keyed by absolute path under modRoot
 // -- and compiles the test binary of every package in testPkgs in the copy
 // with `go test -c -overlay`, which lays the rewritten files over the copy's,
-// at most runtime.NumCPU() at a time, all within allowance. A package
+// at most runtime.NumCPU() at a time, all within allowance (a path listed
+// twice is built once). A package
 // whose files cannot be written or whose binary does not build has its error
 // in the returned map and no binary; the other packages keep theirs. A
 // package that builds without test files is in Build.NoTests, with neither.
@@ -82,6 +83,8 @@ type Build struct {
 func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[string]map[string][]byte,
 	testPkgs []string, allowance time.Duration,
 ) (Build, map[string]error) {
+	// A path listed twice would start two `go test -c` writing one binary.
+	testPkgs = uniquePackages(testPkgs)
 	errs := map[string]error{}
 	failAll := func(err error) (Build, map[string]error) {
 		for _, p := range testPkgs {
@@ -169,6 +172,20 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 	wg.Wait()
 
 	return b, errs
+}
+
+// uniquePackages returns pkgs without repeats, each at its first position.
+func uniquePackages(pkgs []string) []string {
+	seen := make(map[string]bool, len(pkgs))
+	out := make([]string, 0, len(pkgs))
+	for _, p := range pkgs {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+
+	return out
 }
 
 // writeFiles writes files, keyed by absolute path under modRoot, to the same
