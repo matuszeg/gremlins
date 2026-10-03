@@ -81,8 +81,8 @@ const nullFailed = "null-mutant run failed: "
 //
 // A mutant is netted when it maps to no operator in the loaded source, when
 // the rewrite drops its site, when testPkgs names no package for its package,
-// or when the build or the second null run of a package testPkgs names for it
-// fails. A netted mutant has a reason and an error log line carrying the
+// when its package's rewritten files cannot be written, or when the build or
+// the second null run of a package testPkgs names for it fails. A netted mutant has a reason and an error log line carrying the
 // reason's first line, cut to 200 bytes; a reason the line cuts is logged
 // whole once per package. Every mutant of runnable ends in exactly one of
 // Placed and Netted. Prepare writes nothing outside workDir, which the caller
@@ -367,13 +367,16 @@ func (p *preparer) netUnselected(need map[string][]string) {
 }
 
 // netFailed nets every still-placed mutant whose own package, or a package
-// need lists for it, failed.
+// need lists for it, failed. The own package counts even when need does not
+// list it: BuildAll records a failure to write a package's rewritten files
+// under that package, and then no binary compiles its mutants in.
 func (p *preparer) netFailed(need map[string][]string, failed map[string]string) {
 	for i := range p.muts {
 		if p.reasons[i] != "" {
 			continue
 		}
-		for _, pkg := range need[p.pkgOf[i]] {
+		own := p.pkgOf[i]
+		for _, pkg := range append([]string{own}, need[own]...) {
 			if r, ok := failed[pkg]; ok {
 				p.net(i, r)
 
