@@ -230,8 +230,8 @@ func TestReportSchemataSummary(t *testing.T) {
 		want    string
 	}{
 		"with_schemata":    {summary: &report.SchemataSummary{Placed: 3, PerMutant: 2}, want: "Mutator coverage: 100.00%\nSchemata: placed 3, per-mutant path 2\n"},
-		"dry_run":          {summary: &report.SchemataSummary{NotUsed: "dry run"}, want: "Mutator coverage: 100.00%\nSchemata: not used (dry run)\n"},
-		"integration_mode": {summary: &report.SchemataSummary{PerMutant: 4, NotUsed: "integration mode"}, want: "Mutator coverage: 100.00%\nSchemata: not used (integration mode)\n"},
+		"dry_run":          {summary: &report.SchemataSummary{NotUsed: "dry run"}, want: "Mutator coverage: 100.00%\nSchemata: not used (dry run), per-mutant path 0\n"},
+		"integration_mode": {summary: &report.SchemataSummary{PerMutant: 4, NotUsed: "integration mode"}, want: "Mutator coverage: 100.00%\nSchemata: not used (integration mode), per-mutant path 4\n"},
 		"without_schemata": {want: "Mutator coverage: 100.00%\n"},
 	}
 	for name, tc := range testCases {

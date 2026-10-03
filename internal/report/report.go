@@ -185,7 +185,7 @@ func (r *reportStatus) reportFindings() {
 	}
 	if r.schemata != nil {
 		if r.schemata.NotUsed != "" {
-			log.Infof("Schemata: not used (%s)\n", r.schemata.NotUsed)
+			log.Infof("Schemata: not used (%s), per-mutant path %d\n", r.schemata.NotUsed, r.schemata.PerMutant)
 		} else {
 			log.Infof("Schemata: placed %d, per-mutant path %d\n", r.schemata.Placed, r.schemata.PerMutant)
 		}
