@@ -41,3 +41,9 @@ func TestDiff(t *testing.T) {
 		t.Error("Diff(3, 1) != 2")
 	}
 }
+
+func TestMix(t *testing.T) {
+	if Mix(1, 2, 1) != 3 {
+		t.Error("Mix(1, 2, 1) != 3")
+	}
+}
