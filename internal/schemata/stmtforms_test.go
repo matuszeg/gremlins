@@ -221,11 +221,30 @@ func TestStmtFormsBehave(t *testing.T) {
 	}
 	t.Logf("not viable: %v", goneAssign)
 
+	// The fixture must hold the helper form of a shift whose count is a
+	// constant, with its x = count mutant: SimpleShiftConst's nine sites.
+	start := bytes.Index(fx.src, []byte("\nfunc SimpleShiftConst("))
+	end := start + bytes.Index(fx.src[start:], []byte("\n}\n"))
+	if start < 0 || end < start {
+		t.Fatal("fixture has no SimpleShiftConst")
+	}
+	constShifts := 0
+	for _, p := range fx.plain {
+		off := fx.fset.Position(p.pos).Offset
+		if p.mt == mutator.RemoveSelfAssignments && off > start && off < end {
+			constShifts++
+		}
+	}
+	if constShifts != 9 {
+		t.Errorf("SimpleShiftConst has %d viable REMOVE_SELF_ASSIGNMENTS mutants, want 9", constShifts)
+	}
+
 	// The fixture must exercise what it is there for: each side effect
 	// once, the label taken, the closures per iteration.
 	fx.runBehave(t, []string{
 		"AddAssignSideEffectLHS: [[1 4 3] 1]\n", "AddAssignSideEffectRHS: [6 1]\n",
 		"MapAssignNamedMap: [map[a:9 b:9] 2]\n", "LabelledAssign: [4 13]\n", "ForPostAddAssign: [0 3 6 9]\n",
+		"SimpleShiftConst: [[48 6 96 6] map[0:48 1:1 2:24] 128 33]\n",
 	})
 }
 

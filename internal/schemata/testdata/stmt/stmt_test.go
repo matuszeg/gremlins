@@ -41,6 +41,7 @@ func TestPrint(t *testing.T) {
 	show("IfInitAssign", func() any { return []int{IfInitAssign(1), IfInitAssign(5)} })
 	show("SimpleInt", func() any { v, m := SimpleInt(13, 5); return []any{v, m} })
 	show("SimpleShift", func() any { v, m := SimpleShift(12, 2, 1); return []any{v, m} })
+	show("SimpleShiftConst", func() any { v, m, b, c := SimpleShiftConst(12, 3); return []any{v, m, b, c} })
 	show("SimpleFloat", func() any { x, m := SimpleFloat(7, 4); return []any{x, m} })
 	show("SimpleString", func() any { s, m := SimpleString("a", "b"); return []any{s, m} })
 }
