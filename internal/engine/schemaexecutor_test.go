@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -246,6 +247,9 @@ func (s *substExec) exec(ctx context.Context, name string, args ...string) *exec
 // for, to a script.
 func newSubstExec(t *testing.T, bodies map[string]string) *substExec {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs /bin/sh")
+	}
 	s := &substExec{scripts: map[string]string{}}
 	dir := t.TempDir()
 	for bin, body := range bodies {

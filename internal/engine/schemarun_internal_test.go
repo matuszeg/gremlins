@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -172,9 +173,19 @@ func TestSchemaTargetsAreTheExecutorSelection(t *testing.T) {
 	}
 }
 
+// skipWithoutShell skips a test whose stand-in test binary is a /bin/sh
+// script: Windows, which the CI matrix includes, has none.
+func skipWithoutShell(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("needs /bin/sh")
+	}
+}
+
 // writeScript writes an executable shell script standing in for a test binary.
 func writeScript(t *testing.T, body string) string {
 	t.Helper()
+	skipWithoutShell(t)
 	path := filepath.Join(t.TempDir(), "pkg.test")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil { //nolint:gosec // G306: the script must be executable
 		t.Fatal(err)
@@ -188,6 +199,7 @@ func writeScript(t *testing.T, body string) string {
 //
 // It is not parallel: it sets GREMLINS_MUTANT in the environment.
 func TestSchemaNullRun(t *testing.T) {
+	skipWithoutShell(t)
 	t.Setenv("GREMLINS_MUTANT", "7")
 	t.Setenv("GREMLINS_REACHED", "/nowhere")
 	dealer := MutantExecutorDealer{execContext: exec.CommandContext, testExecutionTime: 3 * time.Second, wdDealer: wdStub{dir: t.TempDir()}}
