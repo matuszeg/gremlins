@@ -398,11 +398,16 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 }
 
 // writeOverlayFile writes into tmpDir the overlay file that points each file
-// of build.Rewritten under root at build's copy of it, and returns its path.
+// of build.Rewritten, under root and under build.Dir, at build's copy of it,
+// and returns its path. build.Dir is in it because the binaries were built
+// there: runtime.Caller in a test names a file of build.Dir, and a test that
+// runs the go command from that directory must build the rewrite, as it
+// builds the mutated worker copy without schemata.
 func writeOverlayFile(build *schemata.Build, root, tmpDir string) (string, error) {
-	replace := make(map[string]string, len(build.Rewritten))
+	replace := make(map[string]string, 2*len(build.Rewritten))
 	for _, rel := range build.Rewritten {
 		replace[filepath.Join(root, rel)] = filepath.Join(build.Src, rel)
+		replace[filepath.Join(build.Dir, rel)] = filepath.Join(build.Src, rel)
 	}
 	data, err := json.Marshal(struct{ Replace map[string]string }{replace})
 	if err != nil {
