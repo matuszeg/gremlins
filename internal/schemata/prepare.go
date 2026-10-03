@@ -190,11 +190,21 @@ func (p *preparer) file(i int) string {
 // import paths of the packages with a placed site, in stream order.
 func (p *preparer) rewrite(ctx context.Context, tags string) (map[string]map[string][]byte, []string) {
 	p.pkgOf = make([]string, len(p.muts))
-	var dirs []string
+	dirs := make([]string, len(p.muts))
+	var patterns []string
 	for i := range p.muts {
-		dirs = append(dirs, filepath.Dir(p.file(i)))
+		dirs[i] = filepath.Dir(p.file(i))
+		// A directory outside the module root cannot be loaded as one of its
+		// packages; its mutants alone take the per-mutant path.
+		pattern, ok := loadPattern(p.mod.Root, dirs[i])
+		if !ok {
+			p.net(i, fmt.Sprintf("schemata: %s is not under the module root %s", dirs[i], p.mod.Root))
+
+			continue
+		}
+		patterns = append(patterns, pattern)
 	}
-	pkgs, err := loadPackages(ctx, p.mod.Root, tags, dirs)
+	pkgs, err := loadPackages(ctx, p.mod.Root, tags, patterns)
 	if err != nil {
 		for i := range p.muts {
 			p.net(i, err.Error())
@@ -334,7 +344,7 @@ func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]st
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		dir, ok := moduleDir(p.mod, pkg)
+		dir, ok := p.mod.PackageDir(p.mod.Root, pkg)
 		if !ok {
 			failed[pkg] = fmt.Sprintf("schemata: %s is not a package of module %s", pkg, p.mod.Name)
 
@@ -386,16 +396,22 @@ func (p *preparer) netFailed(need map[string][]string, failed map[string]string)
 	}
 }
 
-// loadPackages loads the packages in dirs, under modRoot, with what
-// RewritePackage needs, under ctx.
-func loadPackages(ctx context.Context, modRoot, tags string, dirs []string) ([]*packages.Package, error) {
-	var patterns []string
-	for _, d := range dirs {
-		rel, err := filepath.Rel(modRoot, d)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("schemata: %s is not under the module root %s", d, modRoot)
-		}
-		patterns = append(patterns, "./"+filepath.ToSlash(rel))
+// loadPattern is the go/packages pattern, relative to modRoot, of the
+// package in directory dir, or false when dir is not under modRoot.
+func loadPattern(modRoot, dir string) (string, bool) {
+	rel, err := filepath.Rel(modRoot, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+
+	return "./" + filepath.ToSlash(rel), true
+}
+
+// loadPackages loads the packages the patterns name, under modRoot, with
+// what RewritePackage needs, under ctx.
+func loadPackages(ctx context.Context, modRoot, tags string, patterns []string) ([]*packages.Package, error) {
+	if len(patterns) == 0 {
+		return nil, nil
 	}
 	slices.Sort(patterns)
 	patterns = slices.Compact(patterns)
@@ -414,19 +430,6 @@ func loadPackages(ctx context.Context, modRoot, tags string, dirs []string) ([]*
 	}
 
 	return pkgs, nil
-}
-
-// moduleDir maps an import path of mod to its directory under mod.Root.
-func moduleDir(mod gomodule.GoModule, pkg string) (string, bool) {
-	if pkg == mod.Name {
-		return mod.Root, true
-	}
-	rel, ok := strings.CutPrefix(pkg, mod.Name+"/")
-	if !ok || rel == "" {
-		return "", false
-	}
-
-	return filepath.Join(mod.Root, filepath.FromSlash(rel)), true
 }
 
 // shortReasonLimit bounds, in bytes, the reason a netted mutant's log line
