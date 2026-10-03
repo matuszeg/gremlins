@@ -60,6 +60,9 @@ type siteNode struct {
 	// fallback is set when the rewrite failed and rendered is the site's
 	// original text, with its nested sites rendered.
 	fallback bool
+	// dup is set when the site keeps its text and its mutants are placed by
+	// duplicating its function; fallback is then set too.
+	dup *dupError
 }
 
 // Render returns src, the bytes of file, with every site replaced by its
@@ -71,6 +74,13 @@ type siteNode struct {
 // lie in file. If src is not file.Size() bytes, every site is reported and
 // src is returned unchanged.
 //
+// A site whose rewrite asks for duplication -- a compile-time site in a
+// function body, see NewRewriter -- keeps its text too, and is placed: the
+// function's duplicates are appended after the last line, and a jump into
+// each, and names for its unnamed parameters, are spliced into the
+// function's signature line and opening-brace line, so that still no line
+// moves.
+//
 // Caller contract: sites must come from fset. A token.Pos is a plain offset
 // into fset, so a node from a different FileSet whose position happens to
 // fall inside file cannot be detected and is spliced as if it were file's.
@@ -80,8 +90,9 @@ func Render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw 
 	return out, errs
 }
 
-// render is Render, also returning the rendered containment forest.
-func render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []*siteNode, []SiteError) {
+// render is Render, also returning the rendered byte range of every placed
+// site, and of each duplicate's text, attributed to its mutant.
+func render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []renderedSpan, []SiteError) {
 	if file == nil || file.Size() != len(src) {
 		errs := make([]SiteError, 0, len(sites))
 		for _, s := range sites {
@@ -94,8 +105,9 @@ func render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw 
 	for _, r := range roots {
 		errs = renderNode(fset, file, src, r, rw, errs)
 	}
+	out, spans, dupErrs := placeDups(fset, src, []byte(splice(src, 0, len(src), roots)), roots, layoutSpans(roots))
 
-	return []byte(splice(src, 0, len(src), roots)), roots, errs
+	return out, spans, append(errs, dupErrs...)
 }
 
 // buildForest nests each site under the smallest site containing it.
@@ -162,7 +174,12 @@ func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, 
 	}
 	original := splice(src, n.start, n.end, n.children)
 	text, err := rw(n.site, inner)
+	var dup *dupError
 	switch {
+	case errors.As(err, &dup):
+		text = original
+		n.fallback = true
+		n.dup = dup
 	case err != nil:
 		errs = append(errs, SiteError{Site: n.site, Err: err})
 		text = original

@@ -139,7 +139,7 @@ func renderFixture(t *testing.T, name string, mts []mutator.Type) *stmtFixture {
 	if t.Failed() {
 		t.FailNow()
 	}
-	if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
+	if got, want := bytes.Count(beforeDuplicates(out), []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
 		t.Fatalf("rewrite has %d lines, original %d", got, want)
 	}
 	fx.schemaBin = buildFixture(t, map[string][]byte{

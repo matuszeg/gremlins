@@ -326,7 +326,7 @@ func TestNewRewriter(t *testing.T) {
 		"const_float_assign":     {src: "func f() float64 { var r float64; r = 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&r)"},
 		// Constant-valued sites that stay refused.
 		"const_decl":                {src: "const k = 2 * 3", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_decl_local":          {src: "func f() int { const k = 1 + 2; return k }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_decl_local":          {src: "func f() int { const k = 1 + 2; return k }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "placed by duplicating f"},
 		"const_decl_len":            {src: "const k = len([3]int{1 + 1})", tok: token.ADD, muts: []mutator.Type{ab}},
 		"const_operand":             {src: "func f() int { return 2*3 + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},
 		"const_operand_paren":       {src: "func f() int { return (2 * 3) + 1 }", tok: token.MUL, muts: []mutator.Type{ab}},

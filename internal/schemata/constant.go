@@ -66,15 +66,21 @@ func constMutation(mt mutator.Type, tok token.Token) (token.Token, bool) {
 const maxWitnessArity = 4
 
 // constant rewrites the constant-valued site e. A constant is folded at
-// compile time and may be needed there, so it is refused where Go requires
-// one -- anywhere in a const declaration, an array length, a composite
-// literal key -- and where it is itself an operand of a larger constant
-// expression, which keeps the site's mutants out of the outer folding. The
-// replacement keeps the line count of the text it replaces.
+// compile time and may be needed there, so it cannot take a constant form
+// where Go requires one -- anywhere in a const declaration, an array length,
+// a constant composite literal key -- nor where it is itself an operand of a
+// larger constant expression, which keeps the site's mutants out of the
+// outer folding. In the first three, inside a function declaration's body,
+// the site is placed by duplicating the function (see dupSite); elsewhere,
+// and in the fourth, it is refused. The replacement keeps the line count of
+// the text it replaces.
 func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (string, error) {
-	ctx, err := r.context(e)
+	ctx, fn, err := r.context(e)
 	if err != nil {
 		return "", err
+	}
+	if fn != nil {
+		return "", r.dupSite(s, e, fn)
 	}
 	out, err := constantForm(r.info, e, s, r.prefix, r.h, ctx, inner)
 	if err != nil {
@@ -91,30 +97,50 @@ func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (st
 }
 
 // context returns e's context: its nearest ancestor that is not a
-// parenthesis. It refuses e inside a const declaration or an array length,
-// at any depth: anything there must stay constant.
-func (r *rewriter) context(e ast.Expr) (ast.Node, error) {
+// parenthesis. When e lies, at any depth, in a const declaration, an array
+// length or a constant composite literal key -- anything there must stay
+// constant -- it returns instead the function declaration whose body holds
+// e, to duplicate; outside one, it refuses e.
+func (r *rewriter) context(e ast.Expr) (ast.Node, *ast.FuncDecl, error) {
 	if _, ok := r.parent(e); !ok {
-		return nil, fmt.Errorf("%w: constant site outside the package's files", ErrUnsupported)
+		return nil, nil, fmt.Errorf("%w: constant site outside the package's files", ErrUnsupported)
 	}
 	var ctx ast.Node
+	var fn *ast.FuncDecl
+	compileTime, inBody, inLit := "", false, false
 	for child, n := ast.Node(e), r.parents[e]; n != nil; child, n = n, r.parents[n] {
 		if _, paren := n.(*ast.ParenExpr); ctx == nil && !paren {
 			ctx = n
 		}
 		switch n := n.(type) {
 		case *ast.GenDecl:
-			if n.Tok == token.CONST {
-				return nil, fmt.Errorf("%w: constant site in a const declaration", ErrUnsupported)
+			if n.Tok == token.CONST && compileTime == "" {
+				compileTime = "constant site in a const declaration"
 			}
 		case *ast.ArrayType:
-			if n.Len == child {
-				return nil, fmt.Errorf("%w: constant site in an array length", ErrUnsupported)
+			if n.Len == child && compileTime == "" {
+				compileTime = "constant site in an array length"
 			}
+		case *ast.KeyValueExpr:
+			if _, lit := r.parents[n].(*ast.CompositeLit); lit && n.Key == child && r.info.Types[n.Key].Value != nil && compileTime == "" {
+				compileTime = "constant composite literal key"
+			}
+		case *ast.FuncLit:
+			inLit = true
+		case *ast.FuncDecl:
+			fn, inBody = n, child == n.Body
 		}
 	}
+	switch {
+	case compileTime == "":
+		return ctx, nil, nil
+	case fn != nil && inBody:
+		return nil, fn, nil
+	case fn == nil && inLit:
+		return nil, nil, fmt.Errorf("%w: %s, in a function literal outside a function declaration", ErrUnsupported, compileTime)
+	}
 
-	return ctx, nil
+	return nil, nil, fmt.Errorf("%w: %s", ErrUnsupported, compileTime)
 }
 
 // constantForm returns the replacement for the constant-valued site e, whose
@@ -141,9 +167,6 @@ func (r *rewriter) context(e ast.Expr) (ast.Node, error) {
 func constantForm(info *types.Info, e ast.Expr, s Site, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
 	if x, ok := ctx.(ast.Expr); ok && info.Types[x].Value != nil {
 		return "", fmt.Errorf("%w: operand of a constant expression", ErrUnsupported)
-	}
-	if kv, ok := ctx.(*ast.KeyValueExpr); ok && ast.Unparen(kv.Key) == e {
-		return "", fmt.Errorf("%w: constant composite literal key", ErrUnsupported)
 	}
 	// In a conversion T(c) the shift form's untyped 1 takes the type T, which
 	// for a type parameter is not an integer type the shift accepts, whatever

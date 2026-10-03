@@ -85,13 +85,13 @@ func MultiLine() int {
 }
 
 func Arr() int {
-	var a [1 + 1]int // refused +: an array length
+	var a [1 + 1]int // an array length: placed by duplicating Arr
 	return len(a)
 }
 
 func FloatBin(f float64) float64 { return f * (1.5 + 1) } // refused +: a float operand
 
-func Key() []int { return []int{1 + 1: 5} } // refused +: a composite literal key
+func Key() []int { return []int{1 + 1: 5} } // a composite literal key: placed by duplicating Key
 
 func Shift(x int) int { return x << (1 + 1) } // refused +: an untyped shift count
 

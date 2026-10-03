@@ -77,9 +77,12 @@ func HelperFileName(prefix string) string {
 // and sites must come from pkg.Fset. Each type error is attributed to the
 // innermost placed site whose rendered text contains it; those sites are
 // dropped and the package rendered again from its original source, until it
-// type-checks. A type error inside no placed site drops every site of the
-// package with ErrUnattributable. Every input site ends in exactly one of
-// placed and dropped. When no site is placed, files is empty.
+// type-checks. An error in a function duplicate, or in what its jump adds to
+// the original function, drops only the mutant the duplicate is for. A type
+// error inside no placed site drops every site of the package with
+// ErrUnattributable. Every input mutant ends in exactly one of placed and
+// dropped: a site some of whose mutants are dropped is in both, each with its
+// own. When no site is placed, files is empty.
 func RewritePackage(pkg *packages.Package, sites []Site, tags string) (map[string][]byte, []Site, []SiteError) {
 	return rewritePackage(pkg, sites, tags, NewRewriter)
 }
@@ -92,10 +95,20 @@ type sourceFile struct {
 	sites []Site
 }
 
-// renderedSpan is a placed site's byte range in its rendered file.
+// renderedSpan is a placed site's byte range in its rendered file. id is 0
+// for the site's own text, which every mutant of the site shares, or the
+// one mutant the text is for: a duplicate, or what its jump adds to the
+// original function.
 type renderedSpan struct {
 	site       Site
+	id         int
 	start, end int
+}
+
+// mutantKey is a site, by its node, and one of its mutants, or 0 for all.
+type mutantKey struct {
+	node ast.Node
+	id   int
 }
 
 func rewritePackage(pkg *packages.Package, sites []Site, tags string, newRW rewriterFactory) (map[string][]byte, []Site, []SiteError) {
@@ -115,20 +128,25 @@ func rewritePackage(pkg *packages.Package, sites []Site, tags string, newRW rewr
 	}
 
 	files, dropped := groupSites(pkg, sites)
-	for round := 0; round < len(sites); round++ {
+	// Every round drops a site or a mutant.
+	rounds := 0
+	for _, s := range sites {
+		rounds += max(len(s.Muts), 1)
+	}
+	for round := 0; round < rounds; round++ {
 		h := &HelperSet{}
 		rw := newRW(pkg.TypesInfo, pkg.Syntax, prefix, h)
 		overlay := map[string][]byte{}
 		spans := map[string][]renderedSpan{}
 		for _, f := range files {
-			out, roots, errs := render(pkg.Fset, f.file, f.src, f.sites, rw)
+			out, fileSpans, errs := render(pkg.Fset, f.file, f.src, f.sites, rw)
 			for _, e := range errs {
 				dropped = append(dropped, e)
 				f.sites = removeSite(f.sites, e.Site)
 			}
 			if !bytes.Equal(out, f.src) {
 				overlay[f.path] = out
-				spans[f.path] = layoutSpans(roots)
+				spans[f.path] = fileSpans
 			}
 		}
 		if len(liveSites(files)) == 0 {
@@ -154,12 +172,26 @@ func rewritePackage(pkg *packages.Package, sites []Site, tags string, newRW rewr
 		for _, f := range files {
 			kept := f.sites[:0:0]
 			for _, s := range f.sites {
-				if msg, ok := bad[s.Node]; ok {
+				if msg, ok := bad[mutantKey{s.Node, 0}]; ok {
 					dropped = append(dropped, SiteError{Site: s, Err: fmt.Errorf("%w: %s", ErrTypeCheck, msg)})
 
 					continue
 				}
-				kept = append(kept, s)
+				// A duplicate's error drops its own mutant only.
+				var live []Mutant
+				for _, m := range s.Muts {
+					if msg, ok := bad[mutantKey{s.Node, m.ID}]; ok {
+						one := Site{Node: s.Node, Tok: s.Tok, Muts: []Mutant{m}}
+						dropped = append(dropped, SiteError{Site: one, Err: fmt.Errorf("%w: %s", ErrTypeCheck, msg)})
+
+						continue
+					}
+					live = append(live, m)
+				}
+				if len(live) > 0 {
+					s.Muts = live
+					kept = append(kept, s)
+				}
 			}
 			f.sites = kept
 		}
@@ -381,10 +413,11 @@ func cutLast(s, sep string) (string, string, bool) {
 }
 
 // attribute maps each type error to the innermost placed site whose rendered
-// span contains it. It returns the sites to drop, with their messages, or the
-// message of the first error that lies in no placed site.
-func attribute(errs []typeError, overlay map[string][]byte, spans map[string][]renderedSpan) (map[ast.Node]string, string) {
-	bad := map[ast.Node]string{}
+// span contains it -- to one mutant of it, in a span of a duplicate. It
+// returns the sites and mutants to drop, with their messages, or the message
+// of the first error that lies in no placed site.
+func attribute(errs []typeError, overlay map[string][]byte, spans map[string][]renderedSpan) (map[mutantKey]string, string) {
+	bad := map[mutantKey]string{}
 	for _, e := range errs {
 		if _, ok := overlay[e.file]; !ok || e.offset < 0 {
 			return nil, e.msg
@@ -398,8 +431,9 @@ func attribute(errs []typeError, overlay map[string][]byte, spans map[string][]r
 		if inner == nil {
 			return nil, e.msg
 		}
-		if _, seen := bad[inner.site.Node]; !seen {
-			bad[inner.site.Node] = e.msg
+		k := mutantKey{inner.site.Node, inner.id}
+		if _, seen := bad[k]; !seen {
+			bad[k] = e.msg
 		}
 	}
 

@@ -16,6 +16,11 @@
 
 package schemata
 
+import (
+	"errors"
+	"go/token"
+)
+
 // ConstMutation exposes constMutation to the external tests, which hold it
 // against the engine's table.
 var ConstMutation = constMutation
@@ -32,3 +37,16 @@ var BinaryNames = binaryNames
 // AssignMutation exposes assignMutation to the external tests, which hold
 // it against the engine's table.
 var AssignMutation = assignMutation
+
+// BreakDupMutant returns err, a rewriter's request to duplicate a site's
+// function, with mutant id's duplicate made not to type-check: its operator
+// becomes &&, which no constant operand of an arithmetic site accepts. Any
+// other err is returned as it is.
+func BreakDupMutant(err error, id int) error {
+	var d *dupError
+	if errors.As(err, &d) {
+		d.mutated[id] = token.LAND
+	}
+
+	return err
+}
