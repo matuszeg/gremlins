@@ -422,7 +422,7 @@ The rewritten code records that the active mutant's code actually ran in the fil
 
 The two ways of running differ in how a mutant is classified, because reaching the code is observed directly:
 
-* a mutant whose code never ran during the tests is `NOT COVERED`, whatever the exit status of the tests;
+* a mutant whose code never ran during passing tests is `NOT COVERED`;
 * a test failure without the mutant's code having run is `ERRORED`, not `KILLED`.
 
 A mutant Gremlins cannot place in the rewritten code falls back to a per-mutant build automatically,
@@ -432,10 +432,17 @@ and the result is unchanged. At the end of the run, a summary line reports how m
 Schemata: placed 118, per-mutant path 4
 ```
 
-When the schema cannot be used at all, the line says why, and every mutant takes the per-mutant path:
+When the schema cannot be used at all, the line says why. In integration mode every mutant runs the whole
+module, so every mutant takes the per-mutant path:
 
 ```text
-Schemata: not used (dry run), per-mutant path 122
+Schemata: not used (integration mode), per-mutant path 122
+```
+
+A dry run runs no mutant, so nothing is built and none takes either path:
+
+```text
+Schemata: not used (dry run), per-mutant path 0
 ```
 
 To inspect what Gremlins built, set `GREMLINS_SCHEMATA_KEEP=<dir>`: the test binaries, the rewritten source
@@ -445,11 +452,30 @@ and an index of the mutant ids are kept in `<dir>`.
 GREMLINS_SCHEMATA_KEEP=/tmp/schemata gremlins unleash
 ```
 
-To go back to one build per mutant:
+The switch between mutants travels in the environment. A test that starts a child process with an explicit
+environment runs that child with no mutant active and without recording that the mutant's code ran, and a test
+that clears its own environment before the mutant's code first runs loses that record. A test that
+writes next to its own source file, located through `runtime.Caller`, writes into the directory the test
+binaries were built in, which every worker shares; without schemata each worker has its own copy.
+
+To go back to one build per mutant, use the flag, the `unleash.schemata` key in `.gremlins.yaml`, or the
+`GREMLINS_UNLEASH_SCHEMATA` environment variable:
 
 ```shell
 gremlins unleash --schemata=false
 ```
+
+```yaml
+unleash:
+  schemata: false
+```
+
+```shell
+GREMLINS_UNLEASH_SCHEMATA=false gremlins unleash
+```
+
+As for every option, the flag takes precedence over the environment variable, and the environment variable over
+the configuration file.
 
 ### Tags
 

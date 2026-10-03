@@ -52,16 +52,16 @@ type Results struct {
 	Elapsed  time.Duration
 }
 
-// SchemataSummary is how the runnable mutants of a --schemata run were
+// SchemataSummary is how the runnable mutants of a schemata run were
 // executed: Placed were judged against the schema test binaries, PerMutant
 // through the per-mutant go test path, whether Prepare netted them or their
 // executor fell back to it.
 type SchemataSummary struct {
 	Placed    int
 	PerMutant int
-	// NotUsed says why no schema build was made when --schemata was given
-	// and nothing prevented it from being used for lack of mutants: "dry
-	// run", or "integration mode". Placed is 0 then for that reason.
+	// NotUsed says why no schema build was made although schemata is on
+	// and there were runnable mutants: "dry run", or "integration mode".
+	// Placed is 0 then.
 	NotUsed string
 }
 
