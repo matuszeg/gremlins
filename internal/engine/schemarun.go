@@ -410,8 +410,8 @@ func (m MutantExecutorDealer) nullRunDir(pkgDir string) (string, string, error) 
 }
 
 // nullRun runs the test binary bin in dir with no mutant switched on, the
-// tests named in tests (all of them when empty), and the flags, bounds and
-// overlay a mutant's run gets; an empty overlay adds none. A run that does
+// tests named in tests (all of them when empty), and the flags, bounds,
+// GOTMPDIR and overlay a mutant's run gets; an empty overlay adds none. A run that does
 // not pass is an error whose first line says how it ended and, when the
 // output shows it, which test failed.
 func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, dir, overlay string, tests []string) error {
@@ -420,7 +420,7 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, dir, overlay str
 	defer cancel()
 	cmd := m.execContext(ctx, bin, testBinaryArgs(m.testExecutionTime, m.testCPU, tests)...)
 	cmd.Dir = dir
-	cmd.Env = withoutMutant(os.Environ())
+	cmd.Env = append(withoutMutant(os.Environ()), goTmpDir(m.wdDealer))
 	if overlay != "" {
 		cmd.Env = append(cmd.Env, overlayGOFLAGS(overlay))
 	}

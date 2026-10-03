@@ -30,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
@@ -303,6 +304,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 		"GREMLINS_MUTANT="+strconv.Itoa(s.id),
 		"GREMLINS_REACHED="+reach,
 		overlayGOFLAGS(r.overlay),
+		goTmpDir(m.wdDealer),
 	)
 	scanner := newOutputScanner()
 	cmd.Stdout = scanner
@@ -350,6 +352,13 @@ func testBinaryArgs(timeout time.Duration, cpu int, tests []string) []string {
 	}
 
 	return args
+}
+
+// goTmpDir is the GOTMPDIR setting the legacy executor gives go test: the
+// run's work directory, which the caller of the engine removes, so that a test
+// running the go command leaves its work directories nowhere else.
+func goTmpDir(wd workdir.Dealer) string {
+	return "GOTMPDIR=" + wd.WorkDir()
 }
 
 // overlayGOFLAGS is the GOFLAGS setting that adds -overlay=overlay to the

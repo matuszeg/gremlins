@@ -441,6 +441,11 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 	if v, _ := envValue(cmd.Env, "GREMLINS_REACHED"); v != reach {
 		t.Errorf("GREMLINS_REACHED = %q, want %s", v, reach)
 	}
+	// As the legacy executor's go test: a test running the go command
+	// keeps its work directories in the run's work directory.
+	if v, _ := envValue(cmd.Env, "GOTMPDIR"); v != wdd.WorkDir() {
+		t.Errorf("GOTMPDIR = %q, want the work directory %s", v, wdd.WorkDir())
+	}
 	overlay := overlayPath(t, cmd.Env)
 	if other := overlayPath(t, cmds[1].Env); other != overlay {
 		t.Errorf("second mutant on the worker used overlay %s, want the worker's one %s", other, overlay)
