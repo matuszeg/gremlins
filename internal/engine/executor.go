@@ -470,7 +470,7 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 // selectTests decides what to run for the mutant and records the tests it
 // narrowed to on the mutant. See testSelection.forMutant.
 func (m *mutantExecutor) selectTests(pkg string) testRun {
-	sel, names := m.testSelection.forMutant(pkg, m.mutant.Position())
+	sel, names := m.forMutant(pkg, m.mutant.Position())
 	if names != nil {
 		m.mutant.SetTestsRun(names)
 	}

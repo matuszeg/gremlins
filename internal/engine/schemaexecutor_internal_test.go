@@ -224,7 +224,7 @@ func TestOverlayCacheRemembersAFailure(t *testing.T) {
 	if err := os.RemoveAll(spaced); err != nil {
 		t.Fatal(err)
 	}
-	if _, second := c.get(build, "/copy/one", spaced); second != first {
+	if _, second := c.get(build, "/copy/one", spaced); !errors.Is(second, first) {
 		t.Errorf("second get error = %v, want the first's, %v", second, first)
 	}
 	path, err := c.get(build, "/copy/two", good)

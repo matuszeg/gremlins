@@ -537,7 +537,11 @@ func TestMirrorConstraintsMatchTheHelpers(t *testing.T) {
 			}
 			// The constraint under test is the last type parameter of each helper
 			// named above, each of which has only the one.
-			tps := fn.Type().(*types.Signature).TypeParams()
+			sig, ok := fn.Type().(*types.Signature)
+			if !ok {
+				t.Fatalf("%s is not a function", tc.helper)
+			}
+			tps := sig.TypeParams()
 			got := tps.At(tps.Len() - 1).Constraint().Underlying()
 			if !types.Identical(got, tc.mirror) {
 				t.Errorf("helper %s constrains %s, forms.go mirrors it as %s", tc.helper, got, tc.mirror)
