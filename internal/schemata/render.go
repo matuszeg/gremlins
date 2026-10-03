@@ -36,13 +36,17 @@ var (
 	// errSourceSize reports a site not rendered because src is not the
 	// length of the file it is said to hold.
 	errSourceSize = errors.New("schemata: src length differs from the file size")
-	// errNewlineChanged reports a rewrite that adds or removes a newline,
-	// which would move every line after it.
+	// errNewlineChanged reports a rewrite whose text holds a different
+	// number of newlines than the site's original text, which would move
+	// every line after it. Only the count is compared: a site that ends on
+	// the line it ended on is all the lines outside it need.
 	errNewlineChanged = errors.New("schemata: rewrite changes the line count")
 )
 
 // Rewriter returns the replacement text for site s. inner(n) returns the
-// source text of n with every site nested inside n already rendered.
+// source text of n with every site nested inside n already rendered. For a
+// node outside s's own range it returns n's original text, no site rendered,
+// and for a node with no valid range (nil) the empty string.
 type Rewriter func(s Site, inner func(ast.Node) string) (string, error)
 
 // SiteError is a site that was left as its original text, and why.
@@ -67,7 +71,9 @@ type siteNode struct {
 
 // Render returns src, the bytes of file, with every site replaced by its
 // rewrite. Edits are spliced into the original bytes: text outside the sites
-// is byte-identical and every line keeps its number. Sites nested in another
+// is byte-identical and every line outside a site keeps its number, since a
+// rewrite holds as many newlines as its site (a site's own lines can hold
+// other text when its rewrite moves an operand across a newline). Sites nested in another
 // site are rendered first and reach the outer rewrite through inner. A site
 // whose rewrite fails keeps its original text (with its nested sites still
 // rendered) and is reported as a SiteError, as is every site that does not

@@ -258,10 +258,12 @@ func TestRenderRejectsMalformedSites(t *testing.T) {
 		spans   [][2]int // byte offsets [start, end)
 		want    string
 		wantErr error
+		blamed  int // index in spans of the site the SiteError must name
 	}{
-		"partial_overlap":  {spans: [][2]int{{1, 5}, {3, 8}}, want: "aW(bcde)fghij", wantErr: errOverlap},
-		"outside_source":   {spans: [][2]int{{2, 4}, {8, 20}}, want: "abW(cd)efghij", wantErr: errForeignFile},
-		"invalid_position": {spans: [][2]int{{-1, 3}, {2, 4}}, want: "abW(cd)efghij", wantErr: errBadRange},
+		"partial_overlap":  {spans: [][2]int{{1, 5}, {3, 8}}, want: "aW(bcde)fghij", wantErr: errOverlap, blamed: 1},
+		"outside_source":   {spans: [][2]int{{2, 4}, {8, 20}}, want: "abW(cd)efghij", wantErr: errForeignFile, blamed: 1},
+		"invalid_position": {spans: [][2]int{{-1, 3}, {2, 4}}, want: "abW(cd)efghij", wantErr: errBadRange, blamed: 0},
+		"end_before_pos":   {spans: [][2]int{{2, 4}, {6, 3}}, want: "abW(cd)efghij", wantErr: errBadRange, blamed: 1},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -282,9 +284,42 @@ func TestRenderRejectsMalformedSites(t *testing.T) {
 				t.Errorf("got %q, want %q", out, tc.want)
 			}
 			if len(errs) != 1 || !errors.Is(errs[0].Err, tc.wantErr) {
-				t.Errorf("got SiteErrors %v, want one %v", errs, tc.wantErr)
+				t.Fatalf("got SiteErrors %v, want one %v", errs, tc.wantErr)
+			}
+			if errs[0].Site.Node != sites[tc.blamed].Node {
+				t.Errorf("blamed site %v, want sites[%d] = %v", errs[0].Site, tc.blamed, sites[tc.blamed])
 			}
 		})
+	}
+}
+
+// TestRewriterInnerOutsideTheSite checks that inner, asked for a node
+// outside the site being rewritten, returns that node's original text, even
+// where another site lies inside it.
+func TestRewriterInnerOutsideTheSite(t *testing.T) {
+	t.Parallel()
+	const src = "package p\nfunc f(a, b, c, d int) { g(a+b, c-d) }\n"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites := binarySites(f, token.ADD, token.SUB)
+	sibling := sites[1].Node // c-d, a site of its own
+	rw := func(s Site, inner func(ast.Node) string) (string, error) {
+		if s.Tok == token.ADD {
+			return "A(" + inner(sibling) + ")", nil
+		}
+
+		return wrap(s, inner)
+	}
+	out, errs := Render(fset, fset.File(f.Pos()), []byte(src), sites, rw)
+	if len(errs) != 0 {
+		t.Fatalf("SiteErrors: %v", errs)
+	}
+	// The sibling reads c-d, not its rendering W(c-d).
+	if want := "package p\nfunc f(a, b, c, d int) { g(A(c-d), W(c-d)) }\n"; string(out) != want {
+		t.Errorf("got %q, want %q", out, want)
 	}
 }
 
