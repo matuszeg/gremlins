@@ -131,11 +131,18 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 	}
 
 	files, dropped := groupSites(pkg, sites)
-	// Every round drops a site or a mutant.
+	// Every round drops a site or a mutant, and a site dropped for a type
+	// error is restored at most once (see restoreChildren): twice the work.
 	rounds := 0
 	for _, s := range sites {
-		rounds += max(len(s.Muts), 1)
+		rounds += 2 * max(len(s.Muts), 1)
 	}
+	rank := map[siteID]int{}
+	for i, s := range sites {
+		rank[idOf(s)] = i
+	}
+	var typeDrops []typeDrop
+	retried := map[siteID]bool{}
 	for round := 0; round < rounds; round++ {
 		h := &HelperSet{}
 		rw := newRW(pkg.TypesInfo, pkg.TypesSizes, pkg.Syntax, prefix, h)
@@ -172,11 +179,14 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 		if unattributable != "" {
 			return nil, nil, dropAll(dropped, liveSites(files), fmt.Errorf("%w: %s", ErrUnattributable, unattributable))
 		}
+		var roundDrops []typeDrop
 		for _, f := range files {
 			kept := f.sites[:0:0]
 			for _, s := range f.sites {
 				if msg, ok := bad[mutantKey{s.Node, 0}]; ok {
-					dropped = append(dropped, SiteError{Site: s, Err: fmt.Errorf("%w: %s", ErrTypeCheck, msg)})
+					se := SiteError{Site: s, Err: fmt.Errorf("%w: %s", ErrTypeCheck, msg)}
+					dropped = append(dropped, se)
+					roundDrops = append(roundDrops, typeDrop{f: f, err: se})
 
 					continue
 				}
@@ -198,9 +208,53 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 			}
 			f.sites = kept
 		}
+		typeDrops = append(typeDrops, roundDrops...)
+		dropped, typeDrops = restoreChildren(roundDrops, dropped, typeDrops, retried, rank)
 	}
 
 	return nil, nil, dropAll(dropped, liveSites(files), errNoConvergence)
+}
+
+// siteID identifies a site by its node and token, as removeSite does.
+type siteID struct {
+	node ast.Node
+	tok  token.Token
+}
+
+func idOf(s Site) siteID { return siteID{s.Node, s.Tok} }
+
+// typeDrop is a site dropped for a type error, and the file it lies in.
+type typeDrop struct {
+	f   *sourceFile
+	err SiteError
+}
+
+// restoreChildren gives each site in typeDrops that lies inside a site of
+// roundDrops -- dropped this round for a type error -- one more round, once:
+// an error is attributed to the innermost site whose text holds it, which for
+// an inference error of the parent's can be a child of the parent. The
+// parent is dropped in turn, and the child, never at fault, would otherwise
+// stay dropped. A site that fails again after its retry stays dropped. It
+// returns dropped and typeDrops without the restored sites.
+func restoreChildren(roundDrops []typeDrop, dropped []SiteError, typeDrops []typeDrop, retried map[siteID]bool, rank map[siteID]int) ([]SiteError, []typeDrop) {
+	for _, parent := range roundDrops {
+		pn := parent.err.Site.Node
+		for i := 0; i < len(typeDrops); i++ {
+			c := typeDrops[i]
+			cs := c.err.Site
+			if cs.Node == pn || retried[idOf(cs)] || cs.Node.Pos() < pn.Pos() || cs.Node.End() > pn.End() {
+				continue
+			}
+			retried[idOf(cs)] = true
+			typeDrops = slices.Delete(typeDrops, i, i+1)
+			i--
+			dropped = slices.DeleteFunc(dropped, func(e SiteError) bool { return e.Err == c.err.Err })
+			c.f.sites = append(c.f.sites, cs)
+			slices.SortStableFunc(c.f.sites, func(a, b Site) int { return rank[idOf(a)] - rank[idOf(b)] })
+		}
+	}
+
+	return dropped, typeDrops
 }
 
 // dropAll appends every site in sites to dropped with err.
@@ -453,8 +507,11 @@ func attribute(errs []typeError, overlay map[string][]byte, spans map[string][]r
 // original order, so each child is found by searching the parent's text from
 // the end of the previous child. A child that is not found gets no span, nor
 // do its descendants, and an error in its text falls to the parent -- which
-// is then dropped and the child checked again in the next round: a wrong
-// guess costs a site, never a broken build.
+// is then dropped and the child checked again in the next round. In the other
+// direction, an error of the parent's own making that lies in a child's text
+// (an inference error reported at an argument) is blamed on the child, which
+// is dropped and, once its parent is, tried again (restoreChildren). Either
+// way a wrong guess costs a site or a round, never a broken build.
 func layoutSpans(roots []*siteNode) []renderedSpan {
 	var out []renderedSpan
 	layoutChildren(roots, 0, 0, false, "", &out)
