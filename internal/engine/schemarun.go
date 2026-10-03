@@ -52,9 +52,14 @@ const nullCopyID = "schemata-null"
 // Prepare, the ones it places run against the schema binaries, and every other
 // mutant goes to the executor NewExecutor makes, exactly as without schemata.
 func (mu *Engine) executeSchemata(ctx context.Context) report.Results {
-	var all, runnable []mutator.Mutator
-	for m := range mu.mutantStream {
-		all = append(all, m)
+	all, ok := collect(ctx, mu.mutantStream)
+	if !ok {
+		// As the legacy loop, which stops taking mutants once the run is
+		// cancelled: none has run, so there is nothing to report.
+		return report.Results{Schemata: &report.SchemataSummary{}}
+	}
+	var runnable []mutator.Mutator
+	for _, m := range all {
 		if m.Status() == mutator.Runnable {
 			runnable = append(runnable, m)
 		}
@@ -79,6 +84,27 @@ func (mu *Engine) executeSchemata(ctx context.Context) report.Results {
 	res.Schemata = summary
 
 	return res
+}
+
+// collect takes every mutant of stream until it closes, and reports false,
+// without waiting for the rest, if ctx ends first: discovery does not watch
+// the context, and it can take long.
+func collect(ctx context.Context, stream <-chan mutator.Mutator) ([]mutator.Mutator, bool) {
+	var all []mutator.Mutator
+	for {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case m, ok := <-stream:
+			if !ok {
+				return all, true
+			}
+			all = append(all, m)
+		}
+	}
 }
 
 // executePlaced prepares the schema build of runnable and runs all: the
