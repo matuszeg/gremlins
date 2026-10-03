@@ -23,3 +23,13 @@ func Slots() int {
 
 	return len(a)
 }
+
+// Width uses a function-local constant both as an array length and at run
+// time: placed by duplicating Width. TestWidth sees w = 0 (2/2 - 1) but not
+// w = 5 (2*2 + 1), so one of its mutants is killed and the other lives.
+func Width(x int) int {
+	const w = 2*2 - 1
+	var a [w]int
+
+	return x*w + len(a)
+}

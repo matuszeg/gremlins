@@ -7,3 +7,9 @@ func TestConsts(t *testing.T) {
 		t.Error("a constant is wrong")
 	}
 }
+
+func TestWidth(t *testing.T) {
+	if Width(1) <= 0 {
+		t.Error("Width(1) <= 0")
+	}
+}
