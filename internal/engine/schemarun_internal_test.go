@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
 	"go/token"
 	"maps"
 	"os"
@@ -32,6 +34,7 @@ import (
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/coverage"
+	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
@@ -187,12 +190,14 @@ func TestSchemaNullRun(t *testing.T) {
 	t.Setenv("GREMLINS_MUTANT", "7")
 	t.Setenv("GREMLINS_REACHED", "/nowhere")
 	dealer := MutantExecutorDealer{execContext: exec.CommandContext, testExecutionTime: 3 * time.Second}
+	cpuDealer := dealer
+	cpuDealer.testCPU = 2
 
 	t.Run("invocation", func(t *testing.T) {
 		out := filepath.Join(t.TempDir(), "out")
 		bin := writeScript(t, `{ echo "$@"; pwd; env; } > `+out)
 		dir := t.TempDir()
-		if err := dealer.nullRun(context.Background(), bin, dir, "", []string{"TestA", "TestB"}); err != nil {
+		if err := cpuDealer.nullRun(context.Background(), bin, dir, "", []string{"TestA", "TestB"}); err != nil {
 			t.Fatalf("nullRun: %v", err)
 		}
 		raw, err := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
@@ -200,7 +205,7 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		lines := strings.Split(string(raw), "\n")
-		if want := "-test.count=1 -test.timeout 3s -test.paniconexit0 -test.run ^(TestA|TestB)$"; lines[0] != want {
+		if want := "-test.count=1 -test.timeout 3s -test.failfast -test.paniconexit0 -test.run ^(TestA|TestB)$ -test.cpu 2"; lines[0] != want {
 			t.Errorf("args = %q, want %q", lines[0], want)
 		}
 		if lines[1] != dir {
@@ -220,7 +225,7 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatalf("nullRun: %v", err)
 		}
 		raw, _ := os.ReadFile(out) //nolint:gosec // G304: test code reading its script's output
-		if got, want := strings.TrimSpace(string(raw)), "-test.count=1 -test.timeout 3s -test.paniconexit0"; got != want {
+		if got, want := strings.TrimSpace(string(raw)), "-test.count=1 -test.timeout 3s -test.failfast -test.paniconexit0"; got != want {
 			t.Errorf("args = %q, want %q", got, want)
 		}
 	})
@@ -238,14 +243,18 @@ func TestSchemaNullRun(t *testing.T) {
 	})
 
 	t.Run("overlay", func(t *testing.T) {
-		// The null run, in the module root, gets the overlay a mutant's run
-		// gets in its worker copy: a test running the go command builds the
-		// schema source in both.
+		// The null run, in a copy of the module, gets the overlay a mutant's
+		// run gets in its worker copy: a test running the go command builds
+		// the schema source in both. It runs in the copy, never in the
+		// user's tree, so a test writing into its directory changes nothing
+		// there.
 		out := filepath.Join(t.TempDir(), "out")
-		bin := writeScript(t, `env > `+out)
+		bin := writeScript(t, `{ pwd; env; } > `+out+`; : > written.txt`)
 		root, work := t.TempDir(), t.TempDir()
 		d := dealer
 		d.mod = gomodule.GoModule{Name: "m", Root: root}
+		wdd := workdir.NewCachedDealer(work, root)
+		d.wdDealer = wdd
 		build := &schemata.Build{Dir: filepath.Join(work, "schema"), Rewritten: []string{"a.go", filepath.Join("p", "b.go")}}
 		pkgDir := filepath.Join(root, "p")
 		if err := os.Mkdir(pkgDir, 0o700); err != nil {
@@ -258,8 +267,19 @@ func TestSchemaNullRun(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		copyRoot, err := wdd.Get(nullCopyID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(string(raw), "\n")
+		if want := filepath.Join(copyRoot, "p"); lines[0] != want {
+			t.Errorf("null run dir = %s, want %s in the copy", lines[0], want)
+		}
+		if _, err := os.Stat(filepath.Join(pkgDir, "written.txt")); !os.IsNotExist(err) {
+			t.Errorf("the null run wrote into the module tree: %v", err)
+		}
 		var overlay string
-		for _, l := range strings.Split(string(raw), "\n") {
+		for _, l := range lines {
 			if flags, ok := strings.CutPrefix(l, "GOFLAGS="); ok {
 				for _, f := range strings.Fields(flags) {
 					if p, ok := strings.CutPrefix(f, "-overlay="); ok {
@@ -280,8 +300,8 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := map[string]string{
-			filepath.Join(root, "a.go"):      filepath.Join(build.Dir, "a.go"),
-			filepath.Join(root, "p", "b.go"): filepath.Join(build.Dir, "p", "b.go"),
+			filepath.Join(copyRoot, "a.go"):      filepath.Join(build.Dir, "a.go"),
+			filepath.Join(copyRoot, "p", "b.go"): filepath.Join(build.Dir, "p", "b.go"),
 		}
 		if !maps.Equal(o.Replace, want) {
 			t.Errorf("overlay = %v, want %v", o.Replace, want)
@@ -301,6 +321,73 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Errorf("the null run took %s", el)
 		}
 	})
+}
+
+// TestSchemaNullRunLeavesTheModuleTree prepares the nullcopy fixture, whose
+// test writes out.txt into its working directory, and requires the fixture
+// to hold no out.txt afterwards: the null run executes in a copy.
+//
+// It is not parallel: it changes the working directory, as the CLI's
+// relative target does.
+func TestSchemaNullRunLeavesTheModuleTree(t *testing.T) {
+	t.Chdir(filepath.Join("testdata", "nullcopy"))
+	mod, err := gomodule.Init("./w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(mod.Root) {
+		t.Fatalf("gomodule.Init(./w) gave the absolute root %s: the test proves nothing", mod.Root)
+	}
+	out := filepath.Join("w", "out.txt")
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("the fixture already holds %s: %v", out, err)
+	}
+	wdd := workdir.NewCachedDealer(t.TempDir(), mod.Root)
+	defer wdd.Clean()
+	d := NewExecutorDealer(mod, wdd, time.Second)
+	abs, err := absModule(mod)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.mod = abs
+
+	src, err := os.ReadFile(filepath.Join("w", "w.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := token.NewFileSet()
+	// Named relative to the calling directory, as the engine's walk does.
+	file, err := parser.ParseFile(set, "w.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runnable []mutator.Mutator
+	ast.Inspect(file, func(n ast.Node) bool {
+		if node, ok := NewTokenNode(n); ok && node.Tok() == token.ADD {
+			m := NewTokenMutant("nullcopy/w", set, file, node)
+			m.SetType(mutator.ArithmeticBase)
+			m.SetStatus(mutator.Runnable)
+			runnable = append(runnable, m)
+		}
+
+		return true
+	})
+	if len(runnable) != 1 {
+		t.Fatalf("%d mutants, want Add's", len(runnable))
+	}
+
+	eng := New(mod, CodeData{}, d)
+	plan, err := eng.prepareSchemata(context.Background(), d, abs, runnable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Placed) != 1 {
+		t.Fatalf("plan %+v, want Add's mutant placed (its null run passed)", plan)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		_ = os.Remove(out)
+		t.Errorf("the null run wrote %s into the module tree: %v", out, err)
+	}
 }
 
 // wdStub is a workdir.Dealer over one directory.

@@ -329,20 +329,24 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 	return runResult{status: status, noVerdict: exitCode < 0}, cancelled
 }
 
-// binaryArgs are the test binary's flags: the go test flags the legacy
-// executor passes, in their -test. form, and the -test.paniconexit0 go test
-// adds itself. Build tags and -vet do not apply to a binary that is already
-// built.
+// binaryArgs are the test binary's flags for a mutant's run.
 func (s *schemaExecutor) binaryArgs(tests []string) []string {
-	m := s.legacy
+	return testBinaryArgs(s.legacy.testExecutionTime, s.legacy.testCPU, tests)
+}
+
+// testBinaryArgs are a schema test binary's flags, for a mutant's run and a
+// null run alike: the go test flags the legacy executor passes, in their
+// -test. form, and the -test.paniconexit0 go test adds itself. Build tags and
+// -vet do not apply to a binary that is already built.
+func testBinaryArgs(timeout time.Duration, cpu int, tests []string) []string {
 	// go test always passes -test.paniconexit0, so a test that calls
 	// os.Exit(0) fails the run instead of passing it.
-	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.failfast", "-test.paniconexit0"}
+	args := []string{"-test.count=1", "-test.timeout", timeout.String(), "-test.failfast", "-test.paniconexit0"}
 	if len(tests) > 0 {
 		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
 	}
-	if m.testCPU != 0 {
-		args = append(args, "-test.cpu", strconv.Itoa(m.testCPU))
+	if cpu != 0 {
+		args = append(args, "-test.cpu", strconv.Itoa(cpu))
 	}
 
 	return args

@@ -43,6 +43,10 @@ import (
 // bound.
 const nullRunOutputLimit = 64 << 10
 
+// nullCopyID is the work-directory dealer's identifier of the module copy the
+// null runs execute in.
+const nullCopyID = "schemata-null"
+
 // executeSchemata is executeTests under --schemata. It collects every mutant
 // first, because the schema build needs all of them: the runnable ones go to
 // Prepare, the ones it places run against the schema binaries, and every other
@@ -357,10 +361,13 @@ func (t schemaTargets) testsAt(dir string) []string {
 	return t.tests[pkg]
 }
 
-// schemaNullRun is Prepare's null run: each binary runs, in its package's
-// directory of the module root, the tests targets selects there, with the
-// overlay that points the module root's rewritten files at the schema copy's
-// -- the one a mutant's run gets for its worker copy -- written into tmpDir.
+// schemaNullRun is Prepare's null run: each binary runs the tests targets
+// selects in its package's directory of a copy of the module made for the
+// null runs, never in the user's own tree, where a test writing into its
+// directory would leave files behind. It gets the overlay that points the
+// copy's rewritten files at the schema copy's, written into tmpDir, as a
+// mutant's run gets one for its worker copy. pkgDir is the package's
+// directory under the module root.
 func (m MutantExecutorDealer) schemaNullRun(ctx context.Context, tmpDir string, targets schemaTargets) schemata.NullRunFunc {
 	overlays := m.overlays
 	if overlays == nil {
@@ -368,31 +375,51 @@ func (m MutantExecutorDealer) schemaNullRun(ctx context.Context, tmpDir string, 
 	}
 
 	return func(b *schemata.Build, bin, pkgDir string) error {
-		overlay, err := overlays.get(b, m.mod.Root, tmpDir)
+		dir, root, err := m.nullRunDir(pkgDir)
 		if err != nil {
 			return fmt.Errorf("%s in %s: %w", filepath.Base(bin), pkgDir, err)
 		}
+		overlay, err := overlays.get(b, root, tmpDir)
+		if err != nil {
+			return fmt.Errorf("%s in %s: %w", filepath.Base(bin), dir, err)
+		}
 
-		return m.nullRun(ctx, bin, pkgDir, overlay, targets.testsAt(pkgDir))
+		return m.nullRun(ctx, bin, dir, overlay, targets.testsAt(pkgDir))
 	}
 }
 
-// nullRun runs the test binary bin in pkgDir with no mutant switched on, the
-// tests named in tests (all of them when empty), and the bounds and overlay a
-// mutant's run gets; an empty overlay adds none. A run that does not pass is
-// an error whose first line says how it ended and, when the output shows it,
-// which test failed.
-func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir, overlay string, tests []string) error {
+// nullRunDir maps pkgDir, a directory under the module root, to the same
+// directory in the null runs' copy of the module, and returns it with the
+// copy's absolute root.
+func (m MutantExecutorDealer) nullRunDir(pkgDir string) (string, string, error) {
+	rel, err := filepath.Rel(m.mod.Root, pkgDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("%s is not under the module root %s", pkgDir, m.mod.Root)
+	}
+	root, err := m.wdDealer.Get(nullCopyID)
+	if err == nil {
+		// Absolute: the binary runs in a package directory, and the
+		// overlay's keys must name the files the go command sees.
+		root, err = filepath.Abs(root)
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("null run copy: %w", err)
+	}
+
+	return filepath.Join(root, rel), root, nil
+}
+
+// nullRun runs the test binary bin in dir with no mutant switched on, the
+// tests named in tests (all of them when empty), and the flags, bounds and
+// overlay a mutant's run gets; an empty overlay adds none. A run that does
+// not pass is an error whose first line says how it ended and, when the
+// output shows it, which test failed.
+func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, dir, overlay string, tests []string) error {
 	bound := m.testExecutionTime + schemaBackstopGrace
 	ctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
-	// As in a mutant's run: -test.paniconexit0 is what go test passes.
-	args := []string{"-test.count=1", "-test.timeout", m.testExecutionTime.String(), "-test.paniconexit0"}
-	if len(tests) > 0 {
-		args = append(args, "-test.run", "^("+strings.Join(tests, "|")+")$")
-	}
-	cmd := m.execContext(ctx, bin, args...)
-	cmd.Dir = pkgDir
+	cmd := m.execContext(ctx, bin, testBinaryArgs(m.testExecutionTime, m.testCPU, tests)...)
+	cmd.Dir = dir
 	cmd.Env = withoutMutant(os.Environ())
 	if overlay != "" {
 		cmd.Env = append(cmd.Env, overlayGOFLAGS(overlay))
@@ -408,14 +435,14 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, pkgDir, overlay 
 	case err == nil:
 		return nil
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return fmt.Errorf("%s in %s: no verdict within %s", filepath.Base(bin), pkgDir, bound)
+		return fmt.Errorf("%s in %s: no verdict within %s", filepath.Base(bin), dir, bound)
 	case cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 0:
 		// exec.ErrWaitDelay: the binary passed, a child held its output.
 		return nil
 	}
 	text := out.String()
 
-	return fmt.Errorf("%s in %s: %w%s\n%s", filepath.Base(bin), pkgDir, err, firstFailure(text), text)
+	return fmt.Errorf("%s in %s: %w%s\n%s", filepath.Base(bin), dir, err, firstFailure(text), text)
 }
 
 // withoutMutant is env without the variables that switch a mutant on.
