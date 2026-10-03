@@ -57,9 +57,11 @@ type Plan struct {
 }
 
 // NullRunFunc runs the test binary bin of build b once, with no mutant
-// selected, in pkgDir: the package's directory in the original module. b is
-// the build bin belongs to, for the overlay a test running the go command
-// needs to see the source the binary was built from.
+// selected, for the package whose directory in the original module is pkgDir.
+// It runs the binary where a worker would, in a copy of that directory: never
+// in the original module, which Prepare does not write to. b is the build bin
+// belongs to, for the overlay a test running the go command needs to see the
+// source the binary was built from.
 type NullRunFunc func(b *Build, bin, pkgDir string) error
 
 // nullFailed prefixes the reason of a mutant netted by a failing null run.
