@@ -73,10 +73,11 @@ const nullFailed = "null-mutant run failed: "
 // The mutants get ids 1..N in the order runnable lists them. Mutants of one
 // package at one operator token form one Site. Each package is loaded with
 // tags and rewritten; every package testPkgs names for a package with a
-// placed site has its test binary built in workDir within allowance; one with
-// no test files has none, and is no failure: its run passes without reach. Each binary then runs once without a mutant selected through
-// nullRun, given the package's directory in mod -- the original source, as
-// a worker runs it -- and once more if that fails.
+// placed site has its test binary built in workDir within allowance. One with
+// no test files has none, and is no failure: its run passes without reach.
+// Each binary then runs once without a mutant selected through nullRun,
+// given the package's directory in mod -- the original source, which nullRun
+// runs a copy of, as a worker does -- and once more if that fails.
 //
 // A mutant is netted when it maps to no operator in the loaded source, when
 // the rewrite drops its site, when testPkgs names no package for its package,
@@ -109,17 +110,16 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		return Plan{}, err
 	}
 	var plan Plan
-	if len(placedPkgs) > 0 {
-		need := map[string][]string{}
-		var all []string
-		for _, pkg := range placedPkgs {
-			need[pkg] = testPkgs(pkg)
-			all = append(all, need[pkg]...)
-		}
-		slices.Sort(all)
-		all = slices.Compact(all)
-		p.netUnselected(need)
-
+	need := map[string][]string{}
+	var all []string
+	for _, pkg := range placedPkgs {
+		need[pkg] = testPkgs(pkg)
+		all = append(all, need[pkg]...)
+	}
+	slices.Sort(all)
+	all = slices.Compact(all)
+	p.netUnselected(need)
+	if len(all) > 0 {
 		start := time.Now()
 		b, errs := BuildAll(ctx, mod.Root, workDir, tags, rewritten, all, allowance)
 		log.Infof("schemata: built %d packages in %s\n", len(b.Binaries), time.Since(start).Round(time.Millisecond))
