@@ -35,6 +35,7 @@ import (
 	"testing"
 
 	"github.com/go-gremlins/gremlins/internal/engine"
+	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/schemata"
 )
 
@@ -231,5 +232,60 @@ func TestConstMutationsMatchEngine(t *testing.T) {
 				t.Errorf("%s %s: folding rewrites to %s (%v), engine to %s (%v)", mt, tok, got, gok, want, wok)
 			}
 		}
+	}
+}
+
+// TestRenderRefusesAMultiLineWitness checks that a witness (the callee or
+// assignment target a float constant's type is inferred from) spanning lines
+// is refused by Render's newline check, not spliced in to move every later
+// line: the site's own text holds no newline for the replacement to keep. A
+// multi-line operand is kept on its lines.
+func TestRenderRefusesAMultiLineWitness(t *testing.T) {
+	t.Parallel()
+	const head = "package p\n\nimport \"math\"\n\ntype b struct{ r float64 }\n\nvar _ = math.Abs\n\n"
+	cases := map[string]struct {
+		body    string
+		refused bool
+	}{
+		"one_line_callee":    {body: "func f() float64 {\n\treturn math.Abs(1.5 * 2)\n}\n"},
+		"multi_line_callee":  {body: "func f() float64 {\n\treturn math.\n\t\tAbs(1.5 * 2)\n}\n", refused: true},
+		"multi_line_operand": {body: "func f() float64 {\n\treturn math.Abs(1.5 *\n\t\t2)\n}\n"},
+		"multi_line_target":  {body: "func f(v b) {\n\tv.\n\t\tr = 1.5 * 2\n}\n", refused: true},
+		"one_line_target":    {body: "func f(v b) {\n\tv.r =\n\t\t1.5 * 2\n}\n"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			src := []byte(head + tc.body)
+			fset := token.NewFileSet()
+			f, info := typeCheck(t, fset, "p.go", src)
+			var sites []schemata.Site
+			ast.Inspect(f, func(n ast.Node) bool {
+				if be, ok := n.(*ast.BinaryExpr); ok && be.Op == token.MUL {
+					sites = append(sites, schemata.Site{Node: be, Tok: be.Op,
+						Muts: []schemata.Mutant{{ID: 1, Type: mutator.ArithmeticBase}}})
+				}
+
+				return true
+			})
+			if len(sites) != 1 {
+				t.Fatalf("found %d sites, want 1", len(sites))
+			}
+			out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites,
+				schemata.NewRewriter(info, nil, []*ast.File{f}, testPrefix, &schemata.HelperSet{}))
+			if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
+				t.Errorf("output has %d lines, the source %d", got, want)
+			}
+			switch {
+			case tc.refused && (len(errs) != 1 || !errors.Is(errs[0].Err, schemata.ErrNewlineChanged)):
+				t.Errorf("SiteErrors = %v, want the newline check's", errs)
+			case tc.refused && !bytes.Equal(out, src):
+				t.Errorf("a refused site changed the source:\n%s", out)
+			case !tc.refused && len(errs) != 0:
+				t.Errorf("SiteErrors = %v, want none", errs)
+			case !tc.refused && bytes.Equal(out, src):
+				t.Error("the site was not rewritten")
+			}
+		})
 	}
 }
