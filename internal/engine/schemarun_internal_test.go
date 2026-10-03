@@ -97,38 +97,38 @@ func TestSchemaTargetsAreTheExecutorSelection(t *testing.T) {
 			wantTests: map[string][]string{a: nil, b: nil},
 		},
 		"cross_package": {
-			dealer:    MutantExecutorDealer{crossPackage: true, dependents: deps},
+			dealer:    MutantExecutorDealer{testSelection: testSelection{crossPackage: true, dependents: deps}},
 			muts:      []*lineMutant{{pkg: a, line: 1}, {pkg: b, line: 1}},
 			wantPkgs:  map[string][]string{a: {a, c, d}, b: {b, d}},
 			wantTests: map[string][]string{a: nil, b: nil, c: nil, d: nil},
 		},
 		"test_selection_narrows": {
-			dealer: MutantExecutorDealer{crossPackage: true, dependents: deps, testMap: lineSelector{
+			dealer: MutantExecutorDealer{testSelection: testSelection{crossPackage: true, dependents: deps, testMap: lineSelector{
 				mapped: map[string]bool{a: true},
 				tests: map[int][]coverage.TestID{
 					1: {{Pkg: c, Name: "TestC"}},
 					2: {{Pkg: a, Name: "TestA"}, {Pkg: c, Name: "TestC2"}},
 				},
-			}},
+			}}},
 			muts:      []*lineMutant{{pkg: a, line: 1}, {pkg: a, line: 2}},
 			wantPkgs:  map[string][]string{a: {a, c}},
 			wantTests: map[string][]string{a: {"TestA", "TestC2"}, c: {"TestC", "TestA", "TestC2"}},
 		},
 		"one_whole_suite_widens_the_package": {
-			dealer: MutantExecutorDealer{crossPackage: true, dependents: deps, testMap: lineSelector{
+			dealer: MutantExecutorDealer{testSelection: testSelection{crossPackage: true, dependents: deps, testMap: lineSelector{
 				mapped: map[string]bool{a: true},
 				tests:  map[int][]coverage.TestID{1: {{Pkg: c, Name: "TestC"}}},
-			}},
+			}}},
 			// Line 3 has no tests in the map: its mutant runs whole suites.
 			muts:      []*lineMutant{{pkg: a, line: 1}, {pkg: a, line: 3}},
 			wantPkgs:  map[string][]string{a: {a, c, d}},
 			wantTests: map[string][]string{a: nil, c: nil, d: nil},
 		},
 		"integration_mode_runs_whole_suites": {
-			dealer: MutantExecutorDealer{integrationMode: true, testMap: lineSelector{
+			dealer: MutantExecutorDealer{testSelection: testSelection{integrationMode: true, testMap: lineSelector{
 				mapped: map[string]bool{a: true},
 				tests:  map[int][]coverage.TestID{1: {{Pkg: a, Name: "TestA"}}},
-			}},
+			}}},
 			muts:      []*lineMutant{{pkg: a, line: 1}},
 			wantPkgs:  map[string][]string{a: {a}},
 			wantTests: map[string][]string{a: nil},
@@ -442,7 +442,7 @@ func TestSchemaFallbacksAreCountedAndLogged(t *testing.T) {
 			errOut := &bytes.Buffer{}
 			log.Init(&bytes.Buffer{}, errOut)
 			defer log.Reset()
-			d := MutantExecutorDealer{wdDealer: wdStub{t.TempDir()}, integrationMode: tc.integration, schemaCounts: &schemaCounts{}}
+			d := MutantExecutorDealer{wdDealer: wdStub{t.TempDir()}, testSelection: testSelection{integrationMode: tc.integration}, schemaCounts: &schemaCounts{}}
 			// A skipped mutant: the legacy executor only reports it.
 			m := &lineMutant{pkg: "m/a", line: 4, status: mutator.Skipped}
 			outCh := make(chan mutator.Mutator, 1)

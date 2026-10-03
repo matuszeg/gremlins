@@ -59,6 +59,10 @@ type Results struct {
 type SchemataSummary struct {
 	Placed    int
 	PerMutant int
+	// NotUsed says why no schema build was made when --schemata was given
+	// and nothing prevented it from being used for lack of mutants: "dry
+	// run", or "integration mode". Placed is 0 then for that reason.
+	NotUsed string
 }
 
 type reportStatus struct {
@@ -180,7 +184,11 @@ func (r *reportStatus) reportFindings() {
 		r.fullRunReport()
 	}
 	if r.schemata != nil {
-		log.Infof("Schemata: placed %d, per-mutant path %d\n", r.schemata.Placed, r.schemata.PerMutant)
+		if r.schemata.NotUsed != "" {
+			log.Infof("Schemata: not used (%s)\n", r.schemata.NotUsed)
+		} else {
+			log.Infof("Schemata: placed %d, per-mutant path %d\n", r.schemata.Placed, r.schemata.PerMutant)
+		}
 	}
 	r.fileReport()
 }

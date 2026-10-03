@@ -99,8 +99,12 @@ type ExecutorDealer interface {
 type MutantExecutorDealer struct {
 	wdDealer    workdir.Dealer
 	execContext execContext
-	testMap     TestSelector
-	dependents  DependentFinder
+	// testSelection is held once, whole: the dealer's schema preparation and
+	// every executor it makes decide what a mutant runs from this one value,
+	// so that what Prepare builds is what the executors run, with no second
+	// list of its fields to drift apart. It carries testMap, dependents,
+	// crossPackage and integrationMode.
+	testSelection
 	// The context is held rather than passed because the dealer outlives every
 	// call that would carry one: it is built once and each worker asks it for a
 	// mutant's bounds later. SetRunCtx is how the engine's run context reaches
@@ -112,8 +116,6 @@ type MutantExecutorDealer struct {
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
 	dryRun            bool
-	integrationMode   bool
-	crossPackage      bool
 	testCPU           int
 	// overlays is shared by every copy of the dealer, so each worker's
 	// overlay file for a schema build is written once per run, not once per
@@ -223,11 +225,10 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 
 	jd := MutantExecutorDealer{
 		mod:               mod,
-		crossPackage:      crossPackage,
+		testSelection:     testSelection{crossPackage: crossPackage, integrationMode: integrationMode},
 		wdDealer:          wdd,
 		buildTags:         buildTags,
 		dryRun:            dryRun,
-		integrationMode:   integrationMode,
 		testCPU:           testCPU,
 		testExecutionTime: cappedExecutionTime(baseTime * time.Duration(coefficient)),
 		compileAllowance:  compileAllowance(),
@@ -333,11 +334,8 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		wg:                wg,
 		wdDealer:          m.wdDealer,
 		module:            m.mod,
-		testMap:           m.testMap,
-		dependents:        m.dependents,
-		crossPackage:      m.crossPackage,
+		testSelection:     m.testSelection,
 		dryRun:            m.dryRun,
-		integrationMode:   m.integrationMode,
 		buildTags:         m.buildTags,
 		execContext:       m.execContext,
 		testCPU:           m.testCPU,
@@ -352,9 +350,9 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 type execContext = func(ctx context.Context, name string, args ...string) *exec.Cmd
 
 type mutantExecutor struct {
-	mutant      mutator.Mutator
-	testMap     TestSelector
-	dependents  DependentFinder
+	mutant mutator.Mutator
+	// testSelection is the dealer's, see MutantExecutorDealer.
+	testSelection
 	wdDealer    workdir.Dealer
 	outCh       chan<- mutator.Mutator
 	wg          *sync.WaitGroup
@@ -369,8 +367,6 @@ type mutantExecutor struct {
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
 	dryRun            bool
-	integrationMode   bool
-	crossPackage      bool
 	testCPU           int
 }
 
@@ -474,21 +470,12 @@ func (m *mutantExecutor) runTests(rootDir, pkg string) mutator.Status {
 // selectTests decides what to run for the mutant and records the tests it
 // narrowed to on the mutant. See testSelection.forMutant.
 func (m *mutantExecutor) selectTests(pkg string) testRun {
-	sel, names := m.selection().forMutant(pkg, m.mutant.Position())
+	sel, names := m.testSelection.forMutant(pkg, m.mutant.Position())
 	if names != nil {
 		m.mutant.SetTestsRun(names)
 	}
 
 	return sel
-}
-
-func (m *mutantExecutor) selection() testSelection {
-	return testSelection{
-		testMap:         m.testMap,
-		dependents:      m.dependents,
-		crossPackage:    m.crossPackage,
-		integrationMode: m.integrationMode,
-	}
 }
 
 // testSelection is what decides, for a mutant, which packages and tests run.
