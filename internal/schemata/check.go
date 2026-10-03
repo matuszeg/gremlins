@@ -248,7 +248,7 @@ func restoreChildren(roundDrops []typeDrop, dropped []SiteError, typeDrops []typ
 			retried[idOf(cs)] = true
 			typeDrops = slices.Delete(typeDrops, i, i+1)
 			i--
-			dropped = slices.DeleteFunc(dropped, func(e SiteError) bool { return e.Err == c.err.Err })
+			dropped = slices.DeleteFunc(dropped, func(e SiteError) bool { return errors.Is(e.Err, c.err.Err) })
 			c.f.sites = append(c.f.sites, cs)
 			slices.SortStableFunc(c.f.sites, func(a, b Site) int { return rank[idOf(a)] - rank[idOf(b)] })
 		}
