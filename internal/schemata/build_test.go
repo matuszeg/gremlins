@@ -43,13 +43,20 @@ import (
 // engine will hand it to RewritePackage.
 func loadPkg(t *testing.T, dir, pattern string) *packages.Package {
 	t.Helper()
+
+	return loadPkgMode(t, dir, pattern, 0)
+}
+
+// loadPkgMode is loadPkg with extra load mode bits, such as NeedModule.
+func loadPkgMode(t *testing.T, dir, pattern string, extra packages.LoadMode) *packages.Package {
+	t.Helper()
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedTypes |
-			packages.NeedTypesInfo | packages.NeedSyntax,
+			packages.NeedTypesInfo | packages.NeedSyntax | extra,
 		Dir: abs,
 	}
 	pkgs, err := packages.Load(cfg, pattern)
@@ -115,6 +122,27 @@ func refuseTok(tok token.Token) schemata.RewriterFactory {
 	}
 }
 
+// blameChild returns a rewriter factory that wraps NewRewriter but rewrites
+// every site whose token is tok into a call whose second argument must be a
+// string. The operand there is an int, and the error is reported at the
+// operand's text: where the site's own text has a nested site, inside that
+// nested site's, though the nested site is not at fault.
+func blameChild(tok token.Token) schemata.RewriterFactory {
+	return func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+		rw := schemata.NewRewriter(info, sizes, files, prefix, h)
+
+		return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
+			if e, ok := s.Node.(*ast.BinaryExpr); ok && s.Tok == tok {
+				h.AddRaw("func " + prefix + "Pair(a int, b string) int { return a + len(b) }")
+
+				return prefix + "Pair(" + inner(e.X) + ", " + inner(e.Y) + ")", nil
+			}
+
+			return rw(s, inner)
+		}
+	}
+}
+
 // brokenHelper returns a rewriter factory that wraps NewRewriter but adds a
 // helper declaration that does not type-check: an error in the helper file,
 // inside no site.
@@ -169,6 +197,16 @@ func TestRewritePackage(t *testing.T) {
 			want: want{
 				placed: []token.Token{token.MUL, token.LSS}, helper: "zz__gremlins_schema.go",
 				dropped: []token.Token{token.ADD}, reason: "undefined: _gremlinsNope",
+			},
+		},
+		// The error is the outer site's; it is reported inside the nested
+		// site's text, which is dropped first and restored once the outer
+		// site is dropped.
+		"nested_site_blamed_for_its_parents_error_is_retried": {
+			dir: "testdata/twopkgs", pattern: "./bad", factory: blameChild(token.ADD),
+			want: want{
+				placed: []token.Token{token.MUL, token.LSS}, helper: "zz__gremlins_schema.go",
+				dropped: []token.Token{token.ADD}, reason: "cannot use",
 			},
 		},
 		"refused_site_is_dropped_with_its_error": {
@@ -536,5 +574,57 @@ func TestBinaryNamesDoNotCollide(t *testing.T) {
 	}
 	if len(names) != 6 {
 		t.Errorf("got %d names, want 6", len(names))
+	}
+}
+
+// TestRewritePackageGoVersionFromTheLoadedModule checks the module's go
+// version where Prepare reads it: from pkg.Module, which a NeedModule load
+// fills -- not from the go.mod on disk, which is the fallback for a package
+// loaded without it.
+func TestRewritePackageGoVersionFromTheLoadedModule(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		dir, pattern string
+		moduleGoVer  string // overrides the loaded Module.GoVersion, if set
+		wantDropped  string // the reason every site is dropped with, or "" when placed
+	}{
+		"loaded_old_module":            {dir: "testdata/oldgo", pattern: ".", wantDropped: "module go version < 1.21 (go 1.20)"},
+		"loaded_current_module":        {dir: "testdata/twopkgs", pattern: "./ok"},
+		"module_version_beats_go_mod":  {dir: "testdata/twopkgs", pattern: "./ok", moduleGoVer: "1.20", wantDropped: "module go version < 1.21 (go 1.20)"},
+		"module_version_beats_old_mod": {dir: "testdata/oldgo", pattern: ".", moduleGoVer: "1.22"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			pkg := loadPkgMode(t, tc.dir, tc.pattern, packages.NeedModule)
+			if pkg.Module == nil || pkg.Module.GoVersion == "" {
+				t.Fatalf("a NeedModule load gave no go version: %+v", pkg.Module)
+			}
+			if tc.moduleGoVer != "" {
+				pkg.Module.GoVersion = tc.moduleGoVer
+			}
+			sites := pkgSites(pkg)
+			_, placed, dropped := schemata.RewritePackageWith(context.Background(), pkg, sites, "", schemata.NewRewriter)
+			if tc.wantDropped == "" {
+				for _, d := range dropped {
+					if errors.Is(d.Err, schemata.ErrOldGoVersion) {
+						t.Errorf("dropped for the go version: %v", d.Err)
+					}
+				}
+				if len(placed) == 0 {
+					t.Errorf("nothing placed; dropped %v", dropped)
+				}
+
+				return
+			}
+			if len(placed) != 0 || len(dropped) != len(sites) {
+				t.Fatalf("placed %d dropped %d, want all %d dropped", len(placed), len(dropped), len(sites))
+			}
+			for _, d := range dropped {
+				if !errors.Is(d.Err, schemata.ErrOldGoVersion) || !strings.Contains(d.Err.Error(), tc.wantDropped) {
+					t.Errorf("dropped with %v, want %q", d.Err, tc.wantDropped)
+				}
+			}
+		})
 	}
 }
