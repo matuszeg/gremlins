@@ -237,7 +237,13 @@ func (p *preparer) sites(lp *packages.Package, idx []int) []Site {
 		node ast.Node
 		tok  token.Token
 	}
+	// ops is keyed by adjusted position, which is how the engine names a
+	// mutant. An operator a line directive moves (adjusted and raw positions
+	// differ) is never placed, and it poisons its adjusted key: a mutant
+	// there may be that operator's or the one whose raw position the key
+	// names, and the two cannot be told apart.
 	ops := map[tokenKey]op{}
+	moved := map[tokenKey]bool{}
 	for _, f := range lp.Syntax {
 		ast.Inspect(f, func(n ast.Node) bool {
 			var pos token.Pos
@@ -256,8 +262,13 @@ func (p *preparer) sites(lp *packages.Package, idx []int) []Site {
 			default:
 				return true
 			}
-			at := lp.Fset.PositionFor(pos, false)
-			ops[tokenKey{filepath.Clean(at.Filename), at.Line, at.Column}] = op{n, tok}
+			at, raw := lp.Fset.PositionFor(pos, true), lp.Fset.PositionFor(pos, false)
+			k := tokenKey{filepath.Clean(at.Filename), at.Line, at.Column}
+			if at != raw {
+				moved[k] = true
+			} else {
+				ops[k] = op{n, tok}
+			}
 
 			return true
 		})
@@ -268,6 +279,11 @@ func (p *preparer) sites(lp *packages.Package, idx []int) []Site {
 	for _, i := range idx {
 		pos := p.muts[i].Position()
 		k := tokenKey{p.file(i), pos.Line, pos.Column}
+		if moved[k] {
+			p.net(i, fmt.Sprintf("schemata: a line directive moves an operator to %s:%d:%d", k.file, k.line, k.column))
+
+			continue
+		}
 		o, ok := ops[k]
 		if !ok {
 			p.net(i, fmt.Sprintf("schemata: no mutation site at %s:%d:%d in the loaded source", k.file, k.line, k.column))

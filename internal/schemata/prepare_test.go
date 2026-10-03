@@ -458,3 +458,75 @@ func (m movedMutant) Pkg() string {
 
 	return m.Mutator.Pkg()
 }
+
+// TestPrepareLineDirective holds a mutant whose position a line directive
+// moves onto another operator of its own file to the per-mutant path: the
+// engine names mutants by adjusted positions, and placing one at the operator
+// the adjusted position names would switch the wrong operator.
+func TestPrepareLineDirective(t *testing.T) {
+	t.Parallel()
+	src := "package l\n\nfunc Add(a, b int) int { return a + b }\nfunc Mul(a, b int) int { return a * b }\nfunc Sub(a, b int) int { return a /*line l.go:3:35*/- b }\n"
+	dir := writeModule(t, map[string][]byte{
+		"l/l.go": []byte(src),
+		"l/l_test.go": []byte("package l\n\nimport \"testing\"\n\nfunc TestL(t *testing.T) {\n" +
+			"\tif Add(2, 3) != 5 || Mul(2, 3) != 6 || Sub(3, 1) != 2 {\n\t\tt.Error(\"wrong\")\n\t}\n}\n"),
+	})
+	mod := gomodule.GoModule{Name: "fixture", Root: dir, CallingDir: "."}
+
+	// Mul's and Sub's mutants, not Add's, as when Add is not covered: the
+	// directive gives Sub's '-' the position of Add's '+', where
+	// ARITHMETIC_BASE has a form; Mul, before the directive, is not moved.
+	set := token.NewFileSet()
+	file, err := parser.ParseFile(set, "l/l.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var in []mutator.Mutator
+	ast.Inspect(file, func(n ast.Node) bool {
+		node, ok := engine.NewTokenNode(n)
+		if !ok || set.PositionFor(node.TokPos, false).Line < 4 {
+			return true
+		}
+		mts, _ := engine.MutantTypesFor(node)
+		for _, mt := range mts {
+			if mt != mutator.ArithmeticBase {
+				// INVERT_NEGATIVES has no form at '+': it would drop the
+				// site, hiding the misplacement.
+				continue
+			}
+			m := engine.NewTokenMutant("fixture/l", set, file, node)
+			m.SetType(mt)
+			m.SetStatus(mutator.Runnable)
+			in = append(in, m)
+		}
+
+		return true
+	})
+	if len(in) == 0 {
+		t.Fatal("no mutant on Sub's line")
+	}
+	if len(in) != 2 {
+		t.Fatalf("%d mutants, want Mul's and Sub's", len(in))
+	}
+	if got, want := in[1].Position(), set.PositionFor(file.Pos()+token.Pos(strings.Index(src, "+")), false); got.Line != want.Line || got.Column != want.Column {
+		t.Fatalf("Sub's mutant is at %v, want the position of Add's '+' %v: the fixture moves nothing", got, want)
+	}
+
+	runs := &nullRuns{}
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, in, plan)
+	if len(plan.Placed) != 1 || plan.Placed[0].Mutator != in[0] {
+		for _, p := range plan.Placed {
+			t.Errorf("%s at %s placed", p.Mutator.Type(), p.Mutator.Position())
+		}
+		t.Errorf("want Mul's mutant alone placed: Sub's position names another operator")
+	}
+	for _, n := range plan.Netted {
+		if n.Mutator != in[1] || !strings.Contains(n.Reason, "line directive") {
+			t.Errorf("%s at %s netted with %q, want only Sub's, the line directive named", n.Mutator.Type(), n.Mutator.Position(), n.Reason)
+		}
+	}
+}
