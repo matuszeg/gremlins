@@ -21,9 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"go/format"
+	"go/token"
 	"slices"
 	"strings"
 	"text/template"
+
+	"github.com/go-gremlins/gremlins/internal/mutator"
 )
 
 // ErrUnknownHelper is the panic value of HelperSet.Use for a name that is not
@@ -54,7 +57,7 @@ func def(name string, public bool, needs, imports []string, src string) helperDe
 // "this mutant is absent at the site", and GREMLINS_MUTANT unset (or not a
 // number) also parses to 0, so without the test an absent mutant would be
 // switched on in every run that selects none.
-var helperDefs = []helperDef{
+var helperDefs = slices.Concat([]helperDef{
 	def("Active", true, nil, []string{"os", "strconv"}, `
 // {{.}}Active is the mutant this process runs: GREMLINS_MUTANT, or 0 for none.
 var {{.}}Active = func() int { n, _ := {{.}}strconv.Atoi({{.}}os.Getenv("GREMLINS_MUTANT")); return n }()
@@ -176,6 +179,73 @@ func {{.}}IncDecMap[M ~map[K]V, K comparable, V {{.}}Number](id int, m M, k K, i
 	arith("ANDNOT", "Integer", "&^", "&"),
 	shift("SHL", "<<", ">>"),
 	shift("SHR", ">>", "<<"),
+}, assignDefs())
+
+// assignDefs returns the op= statement helpers: for each operator, a helper
+// on *p and one on m[k], a map entry not being addressable; for += also the
+// string helpers, which have no INVERT_ASSIGNMENTS arm (s -= t is never
+// viable); for the shifts also the helpers whose count has a type of its
+// own, which have no REMOVE_SELF_ASSIGNMENTS arm (x = n is not viable then).
+// Their arms are written from assignMutations, one per mutator, in the
+// order of the helper's id parameters.
+func assignDefs() []helperDef {
+	var defs []helperDef
+	for _, tok := range assignTokens {
+		f := assignForms[tok]
+		specs := []assignSpec{{name: f.name + "Assign", tok: tok, mts: f.mts, elem: f.elem}}
+		switch tok { //nolint:exhaustive // only += and the shifts have extra helpers
+		case token.ADD_ASSIGN:
+			specs = append(specs, assignSpec{name: "ADDAssignStr", tok: tok, mts: f.mts[1:], elem: "~string"})
+		case token.SHL_ASSIGN, token.SHR_ASSIGN:
+			specs = append(specs, assignSpec{name: f.name + "AssignX", tok: tok, mts: f.mts[1:], elem: f.elem, mixed: true})
+		}
+		for _, sp := range specs {
+			defs = append(defs, sp.def(false), sp.def(true))
+		}
+	}
+
+	return defs
+}
+
+// assignSpec is one op= helper, on *p or, as <name>Map, on m[k].
+type assignSpec struct {
+	name  string
+	tok   token.Token
+	mts   []mutator.Type
+	elem  string // the operand's constraint: a helper constraint's name, or a literal ~T
+	mixed bool   // a shift whose count has a type parameter of its own
+}
+
+func (s assignSpec) def(onMap bool) helperDef {
+	var needs []string
+	elem := s.elem
+	if !strings.HasPrefix(elem, "~") {
+		needs = append(needs, elem)
+		elem = "{{.}}" + elem
+	}
+	tparams, vt := "T "+elem, "T"
+	if s.mixed {
+		needs = append(needs, "Integer")
+		tparams += ", U {{.}}Integer"
+		vt = "U"
+	}
+	name, target, params := s.name, "*p", "p *T, v "+vt
+	if onMap {
+		name += "Map"
+		tparams = "M ~map[K]T, K comparable, " + tparams
+		target, params = "m[k]", "m M, k K, v "+vt
+	}
+	idNames := make([]string, len(s.mts))
+	var arms strings.Builder
+	for i, mt := range s.mts {
+		idNames[i] = assignIDNames[mt]
+		to, _ := assignMutation(mt, s.tok)
+		fmt.Fprintf(&arms, "\tcase %[1]s != 0 && {{.}}Active == %[1]s:\n\t\t{{.}}Reached()\n\t\t%[2]s %[3]s v\n", idNames[i], target, to)
+	}
+	src := fmt.Sprintf("\n// {{.}}%[1]s is %[2]s %[3]s v.\nfunc {{.}}%[1]s[%[4]s](%[5]s int, %[6]s) {\n\tswitch {\n%[7]s\tdefault:\n\t\t%[2]s %[3]s v\n\t}\n}\n",
+		name, target, s.tok, tparams, strings.Join(idNames, ", "), params, arms.String())
+
+	return def(name, true, needs, nil, src)
 }
 
 // ordered is a comparison helper: idB is CONDITIONALS_BOUNDARY, idN is

@@ -43,6 +43,11 @@ var allHelpers = []string{
 	"Active", "Reached", "Bit", "Xor", "LSS", "LEQ", "GTR", "GEQ",
 	"ADD", "SUB", "MUL", "QUO", "REM", "NEG", "POS", "IncDec", "IncDecMap",
 	"AND", "OR", "XOR", "ANDNOT", "SHL", "SHR",
+	"ADDAssign", "ADDAssignMap", "ADDAssignStr", "ADDAssignStrMap", "SUBAssign", "SUBAssignMap",
+	"MULAssign", "MULAssignMap", "QUOAssign", "QUOAssignMap", "REMAssign", "REMAssignMap",
+	"ANDAssign", "ANDAssignMap", "ORAssign", "ORAssignMap", "XORAssign", "XORAssignMap",
+	"ANDNOTAssign", "ANDNOTAssignMap", "SHLAssign", "SHLAssignMap", "SHLAssignX", "SHLAssignXMap",
+	"SHRAssign", "SHRAssignMap", "SHRAssignX", "SHRAssignXMap",
 }
 
 // siteKind is the shape of the call the fixture makes for a site.

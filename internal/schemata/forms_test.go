@@ -61,6 +61,11 @@ type plainMutant struct {
 // compiles, the rewriter refuses it (TestNewRewriter), and the fixtures
 // promise only mutants that compile.
 func discover(f *ast.File) ([]schemata.Site, []plainMutant) {
+	return discoverFor(f, formsMutators)
+}
+
+// discoverFor is discover restricted to the mutators mts.
+func discoverFor(f *ast.File, mts []mutator.Type) ([]schemata.Site, []plainMutant) {
 	type found struct {
 		node ast.Node
 		pos  token.Pos
@@ -93,13 +98,13 @@ func discover(f *ast.File) ([]schemata.Site, []plainMutant) {
 		if slices.ContainsFunc(typeExprs, func(x ast.Node) bool { return x.Pos() <= n.Pos() && n.End() <= x.End() }) {
 			return true
 		}
-		mts, ok := engine.MutantTypesFor(tn)
+		cands, ok := engine.MutantTypesFor(tn)
 		if !ok {
 			return true
 		}
 		var keep []mutator.Type
-		for _, mt := range mts {
-			if slices.Contains(formsMutators, mt) {
+		for _, mt := range cands {
+			if slices.Contains(mts, mt) {
 				keep = append(keep, mt)
 			}
 		}
@@ -372,7 +377,7 @@ func TestNewRewriter(t *testing.T) {
 		"duplicate_mutator":  {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, muts: []mutator.Type{cn, cn}},
 		"no_mutants":         {src: "func f(a, b int) bool { return a < b }", tok: token.LSS},
 		"tok_mismatch":       {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, siteTok: token.GTR, muts: []mutator.Type{cn}},
-		"assign_stmt":        {src: "func f(a int) { a += 1 }", tok: token.ADD_ASSIGN, muts: []mutator.Type{mutator.InvertAssignments}},
+		"assign_stmt":        {src: "func f(a int) { a += 1 }", tok: token.ADD_ASSIGN, muts: []mutator.Type{mutator.InvertAssignments}, want: "switch _zzActive { case 1: _zzReached(); a -= 1; default: a += 1 }"},
 		"nested_outer":       {src: "func f(a, b, c int) bool { return a+b < c }", tok: token.LSS, muts: []mutator.Type{cb}, want: "_zzLSS(1, 0, a+b, c)"},
 	}
 	runRewriterCases(t, cases)
