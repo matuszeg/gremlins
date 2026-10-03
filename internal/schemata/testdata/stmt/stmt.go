@@ -209,6 +209,36 @@ func SimpleShift(x, n uint, c uint8) ([]uint, map[int]uint) {
 	return v[:], m
 }
 
+// SimpleShiftConst has the shifts in a switch statement's init and over
+// several lines with a constant count, which the helper takes as the value's
+// type: untyped, typed, and a rune. Each has its REMOVE_SELF_ASSIGNMENTS
+// mutant, x = count, the constant converted to the value's type.
+func SimpleShiftConst(x uint, b uint8) ([]uint, map[int]uint, uint8, uint8) {
+	const k uint = 3
+	v := [4]uint{x, x, x, x}
+	m := map[int]uint{0: x, 1: x, 2: x}
+	switch v[0] <<= 2; {
+	}
+	switch v[1] >>= 1; {
+	}
+	switch v[2] <<= k; {
+	}
+	switch v[3] >>= '\x01'; {
+	}
+	switch m[0] <<= 2; {
+	}
+	switch m[1] >>= k; {
+	}
+	m[2] <<=
+		1
+	switch b <<= 7; {
+	}
+	c := b + 5
+	c >>=
+		2
+	return v[:], m, b, c
+}
+
 // SimpleFloat and SimpleString cover the other element types.
 func SimpleFloat(x, y float64) (float64, map[string]float64) {
 	m := map[string]float64{"k": x}
