@@ -50,3 +50,12 @@ func BreakDupMutant(err error, id int) error {
 
 	return err
 }
+
+// Mirrors of the helper constraints, which the external tests hold against
+// the constraints the generated helpers declare.
+var (
+	NumberConstraint  = numberConstraint
+	IntegerConstraint = integerConstraint
+	OrderedConstraint = orderedConstraint
+	StringConstraint  = stringConstraint
+)

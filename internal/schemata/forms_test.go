@@ -388,7 +388,6 @@ func TestNewRewriter(t *testing.T) {
 type rewriterCase struct {
 	src     string // a file body after "package p"
 	tok     token.Token
-	nth     int // which node with tok, in source order
 	siteTok token.Token
 	muts    []mutator.Type
 	want    string // empty: want ErrUnsupported
@@ -452,13 +451,9 @@ func runRewriterCases(t *testing.T, cases map[string]rewriterCase) {
 				info.Uses = nil
 			}
 			var node ast.Node
-			seen := 0
 			ast.Inspect(f, func(n ast.Node) bool {
 				if tn, ok := engine.NewTokenNode(n); ok && tn.Tok() == tc.tok && node == nil {
-					if seen == tc.nth {
-						node = n
-					}
-					seen++
+					node = n
 				}
 
 				return true
@@ -490,6 +485,50 @@ func runRewriterCases(t *testing.T, cases map[string]rewriterCase) {
 			}
 			if err != nil || got != tc.want {
 				t.Errorf("got %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestMirrorConstraintsMatchTheHelpers holds each constraint forms.go uses to
+// pre-check an operand type against the constraint the generated helper
+// declares: a mirror that drifts from its helper would emit calls the
+// compiler rejects, or refuse sites the helper accepts.
+func TestMirrorConstraintsMatchTheHelpers(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct {
+		helper string
+		mirror *types.Interface
+	}{
+		"number":  {helper: "ADD", mirror: schemata.NumberConstraint},
+		"integer": {helper: "REM", mirror: schemata.IntegerConstraint},
+		"ordered": {helper: "LSS", mirror: schemata.OrderedConstraint},
+		"string":  {helper: "ADDAssignStr", mirror: schemata.StringConstraint},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			h := &schemata.HelperSet{}
+			h.Use(tc.helper)
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "helpers.go", helperFile(t, h, "p", testPrefix), 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pkg, err := (&types.Config{Importer: importer.Default()}).Check("p", fset, []*ast.File{f}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fn, ok := pkg.Scope().Lookup(testPrefix + tc.helper).(*types.Func)
+			if !ok {
+				t.Fatalf("no function %s%s", testPrefix, tc.helper)
+			}
+			// The constraint under test is the last type parameter of each helper
+			// named above, each of which has only the one.
+			tps := fn.Type().(*types.Signature).TypeParams()
+			got := tps.At(tps.Len() - 1).Constraint().Underlying()
+			if !types.Identical(got, tc.mirror) {
+				t.Errorf("helper %s constrains %s, forms.go mirrors it as %s", tc.helper, got, tc.mirror)
 			}
 		})
 	}

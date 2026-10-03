@@ -40,6 +40,8 @@ func TestPrint(t *testing.T) {
 	show("MultiLine", func() any { return MultiLine(3, 4) })
 	show("Commented", func() any { return []bool{Commented(1, 2), Commented(2, 2)} })
 	show("Nested", func() any { return []bool{Nested(1, 1, 3), Nested(1, 2, 3), Nested(2, 2, 3)} })
+	show("NestedEq", func() any { return []bool{NestedEq(1, 2), NestedEq(2, 2), NestedEq(0, 0)} })
+	show("GAddOne", func() any { return []any{GAddOne(1), GAddOne(2.5)} })
 	show("Order", func() any { r, x := Order(); return []any{r, x} })
 	show("IncIdent", func() any { return IncIdent() })
 	show("DecField", func() any { return DecField() })
