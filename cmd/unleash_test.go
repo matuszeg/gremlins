@@ -146,7 +146,7 @@ func TestUnleash(t *testing.T) {
 		{
 			name:     "schemata",
 			flagType: "bool",
-			defValue: "false",
+			defValue: "true",
 		},
 		{
 			name:      "tags",
@@ -217,6 +217,38 @@ func TestUnleash(t *testing.T) {
 		if mtf.DefValue != wantDef {
 			t.Errorf("expected %q have default %q, got %q", s, wantDef, mtf.DefValue)
 		}
+	}
+}
+
+// TestSchemataIsDefault checks that a run given no schemata flag or config key
+// resolves to the schema path, and that --schemata=false opts out of it.
+func TestSchemataIsDefault(t *testing.T) {
+	testCases := map[string]struct {
+		args []string
+		want bool
+	}{
+		"no_flag":      {args: nil, want: true},
+		"explicit_off": {args: []string{"--schemata=false"}, want: false},
+		"explicit_on":  {args: []string{"--schemata"}, want: true},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			viper.Reset()
+			t.Cleanup(viper.Reset)
+			c, err := newUnleashCmd(context.Background())
+			if err != nil {
+				t.Fatal("newUnleashCmd should not fail")
+			}
+			c.cmd.RunE = func(_ *cobra.Command, _ []string) error { return nil }
+			c.cmd.SetArgs(tc.args)
+			if err := c.cmd.Execute(); err != nil {
+				t.Fatal("Execute should not fail")
+			}
+			if got := configuration.Get[bool](configuration.UnleashSchemataKey); got != tc.want {
+				t.Errorf("schemata = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

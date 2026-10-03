@@ -409,6 +409,48 @@ Enables/disables the [REMOVE_SELF ASSIGNMENTS](../../mutations/remove_self_assig
 gremlins unleash --remove-self-assignments
 ```
 
+### Schemata
+
+:material-flag: `--schemata` · :material-sign-direction: Default: `true`
+
+Compiles all the mutants of a run into one set of test binaries, instead of building the tests once per mutant.
+
+Building and linking the tests dominates the cost of a mutant, so a run that builds once and switches mutants at
+run time is much faster. Gremlins rewrites the code under test so that every mutant is present in the binary,
+and each test run selects the one to activate through the `GREMLINS_MUTANT` environment variable.
+The rewritten code records that the active mutant's code actually ran in the file named by `GREMLINS_REACHED`.
+
+The two ways of running differ in how a mutant is classified, because reaching the code is observed directly:
+
+* a mutant whose code never ran during the tests is `NOT COVERED`, whatever the exit status of the tests;
+* a test failure without the mutant's code having run is `ERRORED`, not `KILLED`.
+
+A mutant Gremlins cannot place in the rewritten code falls back to a per-mutant build automatically,
+and the result is unchanged. At the end of the run, a summary line reports how many mutants went each way:
+
+```text
+Schemata: placed 118, per-mutant path 4
+```
+
+When the schema cannot be used at all, the line says why, and every mutant takes the per-mutant path:
+
+```text
+Schemata: not used (dry run), per-mutant path 122
+```
+
+To inspect what Gremlins built, set `GREMLINS_SCHEMATA_KEEP=<dir>`: the test binaries, the rewritten source
+and an index of the mutant ids are kept in `<dir>`.
+
+```shell
+GREMLINS_SCHEMATA_KEEP=/tmp/schemata gremlins unleash
+```
+
+To go back to one build per mutant:
+
+```shell
+gremlins unleash --schemata=false
+```
+
 ### Tags
 
 :material-flag: `--tags`/`-t` · :material-sign-direction: Default: empty
