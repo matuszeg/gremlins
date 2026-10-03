@@ -1,6 +1,8 @@
-// Package calc holds the sites the schemata parity run compares: each of the
-// five default mutators, a suppressed site, an uncovered function, a mutant
-// that outlives the test timeout and two operators on one line.
+// Package calc holds the sites the schemata parity run compares: a KILLED
+// and a LIVED mutant of every mutator, a suppressed site, an uncovered
+// function, a mutant that outlives the test timeout, two operators on one
+// line, constant sites (consts.go) and a line only another package's test
+// executes (Twice).
 package calc
 
 import "time"
@@ -42,3 +44,41 @@ func Unused(a, b int) int { return a * b }
 // the '*' one live (c == 1, where * and / agree), so a schema id that switched
 // the other operator would change both verdicts.
 func Mix(a, b, c int) int { return a + b*c }
+
+// Clamp is checked only at 0, where neither of its mutants changes the
+// result: both live.
+func Clamp(x int) int {
+	if x < 0 {
+		return 0
+	}
+
+	return x
+}
+
+// Bump is checked at 5: the decrement lives, the negated != is killed.
+func Bump(x int) bool {
+	x++
+
+	return x != 0
+}
+
+// Flip is checked only at 0, where -x and +x agree: its mutants live.
+func Flip(x int) int { return -x }
+
+// Acc is pinned by TestAcc: both of its assignment mutants are killed.
+func Acc(a, b int) int {
+	a += b
+
+	return a
+}
+
+// Grow is checked only at (1, 1), where *=, /= and = agree: its mutants live.
+func Grow(a, b int) int {
+	a *= b
+
+	return a
+}
+
+// Twice is executed by no test of calc, only by parity/other's TestQuad,
+// which kills its mutant when --cross-package runs it.
+func Twice(x int) int { return x * 2 }
