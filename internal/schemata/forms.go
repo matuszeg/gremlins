@@ -103,8 +103,8 @@ type rewriter struct {
 	prefix string
 	h      *HelperSet
 
-	// parents maps each node of files to its parent, built on the first
-	// constant-valued site.
+	// parents maps each node of files to its parent, built by the first
+	// call of parent.
 	parents map[ast.Node]ast.Node
 }
 
@@ -141,6 +141,12 @@ func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) 
 		}
 
 		return r.incDec(s, n, inner)
+	case *ast.AssignStmt:
+		if err := checkTok(s, n.Tok); err != nil {
+			return "", err
+		}
+
+		return r.assign(s, n, inner)
 	}
 
 	return "", fmt.Errorf("%w: %T site", ErrUnsupported, s.Node)
@@ -504,17 +510,16 @@ func (r *rewriter) incDec(s Site, st *ast.IncDecStmt, inner func(ast.Node) strin
 	if err := satisfies(t, numberConstraint); err != nil {
 		return "", err
 	}
-	if r.info.Types[st.X].Addressable() {
-		return r.call("IncDec", id, "&"+inner(st.X), inc), nil
-	}
-	ix, ok := ast.Unparen(st.X).(*ast.IndexExpr)
-	if !ok || !r.isMap(ix.X) {
+	args, onMap, ok := r.target(st.X, inner)
+	if !ok {
 		return "", fmt.Errorf("%w: %s operand neither addressable nor a map entry", ErrUnsupported, st.Tok)
 	}
-	m := inner(ix.X)
-	k := strings.Trim(inner(srcRange{ix.Lbrack + 1, ix.Rbrack}), " \t")
+	name := "IncDec"
+	if onMap {
+		name = "IncDecMap"
+	}
 
-	return r.call("IncDecMap", id, m, k, inc), nil
+	return r.call(name, id, append(args, inc)...), nil
 }
 
 // isMap reports whether x has a map type. An operand of type-parameter

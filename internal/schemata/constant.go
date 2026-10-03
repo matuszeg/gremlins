@@ -94,26 +94,7 @@ func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (st
 // parenthesis. It refuses e inside a const declaration or an array length,
 // at any depth: anything there must stay constant.
 func (r *rewriter) context(e ast.Expr) (ast.Node, error) {
-	if r.parents == nil {
-		r.parents = map[ast.Node]ast.Node{}
-		for _, f := range r.files {
-			var stack []ast.Node
-			ast.Inspect(f, func(n ast.Node) bool {
-				if n == nil {
-					stack = stack[:len(stack)-1]
-
-					return false
-				}
-				if len(stack) > 0 {
-					r.parents[n] = stack[len(stack)-1]
-				}
-				stack = append(stack, n)
-
-				return true
-			})
-		}
-	}
-	if _, ok := r.parents[e]; !ok {
+	if _, ok := r.parent(e); !ok {
 		return nil, fmt.Errorf("%w: constant site outside the package's files", ErrUnsupported)
 	}
 	var ctx ast.Node

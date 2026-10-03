@@ -28,3 +28,7 @@ var RewritePackageWith = rewritePackage
 
 // BinaryNames exposes binaryNames.
 var BinaryNames = binaryNames
+
+// AssignMutation exposes assignMutation to the external tests, which hold
+// it against the engine's table.
+var AssignMutation = assignMutation
