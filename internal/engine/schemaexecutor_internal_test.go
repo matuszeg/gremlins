@@ -69,3 +69,42 @@ func TestClassifyDirect(t *testing.T) {
 		})
 	}
 }
+
+func TestCombineRuns(t *testing.T) {
+	t.Parallel()
+
+	var (
+		runTimedOut = runResult{status: mutator.RunTimedOut}
+		timedOut    = runResult{status: mutator.TimedOut}
+		signalled   = runResult{status: mutator.Errored, noVerdict: true}
+		killed      = runResult{status: mutator.Killed}
+		failed      = runResult{status: mutator.Errored}
+		lived       = runResult{status: mutator.Lived}
+		notCovered  = runResult{status: mutator.NotCovered}
+	)
+	testCases := map[string]struct {
+		runs []runResult
+		want mutator.Status
+	}{
+		"no_runs":                         {want: mutator.NotCovered},
+		"run_timeout_beats_backstop":      {runs: []runResult{timedOut, runTimedOut}, want: mutator.RunTimedOut},
+		"backstop_beats_no_verdict":       {runs: []runResult{signalled, timedOut}, want: mutator.TimedOut},
+		"no_verdict_beats_kill":           {runs: []runResult{killed, signalled}, want: mutator.Errored},
+		"kill_beats_unreached_failure":    {runs: []runResult{failed, killed}, want: mutator.Killed},
+		"unreached_failure_beats_lived":   {runs: []runResult{lived, failed}, want: mutator.Errored},
+		"reached_first":                   {runs: []runResult{lived, notCovered}, want: mutator.Lived},
+		"reached_last":                    {runs: []runResult{notCovered, lived}, want: mutator.Lived},
+		"none_reached":                    {runs: []runResult{notCovered, notCovered}, want: mutator.NotCovered},
+		"kill_then_timeout":               {runs: []runResult{killed, runTimedOut}, want: mutator.RunTimedOut},
+		"timeout_then_kill_order_ignored": {runs: []runResult{runTimedOut, killed, lived}, want: mutator.RunTimedOut},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := combineRuns(tc.runs); got != tc.want {
+				t.Errorf("combineRuns() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
