@@ -169,12 +169,16 @@ type binaryRun struct {
 }
 
 // plan resolves each selected package to its binary and its directory in the
-// worker copy, in selection order. Any package it cannot resolve fails the
-// whole plan: running the others alone could miss the test that kills the
-// mutant.
+// worker copy, in selection order. A package with no test files has no run:
+// legacy's go test reports it "? pkg [no test files]" and passes it, which is
+// a pass without reach. Any other package it cannot resolve fails the whole
+// plan: running the others alone could miss the test that kills the mutant.
 func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) {
 	runs := make([]binaryRun, 0, len(sel.pkgs))
 	for _, pkg := range sel.pkgs {
+		if s.build.NoTests[pkg] {
+			continue
+		}
 		bin, ok := s.build.Binaries[pkg]
 		if !ok {
 			return nil, fmt.Errorf("no schema test binary for %s", pkg)

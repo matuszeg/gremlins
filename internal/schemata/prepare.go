@@ -69,16 +69,16 @@ const nullFailed = "null-mutant run failed: "
 //
 // The mutants get ids 1..N in the order runnable lists them. Mutants of one
 // package at one operator token form one Site. Each package is loaded with
-// tags and rewritten; every package with a placed site, and every package
-// testPkgs names for it, has its test binary built in workDir within
-// allowance. Each binary then runs once without a mutant selected through
+// tags and rewritten; every package testPkgs names for a package with a
+// placed site has its test binary built in workDir within allowance; one with
+// no test files has none, and is no failure: its run passes without reach. Each binary then runs once without a mutant selected through
 // nullRun, given the package's directory in mod -- the original source, as
 // a worker runs it -- and once more if that fails.
 //
 // A mutant is netted, with a reason and an error log line, when it maps to
-// no operator in the loaded source, when the rewrite drops its site, or when
-// the build or the second null run of its own package or of a package
-// testPkgs names for it fails. Every mutant of runnable ends in exactly one
+// no operator in the loaded source, when the rewrite drops its site, when
+// testPkgs names no package for its package, or when the build or the second
+// null run of a package testPkgs names for it fails. Every mutant of runnable ends in exactly one
 // of Placed and Netted. Prepare writes nothing outside workDir, which the
 // caller removes. A relative mod.Root is taken from the working directory.
 // The error is the context's, when it ends first.
@@ -104,11 +104,12 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		need := map[string][]string{}
 		var all []string
 		for _, pkg := range placedPkgs {
-			need[pkg] = append([]string{pkg}, testPkgs(pkg)...)
+			need[pkg] = testPkgs(pkg)
 			all = append(all, need[pkg]...)
 		}
 		slices.Sort(all)
 		all = slices.Compact(all)
+		p.netUnselected(need)
 
 		start := time.Now()
 		b, errs := BuildAll(ctx, mod.Root, workDir, tags, rewritten, all, allowance)
@@ -333,6 +334,20 @@ func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]st
 	}
 
 	return nil
+}
+
+// noTestPackage is the reason a mutant is netted when its package's mutants
+// select no test package: what to run then is the per-mutant path's to decide.
+const noTestPackage = "no test package selected"
+
+// netUnselected nets every still-placed mutant whose package's mutants select
+// no test package.
+func (p *preparer) netUnselected(need map[string][]string) {
+	for i := range p.muts {
+		if pkg := p.pkgOf[i]; pkg != "" && len(need[pkg]) == 0 {
+			p.net(i, noTestPackage)
+		}
+	}
 }
 
 // netFailed nets every still-placed mutant whose own package, or a package

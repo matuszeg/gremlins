@@ -56,6 +56,9 @@ type Build struct {
 	// Rewritten lists, sorted and relative to the module root, every file
 	// the copy rewrites or adds.
 	Rewritten []string
+	// NoTests holds each package that built without test files: it has no
+	// binary, and its run passes without reaching any mutant.
+	NoTests map[string]bool
 }
 
 // BuildAll copies the module at modRoot into workDir, writes the rewritten
@@ -64,8 +67,9 @@ type Build struct {
 // and compiles the test binary of every package in testPkgs with `go test
 // -c`, at most runtime.NumCPU() at a time, all within allowance. A package
 // whose files cannot be written or whose binary does not build has its error
-// in the returned map and no binary; the other packages keep theirs. If the
-// module cannot be copied, every package has that error.
+// in the returned map and no binary; the other packages keep theirs. A
+// package that builds without test files is in Build.NoTests, with neither.
+// If the module cannot be copied, every package has that error.
 func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[string]map[string][]byte,
 	testPkgs []string, allowance time.Duration,
 ) (Build, map[string]error) {
@@ -96,7 +100,7 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 	}
 	defer func() { _ = os.RemoveAll(goTmp) }()
 
-	b := Build{Dir: dir, Binaries: map[string]string{}}
+	b := Build{Dir: dir, Binaries: map[string]string{}, NoTests: map[string]bool{}}
 	for _, p := range slices.Sorted(maps.Keys(rewritten)) {
 		rels, err := writeFiles(modRoot, dir, rewritten[p])
 		b.Rewritten = append(b.Rewritten, rels...)
@@ -126,6 +130,11 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 			err := buildTest(ctx, dir, goTmp, bin, tags, p)
 			mu.Lock()
 			defer mu.Unlock()
+			if errors.Is(err, ErrNoTestBinary) {
+				b.NoTests[p] = true
+
+				return
+			}
 			if err != nil {
 				errs[p] = err
 

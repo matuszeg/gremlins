@@ -25,6 +25,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path"
@@ -444,6 +445,59 @@ func TestPrepareStopsWhenCancelled(t *testing.T) {
 	runs := &nullRuns{}
 	if _, err := schemata.Prepare(ctx, mod, t.TempDir(), "", streamMutants(t, mod), ownPackage, time.Minute, runs.run); !errors.Is(err, context.Canceled) {
 		t.Errorf("Prepare on a cancelled context: err = %v, want context.Canceled", err)
+	}
+}
+
+// TestPrepareBuildSet checks that Prepare builds exactly the packages the
+// mutants select: an unselected package of a mutant is not built, a mutant
+// whose selection is empty is netted, and a selected package with no test
+// files is no failure -- its run passes without reach -- and no binary.
+func TestPrepareBuildSet(t *testing.T) {
+	t.Parallel()
+	mod := prepareModule(t)
+	b, c, d := prepareMod+"/b", prepareMod+"/c", prepareMod+"/d"
+	var in []mutator.Mutator
+	for _, m := range streamMutants(t, mod) {
+		if m.Pkg() == b || m.Pkg() == c || m.Pkg() == d {
+			in = append(in, m)
+		}
+	}
+	testPkgs := func(p string) []string {
+		switch p {
+		case b:
+			return nil
+		case c:
+			return []string{c, d}
+		default:
+			return []string{prepareMod + "/a"}
+		}
+	}
+	runs := &nullRuns{}
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, in, plan)
+	g := byPkg(plan)
+	if len(g.placed[b]) != 0 || len(g.netted[b]) == 0 {
+		t.Errorf("b: placed %v netted %v, want all netted", g.placed[b], g.netted[b])
+	}
+	for _, r := range g.reasons[b] {
+		if r != "no test package selected" {
+			t.Errorf("b netted with %q, want %q", r, "no test package selected")
+		}
+	}
+	for _, p := range []string{c, d} {
+		if len(g.netted[p]) != 0 || len(g.placed[p]) == 0 {
+			t.Errorf("%s: placed %v netted %v (%v), want all placed", p, g.placed[p], g.netted[p], g.reasons[p])
+		}
+	}
+	got := slices.Sorted(maps.Keys(plan.Build.Binaries))
+	if want := []string{prepareMod + "/a", c}; !slices.Equal(got, want) {
+		t.Errorf("binaries for %v, want %v: only the selected packages with tests", got, want)
+	}
+	if !plan.Build.NoTests[d] || len(plan.Build.NoTests) != 1 {
+		t.Errorf("NoTests = %v, want d alone", plan.Build.NoTests)
 	}
 }
 

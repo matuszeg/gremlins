@@ -45,8 +45,9 @@ import (
 )
 
 const (
-	calcPkg = "schemaexec/calc"
-	usePkg  = "schemaexec/use"
+	calcPkg   = "schemaexec/calc"
+	usePkg    = "schemaexec/use"
+	notestPkg = "schemaexec/notest"
 )
 
 // schemaMutators are the mutators the schemata prototype rewrites.
@@ -70,7 +71,8 @@ type schemaFixture struct {
 }
 
 // buildSchemaFixture discovers the mutants of the calc package, rewrites it
-// and builds the test binaries of calc and use from the schema copy.
+// and builds the test binaries of calc and use from the schema copy; notest,
+// which has no test files, is built too and has none.
 func buildSchemaFixture(t *testing.T) schemaFixture {
 	t.Helper()
 	modRoot, err := filepath.Abs("testdata/schemaexec")
@@ -125,11 +127,14 @@ func buildSchemaFixture(t *testing.T) schemaFixture {
 		t.Fatalf("sites dropped: %v", dropped)
 	}
 	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "",
-		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg}, 5*time.Minute)
+		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg, notestPkg}, 5*time.Minute)
 	for p, err := range errs {
 		if err != nil {
 			t.Fatalf("build %s: %v", p, err)
 		}
+	}
+	if !b.NoTests[notestPkg] {
+		t.Fatalf("notest not recorded as having no tests: %v", b.NoTests)
 	}
 
 	return schemaFixture{
@@ -328,6 +333,20 @@ func testSchemaVerdicts(t *testing.T, fx schemaFixture) {
 			set:  map[string]any{configuration.UnleashCrossPackageKey: true},
 			opts: []engine.ExecutorDealerOption{engine.WithDependents(dependentsStub{calcPkg: {usePkg}})},
 			want: mutator.Killed,
+		},
+		// A selected package with no test files runs nothing, as legacy's
+		// "? pkg [no test files]": calc's verdict stands.
+		"killed_with_no_test_files_dependent": {
+			key:  "Add/ARITHMETIC_BASE",
+			set:  map[string]any{configuration.UnleashCrossPackageKey: true},
+			opts: []engine.ExecutorDealerOption{engine.WithDependents(dependentsStub{calcPkg: {notestPkg}})},
+			want: mutator.Killed,
+		},
+		"lived_with_no_test_files_dependent": {
+			key:  "Scale/ARITHMETIC_BASE",
+			set:  map[string]any{configuration.UnleashCrossPackageKey: true},
+			opts: []engine.ExecutorDealerOption{engine.WithDependents(dependentsStub{calcPkg: {notestPkg}})},
+			want: mutator.Lived,
 		},
 		"selected_tests_do_not_reach": {
 			key: "Scale/ARITHMETIC_BASE",
