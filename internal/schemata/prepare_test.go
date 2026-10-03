@@ -522,6 +522,22 @@ func TestPrepareBuildSet(t *testing.T) {
 	if !plan.Build.NoTests[d] || len(plan.Build.NoTests) != 1 {
 		t.Errorf("NoTests = %v, want d alone", plan.Build.NoTests)
 	}
+
+	// With every mutant's selection empty, nothing is built at all.
+	var onlyB []mutator.Mutator
+	for _, m := range in {
+		if m.Pkg() == b {
+			onlyB = append(onlyB, m)
+		}
+	}
+	plan, err = schemata.Prepare(context.Background(), mod, t.TempDir(), "", onlyB, testPkgs, 2*time.Minute, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, onlyB, plan)
+	if len(plan.Placed) != 0 || plan.Build.Dir != "" {
+		t.Errorf("placed %d, build in %q; want nothing placed and nothing built", len(plan.Placed), plan.Build.Dir)
+	}
 }
 
 // TestPrepareLogsShortReasons nets twopkgs' mutants with long reasons -- a
