@@ -87,6 +87,7 @@ func TestSchemataParity(t *testing.T) {
 	}
 	runnable := len(legacy) - seen[mutator.NotCovered] - seen[mutator.Skipped]
 	checkSharedLine(t, modRoot, legacy)
+	checkDuplicatedVerdicts(t, modRoot, legacy)
 	checkEveryMutator(t, legacy)
 	checkFixtureSites(t, modRoot, legacy)
 
@@ -351,6 +352,26 @@ func checkSharedLine(t *testing.T, modRoot string, legacy map[string]mutator.Sta
 	}
 	if line == 0 || got[mutator.Killed] != 1 || got[mutator.Lived] != 1 || len(got) != 2 {
 		t.Errorf("Mix (line %d) mutants by status = %v, want one KILLED and one LIVED", line, got)
+	}
+}
+
+// checkDuplicatedVerdicts requires the fixture's Width constant -- an array
+// length that Width also uses at run time -- to have KILLED and LIVED
+// mutants, and no other status, without --schemata. Both are placed by duplicating Width, so
+// the parity on it carries function duplication through both verdicts: the
+// LIVED one shows that the copy, entered under its own id only, changes
+// nothing a test does not observe.
+func checkDuplicatedVerdicts(t *testing.T, modRoot string, legacy map[string]mutator.Status) {
+	t.Helper()
+	line := fixtureLine(t, modRoot, "consts.go", "\tconst w")
+	got := map[mutator.Status][]string{}
+	for k, st := range legacy {
+		if strings.HasPrefix(k, fmt.Sprintf("calc/consts.go:%d:", line)) {
+			got[st] = append(got[st], k)
+		}
+	}
+	if line == 0 || len(got[mutator.Killed]) == 0 || len(got[mutator.Lived]) == 0 || len(got) != 2 {
+		t.Errorf("Width's constant (consts.go:%d) mutants by status = %v, want KILLED and LIVED ones only", line, got)
 	}
 }
 
