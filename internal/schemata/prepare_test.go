@@ -310,16 +310,22 @@ func TestPrepare(t *testing.T) {
 	if !strings.Contains(out.String(), fmt.Sprintf("schemata: %d mutants placed, %d netted", len(plan.Placed), len(plan.Netted))) {
 		t.Errorf("info log lacks the counts:\n%s", out.String())
 	}
-	for _, p := range plan.Placed {
-		line := fmt.Sprintf("schemata: id %d = %s %s\n", p.ID, p.Mutator.Position(), p.Mutator.Type())
-		if !strings.Contains(out.String(), line) {
-			t.Errorf("info log lacks %q", line)
-		}
-	}
+	checkPlacedLogged(t, out.String(), plan)
 	for _, n := range plan.Netted {
 		line := fmt.Sprintf("schemata: %s at %s goes through the per-mutant path: %s\n", n.Mutator.Type(), n.Mutator.Position(), n.Reason)
 		if !strings.Contains(eOut.String(), line) {
 			t.Errorf("error log lacks %q", line)
+		}
+	}
+}
+
+// checkPlacedLogged requires the info log out to name each placed mutant's id.
+func checkPlacedLogged(t *testing.T, out string, plan schemata.Plan) {
+	t.Helper()
+	for _, p := range plan.Placed {
+		line := fmt.Sprintf("schemata: id %d = %s %s\n", p.ID, p.Mutator.Position(), p.Mutator.Type())
+		if !strings.Contains(out, line) {
+			t.Errorf("info log lacks %q", line)
 		}
 	}
 }

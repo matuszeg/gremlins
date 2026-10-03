@@ -170,7 +170,7 @@ func keepSchemata(dir string, plan schemata.Plan) error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(dir, "index.json"), data, 0o600)
+	return os.WriteFile(filepath.Join(dir, "index.json"), data, 0o600) //nolint:gosec // G703: dir is the user's own GREMLINS_SCHEMATA_KEEP
 }
 
 // copyFile copies src to dst with mode perm, making dst's directory.
@@ -179,11 +179,11 @@ func copyFile(src, dst string, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil { //nolint:gosec // G703: under the user's own GREMLINS_SCHEMATA_KEEP
 		return err
 	}
 
-	return os.WriteFile(dst, data, perm)
+	return os.WriteFile(dst, data, perm) //nolint:gosec // G703: under the user's own GREMLINS_SCHEMATA_KEEP
 }
 
 // prepareSchemata runs Prepare over runnable in a fresh directory of the
