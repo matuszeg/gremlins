@@ -18,6 +18,7 @@ package schemata
 
 import (
 	"go/ast"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -87,6 +88,27 @@ func TestLayoutSpansWithRepeatedText(t *testing.T) {
 			}
 			if _, ok := bad[mutantKey{blamed, 0}]; !ok || len(bad) != 1 {
 				t.Errorf("blamed %v, want only %v", bad, blamed)
+			}
+		})
+	}
+}
+
+// TestUniquePackages checks that BuildAll's list of packages to build holds
+// each path once, in first-seen order: a repeat would start two
+// `go test -c` writing the one binary.
+func TestUniquePackages(t *testing.T) {
+	t.Parallel()
+	cases := map[string]struct{ in, want []string }{
+		"none":        {in: nil, want: []string{}},
+		"distinct":    {in: []string{"m/b", "m/a"}, want: []string{"m/b", "m/a"}},
+		"repeats":     {in: []string{"m/b", "m/a", "m/b", "m/a", "m/b"}, want: []string{"m/b", "m/a"}},
+		"only_repeat": {in: []string{"m/a", "m/a"}, want: []string{"m/a"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := uniquePackages(tc.in); !slices.Equal(got, tc.want) {
+				t.Errorf("uniquePackages(%v) = %v, want %v", tc.in, got, tc.want)
 			}
 		})
 	}
