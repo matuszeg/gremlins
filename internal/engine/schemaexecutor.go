@@ -17,6 +17,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -165,7 +166,7 @@ func (s *schemaExecutor) fallBack(w *workerpool.Worker, reason string) {
 
 // binaryRun is one package's test binary and where it runs.
 type binaryRun struct {
-	bin, dir, overlay string
+	pkg, bin, dir, overlay string
 }
 
 // plan resolves each selected package to its binary and its directory in the
@@ -187,7 +188,7 @@ func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) 
 		if !ok {
 			return nil, fmt.Errorf("%s is not a package of module %s", pkg, s.legacy.module.Name)
 		}
-		runs = append(runs, binaryRun{bin: bin, dir: dir})
+		runs = append(runs, binaryRun{pkg: pkg, bin: bin, dir: dir})
 	}
 
 	return runs, nil
@@ -197,6 +198,10 @@ func (s *schemaExecutor) plan(rootDir string, sel testRun) ([]binaryRun, error) 
 // selected packages does, and combines their verdicts with combineRuns. Only a
 // cancelled run ends it early. reach is the file the mutant's site creates
 // when it runs.
+//
+// A mutant booked ERRORED is a broken baseline, an environment fault or a
+// flake, and the one-line verdict cannot tell them apart: each ERRORED run
+// that went into the verdict logs its account of itself.
 func (s *schemaExecutor) runAll(reach string, tests []string, runs []binaryRun) mutator.Status {
 	results := make([]runResult, 0, len(runs))
 	for _, r := range runs {
@@ -210,16 +215,27 @@ func (s *schemaExecutor) runAll(reach string, tests []string, runs []binaryRun) 
 		results = append(results, res)
 	}
 
-	return combineRuns(results)
+	status := combineRuns(results)
+	if status == mutator.Errored {
+		for _, r := range results {
+			if r.status == mutator.Errored {
+				log.Errorf("test run for %s booked ERRORED: %s", s.legacy.mutant.Position(), r.explanation)
+			}
+		}
+	}
+
+	return status
 }
 
 // runResult is one package run's verdict. noVerdict marks an ERRORED run
 // that reached no verdict at all -- the binary was signalled, never started,
 // or the stale reach file could not be cleared -- as opposed to one whose
-// tests failed without reaching the mutant's site.
+// tests failed without reaching the mutant's site. explanation is set only
+// on an ERRORED run: runOutput.explain's account of it.
 type runResult struct {
-	status    mutator.Status
-	noVerdict bool
+	status      mutator.Status
+	explanation string
+	noVerdict   bool
 }
 
 // combineRuns is the verdict of a mutant over its package runs, read the way
@@ -278,7 +294,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 	if err := os.Remove(reach); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Errorf("test run for %s reached no verdict: cannot clear %s: %v\n", pos, reach, err)
 
-		return runResult{status: mutator.Errored, noVerdict: true}, false
+		return runResult{status: mutator.Errored, noVerdict: true, explanation: r.pkg + " did not run: the reach file could not be cleared\n"}, false
 	}
 
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+schemaBackstopGrace)
@@ -291,9 +307,9 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 		overlayGOFLAGS(r.overlay),
 		goTmpDir(m.wdDealer),
 	)
-	scanner := newOutputScanner()
-	cmd.Stdout = scanner
-	cmd.Stderr = scanner
+	out := newRunOutput()
+	cmd.Stdout = out
+	cmd.Stderr = out
 	cmd.WaitDelay = outputDrainGrace
 	procgroup.Setup(cmd)
 
@@ -311,9 +327,116 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 	}
 	cancelled := m.runCtx.Err() != nil
 	deadlineHit := errors.Is(ctx.Err(), context.DeadlineExceeded)
-	status := classifyDirect(err, exitCode, scanner.sawTestTimeout(), reached, deadlineHit, cancelled, pos)
+	status := classifyDirect(err, exitCode, out.sawTestTimeout(), reached, deadlineHit, cancelled, pos)
+	res := runResult{status: status, noVerdict: exitCode < 0}
+	if status == mutator.Errored {
+		res.explanation = out.explain(r.pkg, exitCode)
+	}
 
-	return runResult{status: status, noVerdict: exitCode < 0}, cancelled
+	return res, cancelled
+}
+
+// The bounds on what a package run keeps to explain an ERRORED verdict.
+const (
+	erroredHeadLines   = 60
+	erroredHeadBytes   = 8 << 10
+	maxFailureLines    = 20
+	maxFailureLineSize = 256
+)
+
+// runOutput is the writer a package run's stdout and stderr both go to. It
+// watches for the markers outputScanner watches for, and keeps what an
+// ERRORED verdict is explained with: the head of the output, and the lines
+// that name a failing test or a panic wherever they fall in it. All of it is
+// bounded however much the binary prints. os/exec writes Stdout and Stderr
+// from one goroutine when they are the same writer, so it needs no lock of
+// its own.
+type runOutput struct {
+	*outputScanner
+	head     headWriter
+	line     []byte // the first maxFailureLineSize bytes of the current line
+	failures []string
+	dropped  int // failure lines past maxFailureLines
+	written  int
+}
+
+func newRunOutput() *runOutput {
+	return &runOutput{outputScanner: newOutputScanner(), head: headWriter{limit: erroredHeadBytes}}
+}
+
+func (o *runOutput) Write(p []byte) (int, error) {
+	_, _ = o.outputScanner.Write(p)
+	_, _ = o.head.Write(p)
+	o.written += len(p)
+	for rest := p; len(rest) > 0; {
+		end := bytes.IndexByte(rest, '\n')
+		chunk := rest
+		if end >= 0 {
+			chunk = rest[:end]
+		}
+		if room := maxFailureLineSize - len(o.line); room > 0 {
+			o.line = append(o.line, chunk[:min(room, len(chunk))]...)
+		}
+		if end < 0 {
+			break
+		}
+		o.endLine()
+		rest = rest[end+1:]
+	}
+
+	return len(p), nil
+}
+
+// endLine keeps the current line if it names a failing test or a panic, and
+// starts the next.
+func (o *runOutput) endLine() {
+	l := strings.TrimSpace(string(o.line))
+	o.line = o.line[:0]
+	switch {
+	case !isFailureLine(l):
+	case len(o.failures) == maxFailureLines:
+		o.dropped++
+	default:
+		o.failures = append(o.failures, l)
+	}
+}
+
+// explain is the account of an ERRORED run of pkg's test binary, which
+// exited with exitCode: the failure lines, then the head of the output,
+// indented under its first line so that it reads as one block in the log.
+// It is called once the run is over.
+func (o *runOutput) explain(pkg string, exitCode int) string {
+	if len(o.line) > 0 {
+		o.endLine() // the output ended mid-line
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s exited %d", pkg, exitCode)
+	if exitCode < 0 {
+		b.WriteString(" (signalled, or never started)")
+	}
+	b.WriteString("\n")
+	for _, l := range o.failures {
+		fmt.Fprintf(&b, "    failing: %s\n", l)
+	}
+	if o.dropped > 0 {
+		fmt.Fprintf(&b, "    failing: and %d more\n", o.dropped)
+	}
+	if o.written == 0 {
+		b.WriteString("    no output\n")
+
+		return b.String()
+	}
+	fmt.Fprintf(&b, "    output (first %d lines, at most %d bytes):\n", erroredHeadLines, erroredHeadBytes)
+	lines := strings.Split(strings.TrimSuffix(o.head.String(), "\n"), "\n")
+	truncated := o.written > len(o.head.buf) || len(lines) > erroredHeadLines
+	for _, l := range lines[:min(len(lines), erroredHeadLines)] {
+		fmt.Fprintf(&b, "        %s\n", l)
+	}
+	if truncated {
+		b.WriteString("        [output truncated]\n")
+	}
+
+	return b.String()
 }
 
 // binaryArgs are the test binary's flags for a mutant's run.

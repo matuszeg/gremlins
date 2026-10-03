@@ -477,12 +477,18 @@ func withoutMutant(env []string) []string {
 func firstFailure(out string) string {
 	for _, l := range strings.Split(out, "\n") {
 		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "--- FAIL") || strings.HasPrefix(l, "panic:") {
+		if isFailureLine(l) {
 			return ": " + l
 		}
 	}
 
 	return ""
+}
+
+// isFailureLine reports whether l, trimmed of space, names a failing test or
+// a panic.
+func isFailureLine(l string) bool {
+	return strings.HasPrefix(l, "--- FAIL") || strings.HasPrefix(l, "panic:")
 }
 
 // headWriter keeps the first limit bytes written to it and drops the rest.
