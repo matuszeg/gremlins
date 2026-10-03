@@ -89,30 +89,118 @@ func viable(t *testing.T, src []byte, fset *token.FileSet, sites []schemata.Site
 	return out, kept, gone
 }
 
+// stmtFixture is a testdata module rendered into one schema binary, with the
+// original and the sites' plain mutants to compare it against.
+type stmtFixture struct {
+	name      string
+	src       []byte
+	driver    []byte
+	fset      *token.FileSet
+	plain     []plainMutant
+	gone      []plainMutant // mutants dropped as not viable
+	schemaBin string
+	origBin   string
+	gomod     []byte
+}
+
+// renderFixture renders every site of the mutators mts in testdata/<name>
+// -- name.go, driven by name_test.go -- and builds the schema and the
+// original binary.
+func renderFixture(t *testing.T, name string, mts []mutator.Type) *stmtFixture {
+	t.Helper()
+	dir := filepath.Join("testdata", name)
+	src, err := os.ReadFile(filepath.Join(dir, name+".go")) //nolint:gosec // G304: the path is a testdata fixture named by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	driver, err := os.ReadFile(filepath.Join(dir, name+"_test.go")) //nolint:gosec // G304: the path is a testdata fixture named by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	gomod, err := os.ReadFile(filepath.Join(dir, "go.mod")) //nolint:gosec // G304: the path is a testdata fixture named by this test
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx := &stmtFixture{name: name, src: src, driver: driver, fset: token.NewFileSet(), gomod: gomod}
+	f, info := typeCheck(t, fx.fset, name+".go", src)
+	df, err := parser.ParseFile(fx.fset, name+"_test.go", driver, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sites, plain := discoverFor(f, mts)
+	sites, fx.plain, fx.gone = viable(t, src, fx.fset, sites, plain)
+
+	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
+	h := &schemata.HelperSet{}
+	out, errs := schemata.Render(fx.fset, fx.fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
+	for _, e := range errs {
+		t.Errorf("site at %s not rewritten: %v", fx.fset.Position(e.Site.Node.Pos()), e.Err)
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+	if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
+		t.Fatalf("rewrite has %d lines, original %d", got, want)
+	}
+	fx.schemaBin = buildFixture(t, map[string][]byte{
+		"go.mod": gomod, name + ".go": out, name + "_test.go": driver, "gremlins_schemata.go": helperFile(t, h, name, prefix),
+	})
+	fx.origBin = buildFixture(t, map[string][]byte{"go.mod": gomod, name + ".go": src, name + "_test.go": driver})
+
+	return fx
+}
+
+// runBehave is the subtest per run: with no mutant the schema must print
+// what the original does, containing each line of mustPrint, and write no
+// reach file; under each mutant id it must print what the plain mutant
+// prints, and record the reach.
+func (fx *stmtFixture) runBehave(t *testing.T, mustPrint []string) {
+	t.Helper()
+	t.Run("id0", func(t *testing.T) {
+		t.Parallel()
+		reach := filepath.Join(t.TempDir(), "reached")
+		want := runFixture(t, fx.origBin)
+		for _, line := range mustPrint {
+			if !bytes.Contains(want, []byte(line)) {
+				t.Errorf("original output lacks %q:\n%s", line, want)
+			}
+		}
+		if got := runFixture(t, fx.schemaBin, "GREMLINS_REACHED="+reach); !bytes.Equal(got, want) {
+			t.Errorf("schema without a mutant printed\n%s\nthe original printed\n%s", got, want)
+		}
+		if _, err := os.Stat(reach); err == nil {
+			t.Error("reach file written with no mutant active")
+		}
+	})
+	for _, p := range fx.plain {
+		name := fmt.Sprintf("id%d_%s_%s_line%d", p.id, p.mt, p.tok, fx.fset.Position(p.pos).Line)
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			files := map[string][]byte{
+				"go.mod": fx.gomod, fx.name + ".go": plainSource(t, fx.src, fx.fset, p), fx.name + "_test.go": fx.driver,
+			}
+			want := runFixture(t, buildFixture(t, files))
+			reach := filepath.Join(t.TempDir(), "reached")
+			got := runFixture(t, fx.schemaBin, "GREMLINS_MUTANT="+strconv.Itoa(p.id), "GREMLINS_REACHED="+reach)
+			if !bytes.Equal(got, want) {
+				t.Errorf("schema with mutant %d printed\n%s\nthe plain mutant printed\n%s", p.id, got, want)
+			}
+			if _, err := os.Stat(reach); err != nil {
+				t.Errorf("reach file missing: %v", err)
+			}
+		})
+	}
+}
+
 // TestStmtFormsBehave is TestFormsBehave for the statement forms: every
 // site of testdata/stmt, of every mutator with a form, rendered into one
 // schema binary that must print, under each mutant id, exactly what the plain
 // token mutant prints, and record that the site was reached.
 func TestStmtFormsBehave(t *testing.T) {
 	t.Parallel()
-	src, err := os.ReadFile("testdata/stmt/stmt.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	driver, err := os.ReadFile("testdata/stmt/stmt_test.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fset := token.NewFileSet()
-	f, info := typeCheck(t, fset, "stmt.go", src)
-	df, err := parser.ParseFile(fset, "stmt_test.go", driver, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sites, plain := discoverFor(f, stmtMutators)
-	sites, plain, gone := viable(t, src, fset, sites, plain)
+	fx := renderFixture(t, "stmt", stmtMutators)
 	covered := map[mutator.Type]bool{}
-	for _, p := range plain {
+	for _, p := range fx.plain {
 		covered[p.mt] = true
 	}
 	for _, mt := range assignMutators {
@@ -123,9 +211,9 @@ func TestStmtFormsBehave(t *testing.T) {
 	// The fixture must hold the sites a mutant is missing from: s -= t on a
 	// string, and x = n for a count of another type than the value.
 	var goneAssign []string
-	for _, p := range gone {
+	for _, p := range fx.gone {
 		if slices.Contains(assignMutators, p.mt) {
-			goneAssign = append(goneAssign, fmt.Sprintf("%s %s line %d", p.mt, p.tok, fset.Position(p.pos).Line))
+			goneAssign = append(goneAssign, fmt.Sprintf("%s %s line %d", p.mt, p.tok, fx.fset.Position(p.pos).Line))
 		}
 	}
 	if len(goneAssign) == 0 {
@@ -133,59 +221,38 @@ func TestStmtFormsBehave(t *testing.T) {
 	}
 	t.Logf("not viable: %v", goneAssign)
 
-	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
-	h := &schemata.HelperSet{}
-	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, []*ast.File{f}, prefix, h))
-	for _, e := range errs {
-		t.Errorf("site at %s not rewritten: %v", fset.Position(e.Site.Node.Pos()), e.Err)
-	}
-	if t.Failed() {
-		t.FailNow()
-	}
-	if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
-		t.Fatalf("rewrite has %d lines, original %d", got, want)
-	}
-	schemaBin := buildFixture(t, map[string][]byte{
-		"stmt.go": out, "stmt_test.go": driver, "gremlins_schemata.go": helperFile(t, h, "stmt", prefix),
+	// The fixture must exercise what it is there for: each side effect
+	// once, the label taken, the closures per iteration.
+	fx.runBehave(t, []string{
+		"AddAssignSideEffectLHS: [[1 4 3] 1]\n", "AddAssignSideEffectRHS: [6 1]\n",
+		"MapAssignNamedMap: [map[a:9 b:9] 2]\n", "LabelledAssign: [4 13]\n", "ForPostAddAssign: [0 3 6 9]\n",
 	})
-	origBin := buildFixture(t, map[string][]byte{"stmt.go": src, "stmt_test.go": driver})
+}
 
-	t.Run("id0", func(t *testing.T) {
-		t.Parallel()
-		reach := filepath.Join(t.TempDir(), "reached")
-		want := runFixture(t, origBin)
-		// The fixture must exercise what it is there for: each side effect
-		// once, the label taken, the closures per iteration.
-		for _, line := range []string{
-			"AddAssignSideEffectLHS: [[1 4 3] 1]\n", "AddAssignSideEffectRHS: [6 1]\n",
-			"MapAssignNamedMap: [map[a:9 b:9] 2]\n", "LabelledAssign: [4 13]\n", "ForPostAddAssign: [0 3 6 9]\n",
-		} {
-			if !bytes.Contains(want, []byte(line)) {
-				t.Errorf("original output lacks %q:\n%s", line, want)
-			}
+// TestLoopCtrlFormsBehave is TestStmtFormsBehave for the break and continue
+// form, over testdata/loopctrl.
+func TestLoopCtrlFormsBehave(t *testing.T) {
+	t.Parallel()
+	fx := renderFixture(t, "loopctrl", []mutator.Type{mutator.InvertLoopCtrl})
+	var breaks, continues, gone int
+	for _, p := range fx.plain {
+		if p.tok == token.BREAK {
+			breaks++
+		} else {
+			continues++
 		}
-		if got := runFixture(t, schemaBin, "GREMLINS_REACHED="+reach); !bytes.Equal(got, want) {
-			t.Errorf("schema without a mutant printed\n%s\nthe original printed\n%s", got, want)
-		}
-		if _, err := os.Stat(reach); err == nil {
-			t.Error("reach file written with no mutant active")
-		}
-	})
-	for _, p := range plain {
-		name := fmt.Sprintf("id%d_%s_%s_line%d", p.id, p.mt, p.tok, fset.Position(p.pos).Line)
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			want := runFixture(t, buildFixture(t, map[string][]byte{"stmt.go": plainSource(t, src, fset, p), "stmt_test.go": driver}))
-			reach := filepath.Join(t.TempDir(), "reached")
-			got := runFixture(t, schemaBin, "GREMLINS_MUTANT="+strconv.Itoa(p.id), "GREMLINS_REACHED="+reach)
-			if !bytes.Equal(got, want) {
-				t.Errorf("schema with mutant %d printed\n%s\nthe plain mutant printed\n%s", p.id, got, want)
-			}
-			if _, err := os.Stat(reach); err != nil {
-				t.Errorf("reach file missing: %v", err)
-			}
-		})
 	}
+	gone = len(fx.gone)
+	// Five breaks and three continues compile as their opposite, and the two
+	// breaks outside a loop do not.
+	if breaks != 5 || continues != 3 || gone != 2 {
+		t.Errorf("fixture has %d break, %d continue mutants, %d not viable; want 5, 3 and 2", breaks, continues, gone)
+	}
+	fx.runBehave(t, []string{
+		"BreakInFor: [0 1 2]\n", "ContinueInFor: [0 2 4]\n", "BreakInSwitchInLoop: [0 0 10 2 20 3 30]\n",
+		"BreakInSelectInLoop: [0 0 10 2 20]\n", "LabelledBreak: [0]\n", "LabelledContinueOuter: [0 10 20]\n",
+		"RangeOverFuncBreak: [0 1 2]\n", "RangeOverFuncContinue: [1 3]\n",
+	})
 }
 
 // TestAssignMutationsMatchEngine holds the statement forms' table to the
@@ -245,6 +312,32 @@ func TestNewRewriterAssign(t *testing.T) {
 		"generic_map_multiln": {src: "func f[M ~map[string]int](m M) {\n\tm[\"a\"] +=\n\t\t1\n}", tok: token.ADD_ASSIGN, muts: []mutator.Type{ia}, refusal: "neither addressable nor a map entry"},
 		"simple_generic_str":  {src: "func f[T ~int | ~string](x, y T) { for ; ; x += y {} }", tok: token.ADD_ASSIGN, muts: []mutator.Type{rs}},
 		"no_files":            {src: "func f(x, y int) { x += y }", tok: token.ADD_ASSIGN, muts: []mutator.Type{ia}, noFiles: true},
+	}
+	runRewriterCases(t, cases)
+}
+
+// TestNewRewriterBranch is TestNewRewriter for the break and continue form.
+func TestNewRewriterBranch(t *testing.T) {
+	t.Parallel()
+	lc := mutator.InvertLoopCtrl
+	cases := map[string]rewriterCase{
+		"break_in_for":      {src: "func f() { for { break } }", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue } else { break }"},
+		"continue_in_for":   {src: "func f(x int) { for x < 3 { continue } }", tok: token.CONTINUE, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { break } else { continue }"},
+		"break_in_range":    {src: "func f(s []int) { for range s { break } }", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue } else { break }"},
+		"break_switch_loop": {src: "func f(x int) { for { switch x { case 1: break } } }", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue } else { break }"},
+		"break_select_loop": {src: "func f() { for { select { default: break } } }", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue } else { break }"},
+		"label_break_loop":  {src: "func f() {\nL:\n\tfor { break L } }", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue L } else { break L }"},
+		"label_continue":    {src: "func f() {\nL:\n\tfor { for { continue L } } }", tok: token.CONTINUE, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { break L } else { continue L }"},
+		// Refused: a break whose continue would not compile, a goto, a foreign
+		// mutator, and a site token that is not the node's.
+		"break_outside_loop":    {src: "func f(x int) { switch x { case 1: break } }", tok: token.BREAK, muts: []mutator.Type{lc}, refusal: "no loop continues"},
+		"break_loop_in_funclit": {src: "func f() { for { _ = func() { switch { default: break } } } }", tok: token.BREAK, muts: []mutator.Type{lc}, refusal: "no loop continues"},
+		"label_break_switch":    {src: "func f(x int) {\nL:\n\tswitch x { case 1: break L } }", tok: token.BREAK, muts: []mutator.Type{lc}, refusal: "no loop continues"},
+		"label_break_other":     {src: "func f() {\nL:\n\tfor { for { break L } }\n}", tok: token.BREAK, muts: []mutator.Type{lc}, want: "if _zzXor(1, false) { continue L } else { break L }"},
+		"goto":                  {src: "func f() {\nL:\n\tgoto L }", tok: token.GOTO, muts: []mutator.Type{lc}, refusal: "branch statement goto"},
+		"wrong_mutator":         {src: "func f() { for { break } }", tok: token.BREAK, muts: []mutator.Type{mutator.InvertLogical}},
+		"wrong_site_token":      {src: "func f() { for { break } }", tok: token.BREAK, siteTok: token.CONTINUE, muts: []mutator.Type{lc}},
+		"no_files":              {src: "func f() { for { break } }", tok: token.BREAK, muts: []mutator.Type{lc}, noFiles: true},
 	}
 	runRewriterCases(t, cases)
 }

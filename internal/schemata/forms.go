@@ -147,6 +147,12 @@ func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) 
 		}
 
 		return r.assign(s, n, inner)
+	case *ast.BranchStmt:
+		if err := checkTok(s, n.Tok); err != nil {
+			return "", err
+		}
+
+		return r.branch(s, n)
 	}
 
 	return "", fmt.Errorf("%w: %T site", ErrUnsupported, s.Node)
