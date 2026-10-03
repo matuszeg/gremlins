@@ -143,7 +143,7 @@ func TestSchemataSaysWhyItWasNotUsed(t *testing.T) {
 			log.Init(out, &bytes.Buffer{})
 			defer log.Reset()
 			_ = report.Do(res)
-			if want := "Schemata: not used (" + tc.wantWhy + ")\n"; !strings.Contains(out.String(), want) {
+			if want := fmt.Sprintf("Schemata: not used (%s), per-mutant path %d\n", tc.wantWhy, res.Schemata.PerMutant); !strings.Contains(out.String(), want) {
 				t.Errorf("report does not contain %q:\n%s", want, out.String())
 			}
 		})

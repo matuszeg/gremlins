@@ -694,18 +694,31 @@ func assignCall(h, name, ids string) string {
 // escapeLine is a -gcflags=-m=1 diagnostic: "file.go:12:34: message".
 var escapeLine = regexp.MustCompile(`^(?:\./)?([^:\s]+\.go):(\d+):\d+: (.*)$`)
 
-// allocations returns the lines of -m=1 output that report an allocation in
-// file: "escapes to heap" and "moved to heap". "leaking param" is not one --
-// it says an argument's value flows out, which allocates nothing.
-func allocations(out, file string) []string {
+// allocations returns the -m=1 lines that show a helper allocating. In the
+// helper file: "escapes to heap", "moved to heap", and any "leaking param"
+// that does not flow to a result -- a parameter leaking to the heap makes the
+// caller's argument allocate, and the compiler reports that only at the
+// caller. In the caller's file: "escapes to heap" and "moved to heap", where
+// that allocation shows. "leaking param: p to result ~r0 level=0" is a value
+// passed through, which allocates nothing.
+func allocations(out, helperFile, callerFile string) []string {
 	var found []string
 	for _, line := range strings.Split(out, "\n") {
 		m := escapeLine.FindStringSubmatch(strings.TrimSpace(line))
-		if m == nil || filepath.Base(m[1]) != file {
+		if m == nil {
 			continue
 		}
-		if strings.Contains(m[3], "escapes to heap") || strings.Contains(m[3], "moved to heap") {
-			found = append(found, line)
+		file, msg := filepath.Base(m[1]), m[3]
+		alloc := strings.Contains(msg, "escapes to heap") || strings.Contains(msg, "moved to heap")
+		switch file {
+		case helperFile:
+			if alloc || strings.HasPrefix(msg, "leaking param") && !strings.Contains(msg, " to result ") {
+				found = append(found, line)
+			}
+		case callerFile:
+			if alloc {
+				found = append(found, line)
+			}
 		}
 	}
 
@@ -714,7 +727,8 @@ func allocations(out, file string) []string {
 
 // TestHelpersDoNotEscape builds each helper set's fixture with
 // -gcflags=-m=1 and requires the compiler to report no heap allocation at
-// any position of the helper file: a helper runs on every evaluation of a
+// any position of the helper file, no parameter leaking to the heap, and none
+// in the fixture's calls of them: a helper runs on every evaluation of a
 // mutated operator, and an allocation there is a cost on user hot paths.
 func TestHelpersDoNotEscape(t *testing.T) {
 	t.Parallel()
@@ -736,7 +750,7 @@ func TestHelpersDoNotEscape(t *testing.T) {
 			if !bytes.Contains(out, []byte("helpers.go:")) {
 				t.Fatalf("no diagnostic mentions helpers.go: the test proves nothing:\n%s", out)
 			}
-			if got := allocations(string(out), "helpers.go"); len(got) > 0 {
+			if got := allocations(string(out), "helpers.go", "main.go"); len(got) > 0 {
 				t.Errorf("helper allocations:\n%s", strings.Join(got, "\n"))
 			}
 		})
@@ -751,14 +765,24 @@ func TestAllocationsParsing(t *testing.T) {
 	out := strings.Join([]string{
 		"# fixture",
 		"./helpers.go:10:6: leaking param content: m",
+		"./helpers.go:11:6: leaking param: p to result ~r0 level=0",
 		"./helpers.go:12:3: moved to heap: x",
 		"./helpers.go:14:9: func literal escapes to heap",
 		"./main.go:5:2: n escapes to heap",
+		"./other.go:5:2: n escapes to heap",
+		"./main.go:6:2: leaking param: q",
 		"./helpers.go:16:2: inlining call to os.Getenv",
+		"./helpers.go:17:6: leaking param: p",
 	}, "\n")
-	got := allocations(out, "helpers.go")
-	if len(got) != 2 || !strings.Contains(got[0], "moved to heap") || !strings.Contains(got[1], "func literal escapes") {
-		t.Errorf("allocations = %q", got)
+	want := []string{"leaking param content: m", "moved to heap: x", "func literal escapes", "main.go:5:2: n escapes", "leaking param: p"}
+	got := allocations(out, "helpers.go", "main.go")
+	if len(got) != len(want) {
+		t.Fatalf("allocations = %q, want %d lines", got, len(want))
+	}
+	for i, w := range want {
+		if !strings.Contains(got[i], w) {
+			t.Errorf("allocation %d = %q, want it to contain %q", i, got[i], w)
+		}
 	}
 }
 
@@ -775,7 +799,50 @@ func TestEscapeCheckSeesAnAllocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
-	if got := allocations(string(out), "helpers.go"); len(got) != 1 || !strings.Contains(got[0], "moved to heap: x") {
-		t.Errorf("allocations = %q, want the moved parameter x\n%s", got, out)
+	got := allocations(string(out), "helpers.go", "main.go")
+	if len(got) == 0 || !strings.Contains(got[0], "helpers.go") || !strings.Contains(got[0], "moved to heap: x") {
+		t.Errorf("allocations = %q, want the moved parameter x first, in helpers.go\n%s", got, out)
+	}
+}
+
+// TestEscapeCheckSeesALeakedPointer is the positive control for the blind
+// spot of an allocation test that looks only at the helper file: a helper
+// that stores its pointer parameter in a global leaks it, so the caller's
+// variable moves to the heap, which the compiler reports at the call, and in
+// the helper only as "leaking param". Both must be flagged.
+func TestEscapeCheckSeesALeakedPointer(t *testing.T) {
+	t.Parallel()
+	h := &schemata.HelperSet{}
+	h.AddRaw("var " + testPrefix + "Sink *int\n\nfunc " + testPrefix + "LeakPtr(id int, p *int) { " + testPrefix + "Sink = p }")
+	main := "package main\n\nimport \"os\"\n\nfunc main() {\n\tn := len(os.Args)\n\t" + testPrefix + "LeakPtr(0, &n)\n}\n"
+	dir := writeModule(t, map[string][]byte{"main.go": []byte(main), "helpers.go": helperFile(t, h, "main", testPrefix)})
+	out, err := goCmd(t, dir, nil, "build", "-gcflags=-m=1", "-o", filepath.Join(dir, "fixture"), ".")
+	if err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	got := strings.Join(allocations(string(out), "helpers.go", "main.go"), "\n")
+	for _, want := range []string{"helpers.go", "leaking param: p", "main.go", "moved to heap: n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("flagged lines lack %q:\n%s\nfull output:\n%s", want, got, out)
+		}
+	}
+}
+
+// TestEscapeSetsCoverEveryHelper holds the hand-listed escape sets to the
+// list of all helpers: a helper added to one and not the other would go
+// unchecked for allocation. Active and Reached are declared by every file and
+// need no call.
+func TestEscapeSetsCoverEveryHelper(t *testing.T) {
+	t.Parallel()
+	var union []string
+	for _, names := range escapeSets {
+		union = append(union, names...)
+	}
+	union = append(union, "Active", "Reached")
+	slices.Sort(union)
+	want := slices.Clone(allHelpers)
+	slices.Sort(want)
+	if !slices.Equal(union, want) {
+		t.Errorf("escape sets plus Active and Reached = %v, allHelpers = %v", union, want)
 	}
 }
