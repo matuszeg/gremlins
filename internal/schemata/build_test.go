@@ -465,6 +465,44 @@ func TestBuildAllReportsMissingTestFiles(t *testing.T) {
 	}
 }
 
+// TestBuildAllEmbedsOriginalSourcePaths builds a package whose test reads the
+// file runtime.Caller names for a function of the rewritten file, and runs it
+// with no mutant and under a mutant of that file: the file it reads must hold
+// the original source, as it does without schemata, not the rewrite.
+func TestBuildAllEmbedsOriginalSourcePaths(t *testing.T) {
+	t.Parallel()
+	modRoot := writeModule(t, map[string][]byte{
+		"caller/caller.go": []byte("package caller\n\nimport \"runtime\"\n\n" +
+			"// Add returns a plus b.\nfunc Add(a, b int) int { return a + b }\n\n" +
+			"// Here is the file it is declared in, as runtime.Caller reports it.\n" +
+			"func Here() string {\n\t_, file, _, _ := runtime.Caller(0)\n\n\treturn file\n}\n"),
+		"caller/caller_test.go": []byte("package caller\n\nimport (\n\t\"os\"\n\t\"strings\"\n\t\"testing\"\n)\n\n" +
+			"func TestHere(t *testing.T) {\n\tsrc, err := os.ReadFile(Here())\n\tif err != nil {\n\t\tt.Fatal(err)\n\t}\n" +
+			"\tif strings.Contains(string(src), \"_gremlins\") || !strings.Contains(string(src), \"return a + b\") {\n" +
+			"\t\tt.Fatalf(\"%s does not hold the original source:\\n%s\", Here(), src)\n\t}\n}\n"),
+	})
+	pkg := loadPkg(t, modRoot, "./caller")
+	sites := pkgSites(pkg)
+	files, _, dropped := schemata.RewritePackage(pkg, sites, "")
+	if len(dropped) > 0 {
+		t.Fatalf("sites dropped: %v", dropped)
+	}
+	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "",
+		map[string]map[string][]byte{"fixture/caller": files}, []string{"fixture/caller"}, 5*time.Minute)
+	if err := errs["fixture/caller"]; err != nil {
+		t.Fatal(err)
+	}
+	id := mutantID(t, sites, token.ADD, mutator.ArithmeticBase)
+	for name, active := range map[string]int{"no_mutant": 0, "caller_reads_original_source": id} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if out, err := runTestBinary(t, b.Binaries["fixture/caller"], filepath.Join(b.Dir, "caller"), active); err != nil {
+				t.Errorf("mutant %d: %v\n%s", active, err, out)
+			}
+		})
+	}
+}
+
 // TestBuildAllHonoursAllowance checks that the compile allowance bounds the
 // build: an allowance already spent fails every package.
 func TestBuildAllHonoursAllowance(t *testing.T) {

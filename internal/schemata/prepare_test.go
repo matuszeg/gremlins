@@ -295,15 +295,11 @@ func TestPrepare(t *testing.T) {
 		}
 		// The null run gets the build, for the overlay its go commands need.
 		got := runs.builds[bin]
-		if got == nil || got.Dir != plan.Build.Dir || got.Binaries[p] != bin || !slices.Equal(got.Rewritten, plan.Build.Rewritten) {
+		if got == nil || got.Dir != plan.Build.Dir || got.Src != plan.Build.Src || got.Binaries[p] != bin || !slices.Equal(got.Rewritten, plan.Build.Rewritten) {
 			t.Errorf("null run of %s was handed build %+v, want %+v", p, got, plan.Build)
 		}
 	}
-	// The fixture is not vacuous: b's binary fails in the schema copy, where
-	// the helper file sits beside its source.
-	if err := realNullRun(plan.Build.Binaries[b], filepath.Join(plan.Build.Dir, "b")); err == nil {
-		t.Error("b's binary passes in the schema copy: the original-source check proves nothing")
-	}
+	checkBesideRewrittenFails(t, mod, plan, b)
 
 	if !strings.Contains(out.String(), "schemata: built 3 packages in ") {
 		t.Errorf("info log lacks the build line:\n%s", out.String())
@@ -317,6 +313,32 @@ func TestPrepare(t *testing.T) {
 		if !strings.Contains(eOut.String(), line) {
 			t.Errorf("error log lacks %q", line)
 		}
+	}
+}
+
+// checkBesideRewrittenFails requires the binary of pkg, b's, to fail in a
+// directory holding b's rewritten source, where the helper file sits beside
+// it: the fixture's original-source check is then not vacuous.
+func checkBesideRewrittenFails(t *testing.T, mod gomodule.GoModule, plan schemata.Plan, pkg string) {
+	t.Helper()
+	dst := t.TempDir()
+	for _, dir := range []string{filepath.Join(mod.Root, "b"), filepath.Join(plan.Build.Src, "b")} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			data, err := os.ReadFile(filepath.Join(dir, e.Name())) //nolint:gosec // G304: a fixture or build file
+			if err == nil {
+				err = os.WriteFile(filepath.Join(dst, e.Name()), data, 0o600) //nolint:gosec // G703: a test temp dir
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := realNullRun(plan.Build.Binaries[pkg], dst); err == nil {
+		t.Error("b's binary passes beside the rewritten source: the original-source check proves nothing")
 	}
 }
 

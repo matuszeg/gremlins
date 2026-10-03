@@ -255,7 +255,7 @@ func TestSchemaNullRun(t *testing.T) {
 		d.mod = gomodule.GoModule{Name: "m", Root: root}
 		wdd := workdir.NewCachedDealer(work, root)
 		d.wdDealer = wdd
-		build := &schemata.Build{Dir: filepath.Join(work, "schema"), Rewritten: []string{"a.go", filepath.Join("p", "b.go")}}
+		build := &schemata.Build{Src: filepath.Join(work, "schema"), Rewritten: []string{"a.go", filepath.Join("p", "b.go")}}
 		pkgDir := filepath.Join(root, "p")
 		if err := os.Mkdir(pkgDir, 0o700); err != nil {
 			t.Fatal(err)
@@ -300,8 +300,8 @@ func TestSchemaNullRun(t *testing.T) {
 			t.Fatal(err)
 		}
 		want := map[string]string{
-			filepath.Join(copyRoot, "a.go"):      filepath.Join(build.Dir, "a.go"),
-			filepath.Join(copyRoot, "p", "b.go"): filepath.Join(build.Dir, "p", "b.go"),
+			filepath.Join(copyRoot, "a.go"):      filepath.Join(build.Src, "a.go"),
+			filepath.Join(copyRoot, "p", "b.go"): filepath.Join(build.Src, "p", "b.go"),
 		}
 		if !maps.Equal(o.Replace, want) {
 			t.Errorf("overlay = %v, want %v", o.Replace, want)

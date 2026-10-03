@@ -180,7 +180,7 @@ func keepSchemata(dir string, plan schemata.Plan) error {
 		idx.Binaries[pkg] = dst
 	}
 	for _, rel := range b.Rewritten {
-		if err := copyFile(filepath.Join(b.Dir, rel), filepath.Join(idx.Source, rel), 0o600); err != nil {
+		if err := copyFile(filepath.Join(b.Src, rel), filepath.Join(idx.Source, rel), 0o600); err != nil {
 			return err
 		}
 	}
@@ -365,7 +365,7 @@ func (t schemaTargets) testsAt(dir string) []string {
 // selects in its package's directory of a copy of the module made for the
 // null runs, never in the user's own tree, where a test writing into its
 // directory would leave files behind. It gets the overlay that points the
-// copy's rewritten files at the schema copy's, written into tmpDir, as a
+// copy's rewritten files at the schema build's, written into tmpDir, as a
 // mutant's run gets one for its worker copy. pkgDir is the package's
 // directory under the module root.
 func (m MutantExecutorDealer) schemaNullRun(ctx context.Context, tmpDir string, targets schemaTargets) schemata.NullRunFunc {
