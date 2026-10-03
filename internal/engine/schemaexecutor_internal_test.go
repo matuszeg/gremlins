@@ -20,12 +20,15 @@ import (
 	"bytes"
 	"errors"
 	"go/token"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/go-gremlins/gremlins/internal/schemata"
 )
 
 func TestClassifyDirect(t *testing.T) {
@@ -194,5 +197,41 @@ func TestCombineRuns(t *testing.T) {
 				t.Errorf("combineRuns() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestOverlayCacheRemembersAFailure checks that a worker copy whose overlay
+// cannot be written is not retried for each mutant: the second ask returns
+// the first's error and touches nothing, while another worker copy, whose
+// root is another key, is still tried. The failure here is a temp directory
+// whose path has whitespace, which cannot go in GOFLAGS.
+func TestOverlayCacheRemembersAFailure(t *testing.T) {
+	t.Parallel()
+	spaced := filepath.Join(t.TempDir(), "has space")
+	if err := os.Mkdir(spaced, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	good := t.TempDir()
+	build := &schemata.Build{Src: t.TempDir(), Rewritten: []string{"a.go"}}
+	c := newOverlayCache()
+
+	_, first := c.get(build, "/copy/one", spaced)
+	if first == nil || !strings.Contains(first.Error(), "whitespace") {
+		t.Fatalf("first get error = %v, want the whitespace error", first)
+	}
+	// Removed, the directory makes a retry fail differently (no such
+	// directory), so a second get that returns the first's error did not retry.
+	if err := os.RemoveAll(spaced); err != nil {
+		t.Fatal(err)
+	}
+	if _, second := c.get(build, "/copy/one", spaced); second != first {
+		t.Errorf("second get error = %v, want the first's, %v", second, first)
+	}
+	path, err := c.get(build, "/copy/two", good)
+	if err != nil {
+		t.Fatalf("another worker copy: %v", err)
+	}
+	if again, _ := c.get(build, "/copy/two", good); again != path {
+		t.Errorf("a cached overlay changed: %q then %q", path, again)
 	}
 }
