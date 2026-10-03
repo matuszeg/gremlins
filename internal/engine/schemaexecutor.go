@@ -203,34 +203,84 @@ func packageDir(rootDir string, mod gomodule.GoModule, pkg string) (string, bool
 	return filepath.Join(rootDir, filepath.FromSlash(rel)), true
 }
 
-// runAll runs the packages in order and stops at the first verdict other
-// than LIVED or NOT COVERED. Past them all, the mutant LIVED if any run
-// reached its site, and is NOT COVERED if none did. reach is the file the
-// mutant's site creates when it runs.
+// runAll runs every package in order, as legacy's one go test over the
+// selected packages does, and combines their verdicts with combineRuns. Only a
+// cancelled run ends it early. reach is the file the mutant's site creates
+// when it runs.
 func (s *schemaExecutor) runAll(reach string, tests []string, runs []binaryRun) mutator.Status {
-	anyReached := false
+	results := make([]runResult, 0, len(runs))
 	for _, r := range runs {
 		if s.legacy.runCtx.Err() != nil {
 			return shutdownStatus()
 		}
-		status, reached, cancelled := s.runOne(reach, tests, r)
-		if cancelled || (status != mutator.Lived && status != mutator.NotCovered) {
-			return status
+		res, cancelled := s.runOne(reach, tests, r)
+		if cancelled {
+			return res.status
 		}
-		anyReached = anyReached || reached
-	}
-	if anyReached {
-		return mutator.Lived
+		results = append(results, res)
 	}
 
-	return mutator.NotCovered
+	return combineRuns(results)
+}
+
+// runResult is one package run's verdict. noVerdict marks an ERRORED run
+// that reached no verdict at all -- the binary was signalled, never started,
+// or the stale reach file could not be cleared -- as opposed to one whose
+// tests failed without reaching the mutant's site.
+type runResult struct {
+	status    mutator.Status
+	noVerdict bool
+}
+
+// combineRuns is the verdict of a mutant over its package runs, read the way
+// the legacy executor reads one go test over the same packages: a test
+// binary's own timeout first, then the backstop, then a binary that reached
+// no verdict (legacy checks for a signalled binary before the exit status),
+// then a kill. Past those, a failure without reach is ERRORED, as spec §4
+// has it for one run; then the mutant LIVED if any run reached its site, and
+// is NOT COVERED if none did, or if there were no runs.
+func combineRuns(results []runResult) mutator.Status {
+	best, bestRank := mutator.NotCovered, -1
+	for _, r := range results {
+		if rank := r.rank(); rank > bestRank {
+			best, bestRank = r.status, rank
+		}
+	}
+
+	return best
+}
+
+// rank orders run results for combineRuns, higher first. A LIVED run is one
+// that reached the site and passed, a NOT COVERED one passed without reach,
+// so their order is the "LIVED if any run reached" rule.
+func (r runResult) rank() int {
+	switch r.status {
+	case mutator.RunTimedOut:
+		return 6
+	case mutator.TimedOut:
+		return 5
+	case mutator.Errored:
+		if r.noVerdict {
+			return 4
+		}
+
+		return 2
+	case mutator.Killed:
+		return 3
+	case mutator.Lived:
+		return 1
+	case mutator.NotCovered, mutator.Runnable, mutator.Skipped, mutator.NotViable:
+		return 0
+	default:
+		return 0
+	}
 }
 
 // runOne runs one test binary with the mutant switched on and classifies the
-// run. It also reports whether the mutant's site ran and whether the run was
-// cancelled, which ends the mutant whatever the status says. The reach file
-// is removed both before the run and after it.
-func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (mutator.Status, bool, bool) {
+// run. It also reports whether the run was cancelled, which ends the mutant
+// whatever the status says. The reach file is removed both before the run and
+// after it.
+func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runResult, bool) {
 	m := s.legacy
 	pos := m.mutant.Position()
 	// A reach file left by an earlier package's run, or an earlier run of
@@ -238,7 +288,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (muta
 	if err := os.Remove(reach); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Errorf("test run for %s reached no verdict: cannot clear %s: %v\n", pos, reach, err)
 
-		return mutator.Errored, false, false
+		return runResult{status: mutator.Errored, noVerdict: true}, false
 	}
 
 	ctx, cancel := context.WithTimeout(m.runCtx, m.testExecutionTime+schemaBackstopGrace)
@@ -272,7 +322,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (muta
 	deadlineHit := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	status := classifyDirect(err, exitCode, scanner.sawTestTimeout(), reached, deadlineHit, cancelled, pos)
 
-	return status, reached, cancelled
+	return runResult{status: status, noVerdict: exitCode < 0}, cancelled
 }
 
 // binaryArgs are the test binary's flags: the go test flags the legacy

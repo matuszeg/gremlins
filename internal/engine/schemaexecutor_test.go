@@ -218,6 +218,92 @@ func TestSchemaExecutor(t *testing.T) {
 	t.Run("run_cancelled", func(t *testing.T) { testSchemaRunCancelled(t, fx) })
 	t.Run("cancelled_mid_run", func(t *testing.T) { testSchemaCancelledMidRun(t, fx) })
 	t.Run("concurrent_workers_isolated", func(t *testing.T) { testSchemaConcurrentWorkersIsolated(t, fx) })
+	t.Run("combine", func(t *testing.T) { testSchemaCombine(t, fx) })
+}
+
+// substExec records every command and runs, in place of each binary scripts
+// names, a shell script with the given body.
+type substExec struct {
+	cmdRecorder
+	scripts map[string]string
+}
+
+func (s *substExec) exec(ctx context.Context, name string, args ...string) *exec.Cmd {
+	if p, ok := s.scripts[name]; ok {
+		name = p
+	}
+
+	return s.cmdRecorder.exec(ctx, name, args...)
+}
+
+// newSubstExec writes each body of bodies, keyed by the binary it stands in
+// for, to a script.
+func newSubstExec(t *testing.T, bodies map[string]string) *substExec {
+	t.Helper()
+	s := &substExec{scripts: map[string]string{}}
+	dir := t.TempDir()
+	for bin, body := range bodies {
+		p := filepath.Join(dir, filepath.Base(bin)+".sh")
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil { //nolint:gosec // G306: an executable test script
+			t.Fatal(err)
+		}
+		s.scripts[bin] = p
+	}
+
+	return s
+}
+
+// testSchemaCombine runs a mutant whose selection is calc then use, with one
+// of the two binaries replaced by a script, and checks that every package
+// runs and that the verdicts combine as legacy's one go test over both
+// packages reads them.
+func testSchemaCombine(t *testing.T, fx schemaFixture) {
+	t.Parallel()
+	calcBin, useBin := fx.build.Binaries[calcPkg], fx.build.Binaries[usePkg]
+	const (
+		fail      = "exit 1"
+		pass      = "exit 0"
+		reachPass = `: > "$GREMLINS_REACHED"; exit 0` //nolint:gosec // G101: a shell script, not a credential
+		timeout   = "echo 'panic: test timed out after 1s'; exit 2"
+		signalled = "kill -KILL $$"
+	)
+	testCases := map[string]struct {
+		key     string
+		scripts map[string]string
+		want    mutator.Status
+	}{
+		// calc fails without reaching Scale's site; use's real suite kills it.
+		"unreached_failure_then_kill": {key: "Scale/ARITHMETIC_BASE", scripts: map[string]string{calcBin: fail}, want: mutator.Killed},
+		// calc's real suite kills Add's mutant; use then overruns its timeout.
+		"kill_then_timeout": {key: "Add/ARITHMETIC_BASE", scripts: map[string]string{useBin: timeout}, want: mutator.RunTimedOut},
+		// calc kills; use passes without reach. Both run.
+		"kill_then_pass": {key: "Add/ARITHMETIC_BASE", want: mutator.Killed},
+		// calc's real suite reaches Scale's site and passes; use passes
+		// without reach.
+		"reach_aggregation": {key: "Scale/ARITHMETIC_BASE", scripts: map[string]string{useBin: pass}, want: mutator.Lived},
+		"reach_aggregation_last": {
+			key: "Scale/ARITHMETIC_BASE", scripts: map[string]string{calcBin: pass, useBin: reachPass}, want: mutator.Lived,
+		},
+		// Legacy checks for a signalled test binary before the exit status,
+		// so one package with no verdict outweighs another's kill.
+		"kill_then_signalled": {key: "Add/ARITHMETIC_BASE", scripts: map[string]string{useBin: signalled}, want: mutator.Errored},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			sub := newSubstExec(t, tc.scripts)
+			d, _ := newSchemaDealer(t, fx, map[string]any{configuration.UnleashCrossPackageKey: true},
+				engine.WithExecContext(sub.exec),
+				engine.WithDependents(dependentsStub{calcPkg: {usePkg}}))
+			got := runSchemaMutant(t, d, fx, tc.key, &fx.build, workerpool.NewWorker(1, "w"))
+			if got.Status() != tc.want {
+				t.Errorf("status = %s, want %s", got.Status(), tc.want)
+			}
+			if n := len(sub.all()); n != 2 {
+				t.Errorf("%d package runs, want both packages run", n)
+			}
+		})
+	}
 }
 
 // testSchemaVerdicts holds each verdict the fixture can reach to the one its
