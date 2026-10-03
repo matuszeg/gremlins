@@ -39,6 +39,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
+	"github.com/go-gremlins/gremlins/internal/report"
 	"github.com/go-gremlins/gremlins/internal/schemata"
 )
 
@@ -464,5 +465,32 @@ func TestNettedByReason(t *testing.T) {
 	want := []string{"3: build failed", "2: unsupported", "1: a reason"}
 	if got := nettedByReason(netted); !slices.Equal(got, want) {
 		t.Errorf("nettedByReason = %q, want %q", got, want)
+	}
+}
+
+// TestExecuteSchemataStopsCollectingWhenCancelled cancels a --schemata run
+// while mutant discovery is still producing, and requires executeSchemata to
+// return promptly, as the legacy loop stops taking mutants once the run is
+// cancelled, rather than wait for the stream to end.
+func TestExecuteSchemataStopsCollectingWhenCancelled(t *testing.T) {
+	t.Parallel()
+	d := &MutantExecutorDealer{execContext: exec.CommandContext, testExecutionTime: time.Second, wdDealer: wdStub{dir: t.TempDir()}}
+	stream := make(chan mutator.Mutator)
+	mu := &Engine{mutantStream: stream, jDealer: d}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Discovery yields one mutant, then never ends.
+	go func() { stream <- &lineMutant{pkg: "p", line: 1, status: mutator.Runnable} }()
+	time.AfterFunc(100*time.Millisecond, cancel)
+
+	done := make(chan report.Results, 1)
+	go func() { done <- mu.executeSchemata(ctx) }()
+	select {
+	case res := <-done:
+		if len(res.Mutants) != 0 {
+			t.Errorf("a cancelled run reported %d mutants it never ran", len(res.Mutants))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeSchemata still collecting mutants 2s after the run was cancelled")
 	}
 }

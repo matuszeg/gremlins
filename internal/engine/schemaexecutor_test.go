@@ -222,6 +222,7 @@ func TestSchemaExecutor(t *testing.T) {
 	t.Run("missing_binary_falls_back", func(t *testing.T) { testSchemaMissingBinaryFallsBack(t, fx) })
 	t.Run("run_cancelled", func(t *testing.T) { testSchemaRunCancelled(t, fx) })
 	t.Run("cancelled_mid_run", func(t *testing.T) { testSchemaCancelledMidRun(t, fx) })
+	t.Run("cancel_bounds_output_drain", func(t *testing.T) { testSchemaCancelBoundsOutputDrain(t, fx) })
 	t.Run("concurrent_workers_isolated", func(t *testing.T) { testSchemaConcurrentWorkersIsolated(t, fx) })
 	t.Run("combine", func(t *testing.T) { testSchemaCombine(t, fx) })
 }
@@ -532,6 +533,41 @@ func testSchemaCancelledMidRun(t *testing.T, fx schemaFixture) {
 
 	if got.Status() != mutator.NotCovered {
 		t.Errorf("status = %s, want the default shutdown status NOT COVERED", got.Status())
+	}
+}
+
+// testSchemaCancelBoundsOutputDrain cancels the run while the test binary
+// sleeps, once with a child that escaped the binary's process group still
+// holding its output open, and requires the mutant's run to end within
+// outputDrainGrace (two seconds) of the cancel.
+func testSchemaCancelBoundsOutputDrain(t *testing.T, fx schemaFixture) {
+	t.Parallel()
+	testCases := map[string]struct{ body string }{
+		"sleeping_binary":          {body: "sleep 60"},
+		"child_holding_the_output": {body: "setsid sleep 60 & sleep 60"},
+		"binary_ignoring_sigterm":  {body: "trap '' TERM; sleep 60"},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			sub := newSubstExec(t, map[string]string{fx.build.Binaries[calcPkg]: tc.body})
+			d, _ := newSchemaDealer(t, fx, nil, engine.WithExecContext(sub.exec))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			d.SetRunCtx(ctx)
+			const cancelAfter = 300 * time.Millisecond
+			time.AfterFunc(cancelAfter, cancel)
+			start := time.Now()
+
+			got := runSchemaMutant(t, d, fx, "Add/ARITHMETIC_BASE", &fx.build, workerpool.NewWorker(1, "w"))
+
+			if el := time.Since(start); el > cancelAfter+2*time.Second+500*time.Millisecond {
+				t.Errorf("the run ended %s after the cancel, want within outputDrainGrace", el-cancelAfter)
+			}
+			if got.Status() != mutator.NotCovered {
+				t.Errorf("status = %s, want the default shutdown status NOT COVERED", got.Status())
+			}
+		})
 	}
 }
 
