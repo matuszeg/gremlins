@@ -455,7 +455,7 @@ func testSchemaInvocation(t *testing.T, fx schemaFixture) {
 	}
 	want := map[string]string{}
 	for _, rel := range fx.build.Rewritten {
-		want[filepath.Join(root, rel)] = filepath.Join(fx.build.Dir, rel)
+		want[filepath.Join(root, rel)] = filepath.Join(fx.build.Src, rel)
 	}
 	if len(want) == 0 || !maps.Equal(o.Replace, want) {
 		t.Errorf("overlay = %v, want %v", o.Replace, want)

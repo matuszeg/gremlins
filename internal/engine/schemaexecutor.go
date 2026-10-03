@@ -359,7 +359,7 @@ func overlayGOFLAGS(overlay string) string {
 }
 
 // overlayCache holds, per schema build and worker copy, the overlay file that
-// points the worker copy's rewritten files at the schema copy's. A test that
+// points the worker copy's rewritten files at the schema build's. A test that
 // runs the go command itself then builds what the binary was built from.
 type overlayCache struct {
 	files map[overlayKey]string
@@ -386,7 +386,7 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 	}
 	replace := make(map[string]string, len(build.Rewritten))
 	for _, rel := range build.Rewritten {
-		replace[filepath.Join(root, rel)] = filepath.Join(build.Dir, rel)
+		replace[filepath.Join(root, rel)] = filepath.Join(build.Src, rel)
 	}
 	data, err := json.Marshal(struct{ Replace map[string]string }{replace})
 	if err != nil {
