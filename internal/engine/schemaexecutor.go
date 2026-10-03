@@ -448,7 +448,8 @@ func (c *overlayCache) get(build *schemata.Build, root, tmpDir string) (string, 
 // is deliberately not consulted past the timeout check: err == exec.ErrWaitDelay
 // with exit code 0 is a pass, and an err-based guard would misclassify it.
 //
-// pos is only used to name the mutant in the log line.
+// pos and err only name the mutant and the cause (signal: killed, an OOM
+// kill's diagnostic; or why the binary never started) in the log lines.
 func classifyDirect(err error, exitCode int, sawTimeout, reached, deadlineHit, runCancelled bool, pos token.Position) mutator.Status {
 	switch {
 	case err != nil && sawTimeout:
@@ -458,7 +459,7 @@ func classifyDirect(err error, exitCode int, sawTimeout, reached, deadlineHit, r
 	case runCancelled:
 		return shutdownStatus()
 	case exitCode < 0:
-		log.Errorf("test run for %s reached no verdict: the test binary was terminated by a signal\n", pos)
+		log.Errorf("test run for %s reached no verdict: the test binary did not exit on its own: %v\n", pos, err)
 
 		return mutator.Errored
 	case exitCode == 0:
