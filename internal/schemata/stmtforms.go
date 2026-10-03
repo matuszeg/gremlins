@@ -191,6 +191,60 @@ func (r *rewriter) assignSwitch(tok token.Token, mts []mutator.Type, id []int, l
 	return b.String()
 }
 
+// branch rewrites the break or continue n as an if on the active mutant, the
+// original statement in the else arm and the other one, with the same label,
+// in the then arm. An if is not a breakable statement, so an unlabelled break
+// still leaves the switch, select or loop it did, and the whole form is one
+// line.
+func (r *rewriter) branch(s Site, n *ast.BranchStmt) (string, error) {
+	id, err := ids(s, mutator.InvertLoopCtrl)
+	if err != nil {
+		return "", err
+	}
+	other, ok := map[token.Token]token.Token{token.BREAK: token.CONTINUE, token.CONTINUE: token.BREAK}[n.Tok]
+	if !ok {
+		return "", fmt.Errorf("%w: branch statement %s", ErrUnsupported, n.Tok)
+	}
+	// A continue is always in a loop, so a break is a mutant that compiles;
+	// a break need not be, so refuse a continue that would not.
+	if n.Tok == token.BREAK && !r.continuable(n) {
+		return "", fmt.Errorf("%w: %s where no loop continues", ErrUnsupported, mutator.InvertLoopCtrl)
+	}
+	label := ""
+	if n.Label != nil {
+		label = " " + n.Label.Name
+	}
+
+	return fmt.Sprintf("if %s { %s%s } else { %s%s }", r.call("Xor", id, "false"), other, label, n.Tok, label), nil
+}
+
+// continuable reports whether a continue could stand where the break n does:
+// for a labelled break, the label is a loop's; otherwise some loop of the
+// same function encloses it.
+func (r *rewriter) continuable(n *ast.BranchStmt) bool {
+	for c, ok := ast.Node(n), true; ok; c, ok = r.parent(c) {
+		switch c := c.(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			return false
+		case *ast.ForStmt, *ast.RangeStmt:
+			if n.Label == nil {
+				return true
+			}
+		case *ast.LabeledStmt:
+			if n.Label != nil && c.Label.Name == n.Label.Name {
+				switch c.Stmt.(type) {
+				case *ast.ForStmt, *ast.RangeStmt:
+					return true
+				}
+
+				return false
+			}
+		}
+	}
+
+	return false
+}
+
 // shiftCount refuses a count the helper's U cannot be inferred as an integer
 // type from: an untyped constant is inferred as its default type, int or rune
 // for an integer constant, but float64 for 2.0, legal Go as a count.

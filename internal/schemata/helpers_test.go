@@ -267,7 +267,9 @@ func fixtureMain(t *testing.T, sites []site) (string, [][]int) {
 func writeModule(t *testing.T, files map[string][]byte) string {
 	t.Helper()
 	dir := t.TempDir()
-	files["go.mod"] = []byte("module fixture\n\ngo 1.22\n")
+	if _, ok := files["go.mod"]; !ok {
+		files["go.mod"] = []byte("module fixture\n\ngo 1.22\n")
+	}
 	for name, content := range files {
 		path := filepath.Join(dir, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
