@@ -35,6 +35,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-gremlins/gremlins/internal/engine"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -520,6 +521,84 @@ func TestPrepareBuildSet(t *testing.T) {
 	}
 	if !plan.Build.NoTests[d] || len(plan.Build.NoTests) != 1 {
 		t.Errorf("NoTests = %v, want d alone", plan.Build.NoTests)
+	}
+}
+
+// TestPrepareLogsShortReasons nets twopkgs' mutants with long reasons -- a
+// null run of bad failing with a first line past 200 bytes, a build failing
+// with many lines for ok -- and requires each mutant's log line to carry the
+// reason's first line, cut to 200 bytes, and the full reason to be logged
+// once per package.
+//
+// It is not parallel: it captures the process-wide log.
+func TestPrepareLogsShortReasons(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("testdata", "twopkgs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := gomodule.GoModule{Name: "twopkgs", Root: root, CallingDir: "."}
+	in := streamMutants(t, mod)
+	bad, ok := "twopkgs/bad", "twopkgs/ok"
+	long := strings.Repeat("é", 150) // 300 bytes, two to a rune
+	runs := &nullRuns{fail: func(pkgDir string, _ int) error {
+		if filepath.Base(pkgDir) == "bad" {
+			return errors.New(long + "\nsecond line")
+		}
+
+		return nil
+	}}
+	testPkgs := func(p string) []string {
+		if p == ok {
+			return []string{ok, "twopkgs/nosuch"}
+		}
+
+		return []string{p}
+	}
+
+	var out, eOut bytes.Buffer
+	log.Init(&out, &eOut)
+	defer log.Reset()
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, in, plan)
+	g := byPkg(plan)
+	for _, p := range []string{bad, ok} {
+		if len(g.placed[p]) != 0 || len(g.netted[p]) < 1 {
+			t.Fatalf("%s: placed %v netted %v, want all netted", p, g.placed[p], g.netted[p])
+		}
+	}
+	if r := g.reasons[bad][0]; r != "null-mutant run failed: "+long {
+		t.Errorf("bad's reason = %q, want the null run's first line whole", r)
+	}
+	if r := g.reasons[ok][0]; !strings.Contains(r, "\n") {
+		t.Errorf("ok's reason %q is one line: the build failure proves nothing", r)
+	}
+	logged := eOut.String()
+	for _, n := range plan.Netted {
+		short, _, _ := strings.Cut(n.Reason, "\n")
+		if len(short) > 200 {
+			short = short[:200]
+			for !utf8.ValidString(short) {
+				short = short[:len(short)-1]
+			}
+		}
+		line := fmt.Sprintf("schemata: %s at %s goes through the per-mutant path: %s\n", n.Mutator.Type(), n.Mutator.Position(), short)
+		if !strings.Contains(logged, line) {
+			t.Errorf("error log lacks %q", line)
+		}
+	}
+	for _, p := range []string{bad, ok} {
+		full := fmt.Sprintf("schemata: per-mutant path for %s: %s\n", p, g.reasons[p][0])
+		if c := strings.Count(logged, full); c != 1 {
+			t.Errorf("full reason of %s logged %d times, want once:\n%s", p, c, logged)
+		}
+	}
+	// The build output past the first line is in the full reason alone.
+	_, rest, _ := strings.Cut(g.reasons[ok][0], "\n")
+	if c := strings.Count(logged, rest); c != 1 {
+		t.Errorf("ok's build output logged %d times, want once", c)
 	}
 }
 

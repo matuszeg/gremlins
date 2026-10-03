@@ -26,6 +26,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/tools/go/packages"
 
@@ -77,13 +78,15 @@ const nullFailed = "null-mutant run failed: "
 // nullRun, given the package's directory in mod -- the original source, as
 // a worker runs it -- and once more if that fails.
 //
-// A mutant is netted, with a reason and an error log line, when it maps to
-// no operator in the loaded source, when the rewrite drops its site, when
-// testPkgs names no package for its package, or when the build or the second
-// null run of a package testPkgs names for it fails. Every mutant of runnable ends in exactly one
-// of Placed and Netted. Prepare writes nothing outside workDir, which the
-// caller removes. A relative mod.Root is taken from the working directory.
-// The error is the context's, when it ends first.
+// A mutant is netted when it maps to no operator in the loaded source, when
+// the rewrite drops its site, when testPkgs names no package for its package,
+// or when the build or the second null run of a package testPkgs names for it
+// fails. A netted mutant has a reason and an error log line carrying the
+// reason's first line, cut to 200 bytes; a reason the line cuts is logged
+// whole once per package. Every mutant of runnable ends in exactly one of
+// Placed and Netted. Prepare writes nothing outside workDir, which the caller
+// removes. A relative mod.Root is taken from the working directory. The error
+// is the context's, when it ends first.
 func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
 	testPkgs func(pkg string) []string, allowance time.Duration, nullRun NullRunFunc,
 ) (Plan, error) {
@@ -134,10 +137,17 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		plan.Build = b
 	}
 
+	type pkgReason struct{ pkg, reason string }
+	fullLogged := map[pkgReason]bool{}
 	for i, m := range runnable {
-		if p.reasons[i] != "" {
-			plan.Netted = append(plan.Netted, NetEntry{Mutator: m, Reason: p.reasons[i]})
-			log.Errorf("schemata: %s at %s goes through the per-mutant path: %s\n", m.Type(), m.Position(), p.reasons[i])
+		if r := p.reasons[i]; r != "" {
+			plan.Netted = append(plan.Netted, NetEntry{Mutator: m, Reason: r})
+			short := shortReason(r)
+			log.Errorf("schemata: %s at %s goes through the per-mutant path: %s\n", m.Type(), m.Position(), short)
+			if k := (pkgReason{m.Pkg(), r}); short != r && !fullLogged[k] {
+				fullLogged[k] = true
+				log.Errorf("schemata: per-mutant path for %s: %s\n", m.Pkg(), r)
+			}
 
 			continue
 		}
@@ -414,6 +424,25 @@ func moduleDir(mod gomodule.GoModule, pkg string) (string, bool) {
 	}
 
 	return filepath.Join(mod.Root, filepath.FromSlash(rel)), true
+}
+
+// shortReasonLimit bounds, in bytes, the reason a netted mutant's log line
+// carries: a build failure's reason holds the compiler's whole output.
+const shortReasonLimit = 200
+
+// shortReason is the first line of reason, cut to at most shortReasonLimit
+// bytes without splitting a character.
+func shortReason(reason string) string {
+	short, _, _ := strings.Cut(reason, "\n")
+	if len(short) <= shortReasonLimit {
+		return short
+	}
+	short = short[:shortReasonLimit]
+	for len(short) > 0 && !utf8.ValidString(short) {
+		short = short[:len(short)-1]
+	}
+
+	return short
 }
 
 // firstLine is the first non-empty line of err's message.
