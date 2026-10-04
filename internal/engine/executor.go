@@ -121,6 +121,9 @@ type MutantExecutorDealer struct {
 	// testMemoryLimit caps the address space of every test process the
 	// dealer's executors and schema preparation start.
 	testMemoryLimit memlimit.Limit
+	// limitWarning is shared by every copy of the dealer, so that it warns
+	// once per run.
+	limitWarning *memoryLimitWarning
 	// overlays is shared by every copy of the dealer, so each worker's
 	// overlay file for a schema build is written once per run, not once per
 	// mutant.
@@ -258,11 +261,13 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		// of the two flags deciding it.
 		testExecutionTime: cappedExecutionTime(timeout),
 		compileAllowance:  compileAllowance(),
-		testMemoryLimit:   testMemoryLimit(),
 		execContext:       exec.CommandContext,
 		overlays:          newOverlayCache(),
 		schemaCounts:      &schemaCounts{},
 	}
+
+	jd.testMemoryLimit = testMemoryLimit()
+	jd.limitWarning = newMemoryLimitWarning(configuration.Get[string](configuration.UnleashTestMemoryLimitKey), jd.testMemoryLimit)
 
 	for _, opt := range opts {
 		jd = opt(jd)
@@ -394,6 +399,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		testExecutionTime: m.testExecutionTime,
 		compileAllowance:  m.compileAllowance,
 		testMemoryLimit:   m.testMemoryLimit,
+		limitWarning:      m.limitWarning,
 		runCtx:            runCtx,
 	}
 
@@ -420,6 +426,7 @@ type mutantExecutor struct {
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
 	testMemoryLimit   memlimit.Limit
+	limitWarning      *memoryLimitWarning
 	dryRun            bool
 	testCPU           int
 }
@@ -688,6 +695,8 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 		// safe verdict there, because NOT VIABLE would drop the mutant out of
 		// the denominator altogether.
 		if scanner.sawBuildFailure() {
+			m.noteNotViable(scanner)
+
 			return mutator.NotViable
 		}
 		// And a test binary the kernel destroyed is a third thing go folds into
@@ -702,6 +711,9 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 		}
 
 		status := getTestFailedStatus(exitErr.ExitCode())
+		if status == mutator.NotViable {
+			m.noteNotViable(scanner)
+		}
 		if status == mutator.Errored {
 			// The error carries the signal name ("signal: killed"), which is the only
 			// thing that tells an OOM kill apart from a crash, and neither of them is
@@ -713,6 +725,14 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	}
 
 	return mutator.Lived
+}
+
+// noteNotViable hands a NOT VIABLE run to the run's memory-limit warning,
+// with what its output showed.
+func (m *mutantExecutor) noteNotViable(scanner *outputScanner) {
+	if scanner.sawOutOfMemory() {
+		m.limitWarning.note()
+	}
 }
 
 // outputScanner is an io.Writer that watches a stream for fixed markers and
@@ -728,7 +748,7 @@ type outputScanner struct {
 }
 
 // scannedMarkers are the substrings outputScanner looks for.
-var scannedMarkers = []string{testTimeoutMarker, buildFailureMarker, setupFailureMarker}
+var scannedMarkers = append([]string{testTimeoutMarker, buildFailureMarker, setupFailureMarker}, outOfMemoryMarkers...)
 
 // goSignalledTestBinary matches the two lines go writes when the test binary it
 // spawned was terminated by a signal: the reason, then the FAIL summary for the
@@ -794,6 +814,18 @@ func (s *outputScanner) sawTestTimeout() bool {
 // up before any test ran. Either way the mutant was never adjudicated.
 func (s *outputScanner) sawBuildFailure() bool {
 	return s.saw(buildFailureMarker) || s.saw(setupFailureMarker)
+}
+
+// sawOutOfMemory reports whether the output shows a process running out of
+// memory, as one stopped by --test-memory-limit does.
+func (s *outputScanner) sawOutOfMemory() bool {
+	for _, m := range outOfMemoryMarkers {
+		if s.saw(m) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // sawSignalledTestBinary reports whether go said the test binary it ran was

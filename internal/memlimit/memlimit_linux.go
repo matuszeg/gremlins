@@ -33,9 +33,13 @@ import (
 // Enforced reports whether Wrap caps anything on this platform.
 const Enforced = true
 
-// limitEnv carries the limit from Wrap to the re-executed helper. Its
-// presence is what makes a process the helper.
+// limitEnv carries the limit from Wrap to the re-executed helper.
 const limitEnv = "GREMLINS_INTERNAL_RLIMIT_AS"
+
+// helperName is the helper's argv[0]. A process is the helper only when it
+// has both this name and limitEnv: the variable alone, exported by hand,
+// leaves gremlins running as gremlins.
+const helperName = "gremlins-memlimit"
 
 // self is the running executable. /proc/self/exe names it even when the file
 // has since been replaced or removed.
@@ -56,17 +60,46 @@ const self = "/proc/self/exe"
 // which sets the limit on itself and executes the command in its place:
 // same process, same process group, same arguments, environment and
 // directory.
+//
+// A command with no Env gets what Start would have given it: the caller's
+// environment, with PWD set to Dir when Dir is set.
 func Wrap(cmd *exec.Cmd, l Limit) {
 	if l == 0 || cmd.Err != nil || !startable(cmd) {
 		return
 	}
-	cmd.Args = append([]string{"gremlins-memlimit", cmd.Path}, cmd.Args...)
+	args := cmd.Args
+	if len(args) == 0 {
+		// Start runs a command with no Args with Path as argv[0].
+		args = []string{cmd.Path}
+	}
+	cmd.Args = append([]string{helperName, cmd.Path}, args...)
 	cmd.Path = self
 	env := cmd.Env
 	if env == nil {
-		env = os.Environ()
+		env = withPWD(os.Environ(), cmd.Dir)
 	}
 	cmd.Env = append(withoutLimit(env), limitEnv+"="+strconv.FormatUint(uint64(l), 10))
+}
+
+// withPWD is env with PWD set to dir, as Start sets it for a command whose
+// Env is nil and whose Dir is set; env as it is when dir is empty or cannot
+// be made absolute, as Start leaves it then.
+func withPWD(env []string, dir string) []string {
+	if dir == "" {
+		return env
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "PWD=") {
+			out = append(out, kv)
+		}
+	}
+
+	return append(out, "PWD="+abs)
 }
 
 // startable reports whether cmd's program is a file Start could execute.
@@ -97,12 +130,16 @@ func withoutLimit(env []string) []string {
 //nolint:gochecknoinits // the helper must run before the program it is part of
 func init() {
 	raw, ok := os.LookupEnv(limitEnv)
-	if !ok || len(os.Args) < 3 {
+	if !ok || len(os.Args) == 0 || os.Args[0] != helperName {
 		return
 	}
-	if err := execLimited(raw, os.Args[1], os.Args[2:]); err != nil {
-		fmt.Fprintf(os.Stderr, "gremlins: %v\n", err)
+	var err error
+	if len(os.Args) < 3 {
+		err = fmt.Errorf("memory limit: helper started with %d arguments, want a program and its argv", len(os.Args)-1)
+	} else {
+		err = execLimited(raw, os.Args[1], os.Args[2:])
 	}
+	fmt.Fprintf(os.Stderr, "gremlins: %v\n", err)
 	// The command never ran. Ending by a signal makes it read as a run that
 	// reached no verdict, which is what it is, rather than as an exit status
 	// a test could have chosen.
@@ -113,11 +150,19 @@ func init() {
 // execLimited caps the running process's address space at raw bytes, never
 // above the hard limit it already has, and executes path with args in its
 // place. It returns only on failure.
+//
+// What it can build before the cap it builds before: the process has already
+// reserved what its runtime reserves for an unlimited process, and under a
+// tight cap any further mapping fails. Exec still converts its arguments to C
+// strings after the cap; that is not done by hand because Exec also restores
+// the RLIMIT_NOFILE the Go runtime raised, which the command must not
+// inherit.
 func execLimited(raw, path string, args []string) error {
 	v, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil {
 		return fmt.Errorf("memory limit %q: %w", raw, err)
 	}
+	env := withoutLimit(os.Environ())
 	var own unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_AS, &own); err != nil {
 		return fmt.Errorf("memory limit: %w", err)
@@ -126,7 +171,7 @@ func execLimited(raw, path string, args []string) error {
 	if err := unix.Setrlimit(unix.RLIMIT_AS, &unix.Rlimit{Cur: v, Max: v}); err != nil {
 		return fmt.Errorf("memory limit: %w", err)
 	}
-	if err := unix.Exec(path, args, withoutLimit(os.Environ())); err != nil {
+	if err := unix.Exec(path, args, env); err != nil {
 		return fmt.Errorf("memory limit: exec %s: %w", path, err)
 	}
 

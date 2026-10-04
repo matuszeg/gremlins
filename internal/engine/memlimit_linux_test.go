@@ -19,11 +19,14 @@
 package engine_test
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -31,22 +34,29 @@ import (
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
+	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 )
 
 // TestTestMemoryLimit runs the engine over testdata/memlimit without and with
-// --schemata, with and without --test-memory-limit, and expects the limit to
-// reach the test processes and nothing else.
+// --schemata under three limits, and expects the limit to reach the test
+// processes and nothing else.
 //
 // Under a GiB limit the runaway loop's INCREMENT_DECREMENT mutant dies of the
 // limit and is KILLED, as it was under `ulimit -v` around the whole of
-// gremlins; so is the mutant that allocates nearly two GiB and passes. With
-// no limit the second LIVES, which shows the limit is what killed it; the
-// runaway one is left out of that run, which it would not finish. Both paths
-// agree on every mutant, and gremlins' own address-space limit is the same
-// after each run as before it.
+// gremlins; so is the mutant that allocates nearly two GiB and passes. Under
+// four GiB the second LIVES, which shows the limit is what killed it; the
+// runaway one is left out of that run, so that it never runs under a limit
+// it could take seconds to reach. Under 300 MiB the go command itself cannot
+// start, every mutant is NOT VIABLE, and the run warns once that the limit
+// did it. A KILLED mutant is no reason to warn, so the GiB run does not. Both
+// paths agree on every mutant, and gremlins' own address-space limit is the
+// same after each run as before it.
 //
-// It is not parallel: it sets the global configuration.
+// Every fixture process runs under a limit: the runaway mutant must never run
+// without one.
+//
+// It is not parallel: it sets the global configuration and the global log.
 func TestTestMemoryLimit(t *testing.T) {
 	modRoot, err := filepath.Abs("testdata/memlimit")
 	if err != nil {
@@ -60,10 +70,11 @@ func TestTestMemoryLimit(t *testing.T) {
 	uncovered := maps.Clone(prof)
 	delete(uncovered, runaway.file)
 	testCases := map[string]struct {
-		settings    map[string]any
-		profile     coverage.Profile
-		wantRunaway mutator.Status
-		wantSpare   mutator.Status
+		settings     map[string]any
+		profile      coverage.Profile
+		wantRunaway  mutator.Status
+		wantSpare    mutator.Status
+		wantWarnings int
 	}{
 		"limited": {
 			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "1G"},
@@ -71,11 +82,18 @@ func TestTestMemoryLimit(t *testing.T) {
 			wantRunaway: mutator.Killed,
 			wantSpare:   mutator.Killed,
 		},
-		"unlimited": {
-			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "0"},
+		"generous": {
+			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "4G"},
 			profile:     uncovered,
 			wantRunaway: mutator.NotCovered,
 			wantSpare:   mutator.Lived,
+		},
+		"too_small": {
+			settings:     map[string]any{configuration.UnleashTestMemoryLimitKey: "300M"},
+			profile:      prof,
+			wantRunaway:  mutator.NotViable,
+			wantSpare:    mutator.NotViable,
+			wantWarnings: 1,
 		},
 	}
 	for name, tc := range testCases {
@@ -83,7 +101,13 @@ func TestTestMemoryLimit(t *testing.T) {
 			var byPath [2]map[string]mutator.Status
 			for i, withSchemata := range []bool{false, true} {
 				before := ownAddressSpace(t)
+				errs := captureErrors(t)
 				got, _, _ := runParityWith(t, mod, tc.profile, withSchemata, tc.settings)
+				log.Reset()
+				warning := fmt.Sprintf("--test-memory-limit=%s:", tc.settings[configuration.UnleashTestMemoryLimitKey])
+				if n := strings.Count(errs.String(), warning); n != tc.wantWarnings {
+					t.Errorf("schemata=%t: %d memory-limit warnings, want %d:\n%s", withSchemata, n, tc.wantWarnings, errs.String())
+				}
 				if after := ownAddressSpace(t); after != before {
 					t.Errorf("schemata=%t: gremlins' own RLIMIT_AS went from %+v to %+v", withSchemata, before, after)
 				}
@@ -100,6 +124,38 @@ func TestTestMemoryLimit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// lockedBuffer is a bytes.Buffer the engine's workers can log to at once.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// captureErrors points the global log's error output at a buffer until the
+// test ends.
+func captureErrors(t *testing.T) *lockedBuffer {
+	t.Helper()
+	b := &lockedBuffer{}
+	log.Reset()
+	log.Init(io.Discard, b)
+	t.Cleanup(log.Reset)
+
+	return b
 }
 
 // site names the one mutant of a type on the line of a fixture file that

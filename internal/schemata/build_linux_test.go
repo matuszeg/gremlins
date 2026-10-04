@@ -121,3 +121,23 @@ func TestBuildAllKillsTheWholeBuildAtTheDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestBuildAllIsCapped builds one package under a limit too small for the go
+// command to start, which fails it, and under a generous one, which builds
+// it: the limit reaches the build.
+func TestBuildAllIsCapped(t *testing.T) {
+	t.Parallel()
+	modRoot, err := filepath.Abs("testdata/twopkgs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const pkg = "twopkgs/ok"
+	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{pkg}, 5*time.Minute, 300<<20)
+	if errs[pkg] == nil || b.Binaries[pkg] != "" {
+		t.Errorf("under 300 MiB: binary %q, error %v; want no binary and an error", b.Binaries[pkg], errs[pkg])
+	}
+	b, errs = schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{pkg}, 5*time.Minute, 4<<30)
+	if errs[pkg] != nil || b.Binaries[pkg] == "" {
+		t.Errorf("under 4 GiB: binary %q, error %v; want a binary", b.Binaries[pkg], errs[pkg])
+	}
+}

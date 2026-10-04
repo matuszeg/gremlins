@@ -761,6 +761,10 @@ not with a signal. Without schemata, `go test` folds that into a failing test
 and the mutant is `KILLED`. With schemata, a run that fails after reaching the
 mutant is `KILLED` as well. A limit too small for the `go` command, the
 compiler or the linker shows as `NOT VIABLE`, as it did under `ulimit -v`.
+`NOT VIABLE` mutants leave the efficacy denominator, so a run like that can
+look cleaner than it is. When a schema build or a null run fails, or a mutant
+is recorded `NOT VIABLE`, and its output shows it ran out of memory, Gremlins
+warns once per run, naming the flag and its value.
 
 The limit is set before each process executes, the way `ulimit -v` sets it,
 not on the process after it has started. The difference matters: the Go

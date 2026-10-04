@@ -265,6 +265,10 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 	if err != nil {
 		return plan, err
 	}
+	for _, e := range plan.Netted {
+		// A build that failed carries its output in the reason.
+		d.limitWarning.noteIfOutOfMemory(e.Reason)
+	}
 	for _, line := range nettedByReason(plan.Netted) {
 		log.Infof("schemata: netted %s\n", line)
 	}
@@ -461,6 +465,7 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, dir, overlay str
 		return nil
 	}
 	text := out.String()
+	m.limitWarning.noteIfOutOfMemory(text)
 
 	return fmt.Errorf("%s in %s: %w%s\n%s", filepath.Base(bin), dir, err, firstFailure(text), text)
 }
