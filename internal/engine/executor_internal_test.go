@@ -40,42 +40,42 @@ func TestGetTestArgs(t *testing.T) {
 		"should_not_include_tags_flag_when_build_tags_are_empty": {
 			testExecutionTime: 10 * time.Second,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "12s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "example.com/my/package"},
 		},
 		"should_include_tags_flag_when_build_tags_are_set": {
 			buildTags:         "tag1,tag2",
 			testExecutionTime: 10 * time.Second,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-tags", "tag1,tag2", "-timeout", "12s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-tags", "tag1,tag2", "-timeout", "12s", "-failfast", "example.com/my/package"},
 		},
 		"should_compute_timeout_as_two_seconds_plus_execution_time": {
 			testExecutionTime: 30 * time.Second,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "32s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "32s", "-failfast", "example.com/my/package"},
 		},
 		"should_not_include_cpu_flag_when_test_cpu_is_zero": {
 			testExecutionTime: 10 * time.Second,
 			testCPU:           0,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "12s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "example.com/my/package"},
 		},
 		"should_include_cpu_flag_when_test_cpu_is_nonzero": {
 			testExecutionTime: 10 * time.Second,
 			testCPU:           4,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "12s", "-failfast", "-cpu", "4", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "-cpu", "4", "example.com/my/package"},
 		},
 		"should_use_package_path_when_integration_mode_is_disabled": {
 			testExecutionTime: 10 * time.Second,
 			integrationMode:   false,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "12s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "example.com/my/package"},
 		},
 		"should_use_dot_dot_dot_path_when_integration_mode_is_enabled": {
 			testExecutionTime: 10 * time.Second,
 			integrationMode:   true,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-timeout", "12s", "-failfast", "./..."},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "./..."},
 		},
 		"should_include_all_flags_when_all_options_are_configured": {
 			buildTags:         "integration",
@@ -83,20 +83,20 @@ func TestGetTestArgs(t *testing.T) {
 			testCPU:           2,
 			integrationMode:   true,
 			pkg:               "example.com/my/package",
-			want:              []string{"test", "-tags", "integration", "-timeout", "12s", "-failfast", "-cpu", "2", "./..."},
+			want:              []string{"test", "-vet=off", "-tags", "integration", "-timeout", "12s", "-failfast", "-cpu", "2", "./..."},
 		},
 		"should_run_only_the_selected_tests_when_the_map_named_them": {
 			testExecutionTime: 10 * time.Second,
 			pkg:               "example.com/my/package",
 			tests:             []string{"TestOne", "TestTwo"},
-			want: []string{"test", "-timeout", "12s", "-failfast",
+			want: []string{"test", "-vet=off", "-timeout", "12s", "-failfast",
 				"-run", "^(TestOne|TestTwo)$", "example.com/my/package"},
 		},
 		"should_run_the_whole_suite_when_no_test_was_selected": {
 			testExecutionTime: 10 * time.Second,
 			pkg:               "example.com/my/package",
 			tests:             []string{},
-			want:              []string{"test", "-timeout", "12s", "-failfast", "example.com/my/package"},
+			want:              []string{"test", "-vet=off", "-timeout", "12s", "-failfast", "example.com/my/package"},
 		},
 	}
 
