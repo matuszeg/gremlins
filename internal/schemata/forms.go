@@ -87,8 +87,9 @@ func (s srcRange) End() token.Pos { return s.end }
 // the site's mutants active it evaluates what the engine's token mutant
 // would. A constant-valued site takes one of the constant forms instead
 // (see constantForm), which depend on the context the site is in: files are
-// the package's syntax, where that context is looked up. info must hold the
-// Types and Uses of the package the sites come from; sizes are the target
+// the package's syntax, where that context is looked up. A constant group
+// (see GroupConstantSites) takes one constant form for its whole
+// expression. info must hold the Types and Uses of the package the sites come from; sizes are the target
 // platform's (the package's TypesSizes), against which a constant's mutant
 // values are held to fit their type, nil meaning the host's. A site outside those
 // forms, or one whose operand types the helper cannot take, is refused with
@@ -114,6 +115,9 @@ type rewriter struct {
 func (r *rewriter) rewrite(s Site, inner func(ast.Node) string) (string, error) {
 	if len(s.Muts) == 0 {
 		return "", fmt.Errorf("%w: site has no mutants", ErrUnsupported)
+	}
+	if len(s.Members) > 0 {
+		return r.constantGroup(s, inner)
 	}
 	switch n := s.Node.(type) {
 	case *ast.BinaryExpr:

@@ -77,7 +77,7 @@ func If() int {
 	return 0
 }
 
-func Nested() int { return 2*3 + 1 } // refused *: 2*3 is an operand of a constant
+func Nested() int { return 2*3 + 1 } // 2*3 is an operand of a constant: one site with the +
 
 func MultiLine() int {
 	return 10 +
@@ -89,7 +89,7 @@ func Arr() int {
 	return len(a)
 }
 
-func FloatBin(f float64) float64 { return f * (1.5 + 1) } // refused +: a float operand
+func FloatBin(f float64) float64 { return f * (1.5 + 1) } // a float operand: f is the witness
 
 func Key() []int { return []int{1 + 1: 5} } // a composite literal key: placed by duplicating Key
 

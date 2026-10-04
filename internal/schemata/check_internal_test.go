@@ -113,3 +113,73 @@ func TestUniquePackages(t *testing.T) {
 		})
 	}
 }
+
+// TestRemoveSite checks that a SiteError removes what it names: the whole
+// site when it holds all of the site's mutants (or none), only its own
+// mutants from a site keeping others, and, of a site listed twice, the entry
+// holding its mutants.
+func TestRemoveSite(t *testing.T) {
+	t.Parallel()
+	n, other := &ast.BasicLit{}, &ast.BasicLit{}
+	muts := func(ids ...int) []Mutant {
+		out := make([]Mutant, len(ids))
+		for i, id := range ids {
+			out[i] = Mutant{ID: id}
+		}
+
+		return out
+	}
+	group := Site{Node: n, Muts: muts(1, 2, 3), Members: []Site{{Node: other, Muts: muts(1, 2)}, {Node: other, Muts: muts(3)}}}
+	cases := map[string]struct {
+		sites []Site
+		drop  Site
+		want  [][]int // each remaining site's mutant ids
+		// members are the remaining first site's members' mutant ids.
+		members [][]int
+	}{
+		"whole":       {sites: []Site{{Node: n, Muts: muts(1, 2)}}, drop: Site{Node: n, Muts: muts(1, 2)}, want: [][]int{}},
+		"no_mutants":  {sites: []Site{{Node: n, Muts: muts(1, 2)}}, drop: Site{Node: n}, want: [][]int{}},
+		"partial":     {sites: []Site{group}, drop: Site{Node: n, Muts: muts(2)}, want: [][]int{{1, 3}}, members: [][]int{{1}, {3}}},
+		"member_gone": {sites: []Site{group}, drop: Site{Node: n, Muts: muts(3)}, want: [][]int{{1, 2}}, members: [][]int{{1, 2}}},
+		"listed_twice": {
+			sites: []Site{{Node: n, Muts: muts(1)}, {Node: n, Muts: muts(2)}},
+			drop:  Site{Node: n, Muts: muts(2)}, want: [][]int{{1}},
+		},
+		"absent": {sites: []Site{{Node: n, Muts: muts(1)}}, drop: Site{Node: other, Muts: muts(1)}, want: [][]int{{1}}},
+	}
+	ids := func(ms []Mutant) []int {
+		out := []int{}
+		for _, m := range ms {
+			out = append(out, m.ID)
+		}
+
+		return out
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			before := len(tc.sites[0].Muts)
+			got := removeSite(tc.sites, tc.drop)
+			if len(tc.sites[0].Muts) != before {
+				t.Error("removeSite changed its input")
+			}
+			var gotIDs [][]int
+			for _, s := range got {
+				gotIDs = append(gotIDs, ids(s.Muts))
+			}
+			if !slices.EqualFunc(gotIDs, tc.want, slices.Equal[[]int]) {
+				t.Errorf("remaining %v, want %v", gotIDs, tc.want)
+			}
+			if tc.members == nil {
+				return
+			}
+			var gotMembers [][]int
+			for _, m := range got[0].Members {
+				gotMembers = append(gotMembers, ids(m.Muts))
+			}
+			if !slices.EqualFunc(gotMembers, tc.members, slices.Equal[[]int]) {
+				t.Errorf("members %v, want %v", gotMembers, tc.members)
+			}
+		})
+	}
+}

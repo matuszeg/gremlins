@@ -84,8 +84,10 @@ func HelperFileName(prefix string) string {
 // error inside no placed site drops every site of the package with
 // ErrUnattributable. Every input mutant ends in exactly one of placed and
 // dropped: a site some of whose mutants are dropped is in both, each with its
-// own. When no site is placed, files is empty. The type-checks load packages
-// under ctx; once it ends, every site still placed is dropped.
+// own. The sites inside one maximal constant expression are rewritten, and
+// returned, as one constant group (see GroupConstantSites). When no site is
+// placed, files is empty. The type-checks load packages under ctx; once it
+// ends, every site still placed is dropped.
 func RewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, tags string) (map[string][]byte, []Site, []SiteError) {
 	return rewritePackage(ctx, pkg, sites, tags, NewRewriter)
 }
@@ -130,6 +132,7 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 		return nil, nil, dropAll(nil, sites, fmt.Errorf("schemata: %s already exists", helperPath))
 	}
 
+	sites = GroupConstantSites(pkg.TypesInfo, pkg.Syntax, sites)
 	files, dropped := groupSites(pkg, sites)
 	// Every round drops a site or a mutant, and a site dropped for a type
 	// error is restored at most once (see restoreChildren): twice the work.
@@ -278,13 +281,47 @@ func liveSites(files []*sourceFile) []Site {
 
 // removeSite returns sites without the first site with s's node and token:
 // one entry per SiteError, so that a site listed twice is accounted twice.
+// Of sites listed twice, the one holding s's mutants is taken. When s holds
+// only some of that site's mutants -- a constant group's refused mutants,
+// the rest placed -- only those are removed from it.
 func removeSite(sites []Site, s Site) []Site {
-	i := slices.IndexFunc(sites, func(x Site) bool { return x.Node == s.Node && x.Tok == s.Tok })
+	gone := map[int]bool{}
+	for _, m := range s.Muts {
+		gone[m.ID] = true
+	}
+	same := func(x Site) bool { return x.Node == s.Node && x.Tok == s.Tok }
+	i := slices.IndexFunc(sites, func(x Site) bool {
+		held := 0
+		for _, m := range x.Muts {
+			if gone[m.ID] {
+				held++
+			}
+		}
+
+		return same(x) && held == len(gone)
+	})
+	if i < 0 {
+		i = slices.IndexFunc(sites, same)
+	}
 	if i < 0 {
 		return sites
 	}
+	kept := slices.DeleteFunc(slices.Clone(sites[i].Muts), func(m Mutant) bool { return gone[m.ID] })
+	out := slices.Clone(sites)
+	if len(s.Muts) == 0 || len(kept) == 0 {
+		return slices.Delete(out, i, i+1)
+	}
+	out[i].Muts = kept
+	var members []Site
+	for _, x := range out[i].Members {
+		x.Muts = slices.DeleteFunc(slices.Clone(x.Muts), func(m Mutant) bool { return gone[m.ID] })
+		if len(x.Muts) > 0 {
+			members = append(members, x)
+		}
+	}
+	out[i].Members = members
 
-	return slices.Delete(slices.Clone(sites), i, i+1)
+	return out
 }
 
 // groupSites sorts sites into the package files they lie in, reading each

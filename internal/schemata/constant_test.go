@@ -127,6 +127,7 @@ func TestConstantFormsBehave(t *testing.T) {
 	}
 
 	sites, plain := discover(f)
+	sites = schemata.GroupConstantSites(info, []*ast.File{f}, sites)
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}
 	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, sites, schemata.NewRewriter(info, nil, []*ast.File{f}, prefix, h))
@@ -134,16 +135,23 @@ func TestConstantFormsBehave(t *testing.T) {
 	refused := map[token.Pos]bool{}
 	refusedLines := map[int]bool{}
 	for _, e := range errs {
-		tn, ok := engine.NewTokenNode(e.Site.Node)
-		if !ok {
-			t.Fatalf("site %T is not a token node", e.Site.Node)
+		// A constant group is refused as one site, for each of its members.
+		members := e.Site.Members
+		if len(members) == 0 {
+			members = []schemata.Site{e.Site}
 		}
-		line := fset.Position(tn.TokPos).Line
-		if !errors.Is(e.Err, schemata.ErrUnsupported) || want[line] != e.Site.Tok.String() {
-			t.Errorf("line %d: %s site refused: %v", line, e.Site.Tok, e.Err)
+		for _, s := range members {
+			tn, ok := engine.NewTokenNode(s.Node)
+			if !ok {
+				t.Fatalf("site %T is not a token node", s.Node)
+			}
+			line := fset.Position(tn.TokPos).Line
+			if !errors.Is(e.Err, schemata.ErrUnsupported) || want[line] != s.Tok.String() {
+				t.Errorf("line %d: %s site refused: %v", line, s.Tok, e.Err)
+			}
+			refused[tn.TokPos] = true
+			refusedLines[line] = true
 		}
-		refused[tn.TokPos] = true
-		refusedLines[line] = true
 	}
 	for line, op := range want {
 		if !refusedLines[line] {
