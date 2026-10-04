@@ -105,6 +105,18 @@ func TestConstantGroupRefusals(t *testing.T) {
 			},
 			notViable: []string{"ARITHMETIC_BASE /", "ARITHMETIC_BASE *"},
 		},
+		"len_of_a_constant_string": {
+			body: "func f(n int) int { return len(string(rune(127+1)))*3 + n }",
+			refused: map[string]string{
+				"ARITHMETIC_BASE +": "call between a constant group and its site",
+			},
+		},
+		"len_of_a_constant_string_const": {
+			body: "const k = 127\nfunc f(n int) int { return len(string(rune(k+1)))*3 + n }",
+			refused: map[string]string{
+				"ARITHMETIC_BASE +": "call between a constant group and its site",
+			},
+		},
 		"overflow_in_a_conversion": {
 			body: "func f(v uint8) uint8 { return uint8(255/5) + v }",
 			refused: map[string]string{
@@ -214,6 +226,10 @@ func TestGroupConstantSites(t *testing.T) {
 			body:   "func f(x, n int) int { return len([2]int{x + 1, 0})*3 + n }",
 			groups: map[string]int{"len([2]int{x + 1, 0})*3": 2}, single: 1,
 		},
+		"len_of_a_string_is_not_type_only": {
+			body:   "func f(n int) int { return len(string(rune(127+1)))*3 + n }",
+			groups: map[string]int{"len(string(rune(127+1)))*3": 2}, single: 1,
+		},
 		"two_groups": {
 			body:   "func f(n int) int { return -(2+1)*n + (4*3 - 1) }",
 			groups: map[string]int{"-(2+1)": 2, "(4*3 - 1)": 2}, single: 2,
@@ -303,5 +319,54 @@ func TestRewritePackagePlacesAGroupInPart(t *testing.T) {
 	}
 	if len(placed) != 2 || total != 4 {
 		t.Errorf("placed %d sites of %d mutants, want the + site and the group", len(placed), total)
+	}
+}
+
+// TestRenderRefusesAPartialGroupThatMovesLines checks the newline check on a
+// constant group some of whose mutants are refused: a float group whose
+// witness spans lines would move every later line, so the whole group keeps
+// its text and is refused once, with errNewlineChanged, every one of its
+// mutants in that one error -- the mutant its fold refused is not reported
+// a second time.
+func TestRenderRefusesAPartialGroupThatMovesLines(t *testing.T) {
+	t.Parallel()
+	src := []byte("package p\n\ntype b struct{ r float64 }\n\nfunc f(v b) float64 {\n\treturn v.\n\t\tr * (1.5 + 1.0/(1*0+1))\n}\n")
+	fset := token.NewFileSet()
+	f, info := typeCheck(t, fset, "p.go", src)
+	sites, plain := discover(f)
+	grouped := schemata.GroupConstantSites(info, []*ast.File{f}, sites)
+	var group schemata.Site
+	for _, s := range grouped {
+		if len(s.Members) > 0 {
+			group = s
+		}
+	}
+	if len(group.Members) != 4 {
+		t.Fatalf("group has %d members, want the four sites of (1.5 + 1.0/(1*0+1))", len(group.Members))
+	}
+	out, errs := schemata.Render(fset, fset.File(f.Pos()), src, grouped,
+		schemata.NewRewriter(info, nil, []*ast.File{f}, testPrefix, &schemata.HelperSet{}))
+	if got, want := bytes.Count(out, []byte("\n")), bytes.Count(src, []byte("\n")); got != want {
+		t.Errorf("output has %d lines, the source %d", got, want)
+	}
+	if !bytes.Contains(out, []byte("(1.5 + 1.0/(1*0+1))")) {
+		t.Errorf("the group's text was not kept:\n%s", out)
+	}
+	seen := map[int]int{}
+	for _, e := range errs {
+		if !errors.Is(e.Err, schemata.ErrNewlineChanged) || e.Site.Node != group.Node {
+			t.Errorf("SiteError %v at %s, want the group's newline refusal", e.Err, fset.Position(e.Site.Node.Pos()))
+		}
+		for _, m := range e.Site.Muts {
+			seen[m.ID]++
+		}
+	}
+	for _, m := range group.Muts {
+		if seen[m.ID] != 1 {
+			t.Errorf("mutant %d reported %d times, want once", m.ID, seen[m.ID])
+		}
+	}
+	if len(group.Muts) >= len(plain) {
+		t.Errorf("group holds %d of %d mutants: the outer * should stay its own site", len(group.Muts), len(plain))
 	}
 }

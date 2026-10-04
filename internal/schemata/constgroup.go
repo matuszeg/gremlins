@@ -50,11 +50,12 @@ import (
 //
 //   - through parentheses, unary and binary expressions and basic numeric
 //     conversions only: a member whose mutants M's fold computes through;
-//   - across len, cap, or unsafe.Sizeof, Alignof or Offsetof of a value
-//     whose type alone gives the result, as in len([2]int{x + 1, 0}) -- an
-//     operand never evaluated: a member whose mutants leave M's value as it
-//     is, so each is placed with M's own value, its reach recorded where M is
-//     evaluated;
+//   - across len or cap of an array or a pointer to one, or unsafe.Sizeof,
+//     Alignof or Offsetof -- whose type alone gives the result, as in
+//     len([2]int{x + 1, 0}), the operand never evaluated -- not len of a
+//     constant string, whose value gives it: a member whose mutants leave
+//     M's value as it is, so each is placed with M's own value, its reach
+//     recorded where M is evaluated;
 //   - in a compile-time context, such as the array length of
 //     len([2*3]int{}): not a member. It is placed as without grouping, by
 //     duplicating its function, whose jump runs before M while its mutant is
@@ -193,9 +194,10 @@ func (r *rewriter) foldNode(n ast.Node) bool {
 	return false
 }
 
-// typeOnly reports whether n is a constant call of len, cap, or
-// unsafe.Sizeof, Alignof or Offsetof: its value is its operand's type's, the
-// operand never evaluated, whatever operator in it a mutant rewrites.
+// typeOnly reports whether n is a constant call of len or cap of an array or
+// a pointer to one, or of unsafe.Sizeof, Alignof or Offsetof: its value is
+// its operand's type's, the operand never evaluated, whatever operator in it
+// a mutant rewrites.
 func (r *rewriter) typeOnly(n ast.Node) bool {
 	call, ok := n.(*ast.CallExpr)
 	if !ok || r.info.Types[call].Value == nil || !r.info.Types[call.Fun].IsBuiltin() {
@@ -209,7 +211,23 @@ func (r *rewriter) typeOnly(n ast.Node) bool {
 		name = f.Sel.Name
 	}
 	switch name {
-	case "len", "cap", "Sizeof", "Alignof", "Offsetof":
+	case "len", "cap":
+		// Of an array, or a pointer to one, only: len of a constant string
+		// is constant too, and is the string's value's.
+		if len(call.Args) != 1 {
+			return false
+		}
+		t := r.info.Types[call.Args[0]].Type
+		if t == nil {
+			return false
+		}
+		if p, ok := t.Underlying().(*types.Pointer); ok {
+			t = p.Elem()
+		}
+		_, array := t.Underlying().(*types.Array)
+
+		return array
+	case "Sizeof", "Alignof", "Offsetof":
 		return true
 	}
 
