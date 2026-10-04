@@ -121,7 +121,8 @@ func Land() bool {
 }
 
 // Pi keeps math used outside the sites, which the forms below replace with
-// their values: like assembler's eval.go, which uses math elsewhere too.
+// their values: this harness renders with Render alone, without
+// RewritePackage's repair of an import the rewrite left unused.
 func Pi() float64 { return math.Pi }
 
 type dec float64
