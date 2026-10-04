@@ -92,7 +92,10 @@ type siteNode struct {
 // function's signature line and opening-brace line, so that still no line
 // moves.
 //
-// Caller contract: sites must come from fset. A token.Pos is a plain offset
+// Caller contract: sites must come from fset, and the sites inside a constant
+// expression must have been grouped by GroupConstantSites, as RewritePackage
+// does; ungrouped, such a site is refused as an operand of a constant
+// expression. A token.Pos is a plain offset
 // into fset, so a node from a different FileSet whose position happens to
 // fall inside file cannot be detected and is spliced as if it were file's.
 func Render(fset *token.FileSet, file *token.File, src []byte, sites []Site, rw Rewriter) ([]byte, []SiteError) {
@@ -188,7 +191,15 @@ func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, 
 	var dup *dupError
 	var some *refusedMutantsError
 	switch {
-	case errors.As(err, &some) && strings.Count(text, "\n") == strings.Count(string(src[n.start:n.end]), "\n"):
+	case errors.As(err, &some) && !some.all && strings.Count(text, "\n") != strings.Count(string(src[n.start:n.end]), "\n"):
+		errs = append(errs, SiteError{Site: n.site, Err: errNewlineChanged})
+		text = original
+		n.fallback = true
+	case errors.As(err, &some) && some.all:
+		errs = append(errs, some.refused...)
+		text = original
+		n.fallback = true
+	case errors.As(err, &some):
 		// The rewrite places the group's other mutants.
 		errs = append(errs, some.refused...)
 		n.site.Muts = withoutMutants(n.site.Muts, some.refused)
