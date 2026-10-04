@@ -65,6 +65,7 @@ func TestConstantGroupsBehave(t *testing.T) {
 	fx.runBehave(t, []string{
 		"Room: 51\n", "Paren: 17\n", "NegSum: -21\n", "Compare: true false\n", "FloatOperand: 6\n", "FloatGroup: 5\n",
 		"FloatNamed: 7.5\n", "Converted: 17\n", "Wide: 2305843009213693953\n",
+		"LenArrayLength: 13\n", "LenArrayLengthGroup: 12\n", "LenElements: 7\n",
 	})
 }
 
@@ -95,6 +96,14 @@ func TestConstantGroupRefusals(t *testing.T) {
 				"ARITHMETIC_BASE *": "divides by zero",
 			},
 			notViable: []string{"ARITHMETIC_BASE *"},
+		},
+		"every_mutant_refused_each_for_its_reason": {
+			body: "func f(v uint8) uint8 { return uint8(250/(1*5)) + v }",
+			refused: map[string]string{
+				"ARITHMETIC_BASE /": "does not fit",
+				"ARITHMETIC_BASE *": "divides by zero",
+			},
+			notViable: []string{"ARITHMETIC_BASE /", "ARITHMETIC_BASE *"},
 		},
 		"overflow_in_a_conversion": {
 			body: "func f(v uint8) uint8 { return uint8(255/5) + v }",
@@ -193,6 +202,17 @@ func TestGroupConstantSites(t *testing.T) {
 		},
 		"array_length_stays": {
 			body: "func f() int { var a [2*3 + 1]int; return len(a) }", single: 2,
+		},
+		"array_length_under_lone_site": {
+			body: "func f(n int) int { return len([2*3]int{})*2 + n }", single: 3,
+		},
+		"array_length_under_group": {
+			body:   "func f(n int) int { return len([2*3]int{})*2 - 1 + n }",
+			groups: map[string]int{"len([2*3]int{})*2 - 1": 2}, single: 2,
+		},
+		"elements_under_len": {
+			body:   "func f(x, n int) int { return len([2]int{x + 1, 0})*3 + n }",
+			groups: map[string]int{"len([2]int{x + 1, 0})*3": 2}, single: 1,
 		},
 		"two_groups": {
 			body:   "func f(n int) int { return -(2+1)*n + (4*3 - 1) }",

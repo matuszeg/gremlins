@@ -42,6 +42,18 @@ func FloatNamed(c Celsius) Celsius { return (10.0 - 0.5) - c }
 // its site.
 func Converted(v int64) int64 { return int64(3*4) + v }
 
+// LenArrayLength has a site in an array length under a lone constant
+// site: the 2 * 3 is placed by duplicating the function, the *2 by its own
+// constant form, which takes len's recorded value.
+func LenArrayLength(n int) int { return len([2 * 3]int{})*2 + n }
+
+// LenArrayLengthGroup is LenArrayLength under a group of two sites.
+func LenArrayLengthGroup(n int) int { return len([2 * 3]int{})*2 - 1 + n }
+
+// LenElements has a site len never evaluates: its mutants are placed in
+// the group with the group's own value.
+func LenElements(x, n int) int { return len([2]int{x + 1, 0})*3 + n }
+
 // Wide has every intermediate of the constant operand beyond int64, folded
 // exactly as the compiler folds them: run time would overflow.
 func Wide(n int) int { return (1<<62)*4/8 + n }

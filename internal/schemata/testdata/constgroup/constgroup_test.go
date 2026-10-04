@@ -15,4 +15,7 @@ func TestPrint(t *testing.T) {
 	fmt.Println("FloatNamed:", FloatNamed(2))
 	fmt.Println("Converted:", Converted(5))
 	fmt.Println("Wide:", Wide(1))
+	fmt.Println("LenArrayLength:", LenArrayLength(1))
+	fmt.Println("LenArrayLengthGroup:", LenArrayLengthGroup(1))
+	fmt.Println("LenElements:", LenElements(5, 1))
 }

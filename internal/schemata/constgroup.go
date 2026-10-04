@@ -39,12 +39,30 @@ import (
 // and cK the expression's with that one operator replaced, spelled by the
 // form the expression's type takes (constantForm).
 
-// GroupConstantSites returns sites with every site inside a maximal constant
-// expression, outside a compile-time context, gathered into one Site for
-// that expression: Node the expression, Tok token.ILLEGAL, Members the sites,
-// Muts all their mutants. A group takes the place of its first member; every
-// other site is returned as it is. A lone site that is the expression, or is
-// it but for parentheses, is left alone: its own constant form folds it.
+// GroupConstantSites returns sites with the sites inside each maximal
+// constant expression M, outside a compile-time context, gathered into one
+// Site for M: Node M, Tok token.ILLEGAL, Members the sites, Muts all their
+// mutants. A group takes the place of its first member; every other site is
+// returned as it is. A lone site that is M, or is it but for parentheses, is
+// left alone: its own constant form folds it.
+//
+// Membership follows the site's path up to M (see pathKind):
+//
+//   - through parentheses, unary and binary expressions and basic numeric
+//     conversions only: a member whose mutants M's fold computes through;
+//   - across len, cap, or unsafe.Sizeof, Alignof or Offsetof of a value
+//     whose type alone gives the result, as in len([2]int{x + 1, 0}) -- an
+//     operand never evaluated: a member whose mutants leave M's value as it
+//     is, so each is placed with M's own value, its reach recorded where M is
+//     evaluated;
+//   - in a compile-time context, such as the array length of
+//     len([2*3]int{}): not a member. It is placed as without grouping, by
+//     duplicating its function, whose jump runs before M while its mutant is
+//     active; M's fold takes len's recorded value and never needs its
+//     mutant's.
+//   - across anything else (a call such as min, say): a member, refused with
+//     the reason.
+//
 // info must hold the Types of files, the package syntax the sites come from.
 func GroupConstantSites(info *types.Info, files []*ast.File, sites []Site) []Site {
 	r := &rewriter{info: info, files: files}
@@ -70,22 +88,33 @@ func GroupConstantSites(info *types.Info, files []*ast.File, sites []Site) []Sit
 
 		return best
 	}
+	// rootOf is the group root s joins, or nil.
+	rootOf := func(s Site) ast.Expr {
+		if s.Node == nil {
+			return nil
+		}
+		m := outer(s.Node)
+		if m == nil {
+			return nil
+		}
+		if e, ok := s.Node.(ast.Expr); ok {
+			if _, fn, err := r.context(e); fn != nil || err != nil {
+				return nil
+			}
+		}
+
+		return m
+	}
 	members := map[ast.Expr][]Site{}
 	for _, s := range sites {
-		if s.Node == nil {
-			continue
-		}
-		if m := outer(s.Node); m != nil {
+		if m := rootOf(s); m != nil {
 			members[m] = append(members[m], s)
 		}
 	}
 	var out []Site
 	placed := map[ast.Expr]bool{}
 	for _, s := range sites {
-		var m ast.Expr
-		if s.Node != nil {
-			m = outer(s.Node)
-		}
+		m := rootOf(s)
 		ms := members[m]
 		if m == nil || len(ms) == 1 && ast.Unparen(m) == s.Node {
 			out = append(out, s)
@@ -104,6 +133,87 @@ func GroupConstantSites(info *types.Info, files []*ast.File, sites []Site) []Sit
 	}
 
 	return out
+}
+
+// pathKinds of a site's path up to its group root.
+const (
+	// pathFold: through nodes the root's fold computes through.
+	pathFold = iota
+	// pathTypeOnly: across a builtin whose constant result depends on its
+	// operand's type alone, through fold nodes above it.
+	pathTypeOnly
+	// pathOther: anything else.
+	pathOther
+)
+
+// pathKind classifies the path from n up to the root m, which holds n: a
+// pathKind constant.
+func (r *rewriter) pathKind(n ast.Node, m ast.Expr) int {
+	var path []ast.Node
+	for p := n; p != m; {
+		q, ok := r.parent(p)
+		if !ok {
+			return pathOther
+		}
+		path = append(path, q)
+		p = q
+	}
+	kind := pathFold
+	for i := len(path) - 1; i >= 0; i-- {
+		switch {
+		case r.foldNode(path[i]):
+		case r.typeOnly(path[i]):
+			return pathTypeOnly
+		default:
+			kind = pathOther
+		}
+		if kind == pathOther {
+			break
+		}
+	}
+
+	return kind
+}
+
+// foldNode reports whether foldPath computes through n.
+func (r *rewriter) foldNode(n ast.Node) bool {
+	switch n := n.(type) {
+	case *ast.ParenExpr, *ast.UnaryExpr, *ast.BinaryExpr:
+		return true
+	case *ast.CallExpr:
+		tv := r.info.Types[n.Fun]
+		if !tv.IsType() {
+			return false
+		}
+		b, ok := tv.Type.Underlying().(*types.Basic)
+
+		return ok && b.Info()&(types.IsInteger|types.IsFloat) != 0
+	}
+
+	return false
+}
+
+// typeOnly reports whether n is a constant call of len, cap, or
+// unsafe.Sizeof, Alignof or Offsetof: its value is its operand's type's, the
+// operand never evaluated, whatever operator in it a mutant rewrites.
+func (r *rewriter) typeOnly(n ast.Node) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok || r.info.Types[call].Value == nil || !r.info.Types[call.Fun].IsBuiltin() {
+		return false
+	}
+	var name string
+	switch f := ast.Unparen(call.Fun).(type) {
+	case *ast.Ident:
+		name = f.Name
+	case *ast.SelectorExpr:
+		name = f.Sel.Name
+	}
+	switch name {
+	case "len", "cap", "Sizeof", "Alignof", "Offsetof":
+		return true
+	}
+
+	return false
 }
 
 // maximal returns the maximal constant expression holding the constant e,
@@ -134,6 +244,8 @@ func (r *rewriter) maximal(e ast.Expr) ast.Expr {
 // each a Site of the group holding the one mutant, and why.
 type refusedMutantsError struct {
 	refused []SiteError
+	// all is set when the group places none: the rewrite is empty.
+	all bool
 }
 
 func (m *refusedMutantsError) Error() string {
@@ -172,6 +284,17 @@ func (r *rewriter) constantGroup(g Site, inner func(ast.Node) string) (string, e
 		refused = append(refused, SiteError{Site: one, Err: err})
 	}
 	for _, s := range g.Members {
+		// A mutant beyond a type-only builtin leaves m's value as it is.
+		if r.pathKind(s.Node, m) == pathTypeOnly {
+			for _, mu := range s.Muts {
+				if live[mu.ID] {
+					c.ids = append(c.ids, mu.ID)
+					c.cs = append(c.cs, c.c0)
+				}
+			}
+
+			continue
+		}
 		e, ok := s.Node.(ast.Expr)
 		op, _ := siteMutators(e)
 		// The fold of the expression as written must give the type
@@ -205,7 +328,8 @@ func (r *rewriter) constantGroup(g Site, inner func(ast.Node) string) (string, e
 		}
 	}
 	if len(c.ids) == 0 {
-		return "", refused[0].Err
+		// Each refused for its own reason.
+		return "", &refusedMutantsError{refused: refused, all: true}
 	}
 	out, err := constantForm(r.info, r.sizes, m, c, r.prefix, r.h, ctx, inner)
 	if err != nil {
