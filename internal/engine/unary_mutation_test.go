@@ -19,7 +19,9 @@ package engine_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -241,4 +243,13 @@ func goBuild(dir string) (string, error) {
 	out, err := cmd.CombinedOutput()
 
 	return string(out), err
+}
+
+// writeFile writes a fixture file into dir, failing the test if it cannot.
+func writeFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+		t.Fatalf("writing %s: %v", name, err)
+	}
 }
