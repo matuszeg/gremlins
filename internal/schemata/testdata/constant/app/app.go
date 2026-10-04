@@ -20,7 +20,11 @@
 // ErrUnsupported. Every plain token mutant of every site compiles.
 package app
 
-import "fixture/foo"
+import (
+	"math"
+
+	"fixture/foo"
+)
 
 const k = 2 * 3 // refused *: a const declaration
 
@@ -52,7 +56,7 @@ func Mix() any {
 
 func Method() any {
 	var b foo.Box
-	b.Put(3.0 - 0.5) // refused -: a method value witness can panic out of order
+	b.Put(3.0 - 0.5) // refused -: a method value witness can panic out of order, and foo's ratio has no name here
 	return b.R
 }
 
@@ -97,7 +101,7 @@ func Shift(x int) int { return x << (1 + 1) } // refused +: an untyped shift cou
 
 func Variadic() any { return foo.Sum(0.5 + 1) } // refused +: a variadic float argument
 
-func Generic() any { return foo.Pick(2.5 * 2) } // refused *: a generic callee
+func Generic() any { return foo.Pick(2.5 * 2) } // a generic callee: Site[float64]() as its argument
 
 const lenBase = 127
 
@@ -114,4 +118,56 @@ func SetShl() any { return foo.Set(1 << 4) }
 func Land() bool {
 	x := true && false
 	return x
+}
+
+// Pi keeps math used outside the sites, which the forms below replace with
+// their values: like assembler's eval.go, which uses math elsewhere too.
+func Pi() float64 { return math.Pi }
+
+type dec float64
+
+type bounds struct {
+	Lo dec
+	Hi float64
+}
+
+// Literal is assembler's map[string]any{"Decimal.Min": -math.MaxFloat64}:
+// a float constant as a composite literal's value, of its default type.
+func Literal() any {
+	return map[string]any{
+		"min":  -math.MaxFloat64,
+		"half": 1.5 / 3,
+	}
+}
+
+func StructKV() any { return bounds{Lo: -math.MaxFloat64, Hi: 2.5 * 2} }
+
+func StructPos() any { return bounds{1.5 + 1, -math.SmallestNonzeroFloat64} }
+
+func SliceLit() any { return []dec{0.5 * 3, 4.5 - 1} }
+
+func ArrayLit() any { return [...]float32{1.5 + 2} }
+
+func ForeignLit() any { return []foo.Level{0.25 * 2} }
+
+func Send() any {
+	c := make(chan dec, 1)
+	c <- 1.5 * 3
+	return <-c
+}
+
+func Append() any { return append([]float64{1}, 0.5+0.25, 2.5*2) }
+
+func Return() float64 { return 2.5 * 4 }
+
+func Define() any {
+	r := 1.5 * 2
+	return r
+}
+
+func Unexported() any { return foo.Box{R: 1.5 * 2}.R } // refused *: foo's ratio has no name here
+
+func Shadowed() any {
+	float64 := 1
+	return []any{float64, 0.5 * 3} // refused *: float64 names a variable here
 }

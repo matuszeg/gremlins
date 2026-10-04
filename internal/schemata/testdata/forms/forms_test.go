@@ -79,4 +79,15 @@ func TestPrint(t *testing.T) {
 	})
 	show("LandNamed", func() any { return []flag{LandNamed(true, true), LandNamed(true, false), LandNamed(false, true)} })
 	show("MaskTest", func() any { return []bool{MaskTest(4, 3, true), MaskTest(4, 4, true), MaskTest(4, 3, false)} })
+	for _, p := range [][2]int{{1, 2}, {2, 2}, {3, 2}} {
+		a, b := p[0], p[1]
+		sa, sb := fmt.Sprint(a), fmt.Sprint(b)
+		show("Flag", func() any {
+			return []any{
+				FlagConv(sa, sb), FlagConvLess(a, b), FlagReturn(float64(a), float64(b)), FlagAssign(a, b),
+				FlagVar(a, b), FlagArg(a, b), FlagField(a, b), FlagSlice(a, b), FlagMap(a, b), FlagSend(a, b),
+				FlagOperand(true, a, b), FlagOperand(false, a, b), FlagParam[flag](a, b), FlagLocal(sa, sb),
+			}
+		})
+	}
 }

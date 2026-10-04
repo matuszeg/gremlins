@@ -153,6 +153,7 @@ func newInfo() *types.Info {
 		Uses:       map[*ast.Ident]types.Object{},
 		Instances:  map[*ast.Ident]types.Instance{},
 		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Scopes:     map[ast.Node]*types.Scope{},
 	}
 }
 
@@ -346,46 +347,67 @@ func TestNewRewriter(t *testing.T) {
 		"const_unrepresentable":     {src: "func f() uint8 { return 255 - 1 }", tok: token.SUB, muts: []mutator.Type{ab}},
 		"const_string":              {src: "func f() string { return \"a\" + \"b\" }", tok: token.ADD, muts: []mutator.Type{ab}},
 		"const_complex":             {src: "func f() complex128 { return 1i * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_named_bool":          {src: "type nb bool\nfunc f() nb { return 1 < 2 }", tok: token.LSS, muts: []mutator.Type{cn}},
+		"const_named_bool":          {src: "type nb bool\nfunc f() nb { return 1 < 2 }", tok: token.LSS, muts: []mutator.Type{cn}, want: "nb(_zzBool1(1, true, false))"},
+		"const_named_bool_shadowed": {src: "type nb bool\nfunc f() nb { nb := 0; _ = nb; return 1 < 2 }", tok: token.LSS, muts: []mutator.Type{cn}, refusal: "not nameable"},
 		"const_foreign_mutator":     {src: "func f() int { return 1 + 2 }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
-		"const_float_return":        {src: "func f() float64 { return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_binary_call":   {src: "func g() float64 { return 1 }\nfunc f() float64 { return g() * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "more than a name or selector"},
-		"const_float_binary_deref":  {src: "type b struct{ r float64 }\nfunc f(p *b) float64 { return p.r * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "through a pointer"},
-		"const_float_variadic":      {src: "func g(r ...float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_generic":       {src: "func g[T ~float64](r T) T { return r }\nfunc f() float64 { return g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_builtin":       {src: "func f(s []float64) []float64 { return append(s, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_call_fun":      {src: "func g() func(float64) { return nil }\nfunc f() { g()(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_arity":         {src: "func g(a, b, c, d, e float64) {}\nfunc f() { g(1, 2, 3, 4, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_iface":         {src: "func g(v any) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_no_uses":       {src: "func g(r float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, bareInfo: true},
+		"const_float_return":        {src: "func f() float64 { return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_binary_call":   {src: "type F float64\nfunc g() F { return 1 }\nfunc f() F { F := 0; _ = F; return g() * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "more than a name or selector"},
+		"const_float_binary_deref":  {src: "type F float64\ntype b struct{ r F }\nfunc f(p *b) F { F := 0; _ = F; return p.r * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "through a pointer"},
+		"const_float_variadic":      {src: "func g(r ...float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_generic":       {src: "func g[T ~float64](r T) T { return r }\nfunc f() float64 { return g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_builtin":       {src: "func f(s []float64) []float64 { return append(s, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_call_fun":      {src: "func g() func(float64) { return nil }\nfunc f() { g()(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_arity":         {src: "func g(a, b, c, d, e float64) {}\nfunc f() { g(1, 2, 3, 4, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_iface":         {src: "func g(v any) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_no_uses":       {src: "func g(r float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, bareInfo: true, want: "_zzSite1[float64]()"},
+		"const_float_no_scopes":     {src: "func g(r ...float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, noScopes: true, refusal: "no Scopes"},
 		"const_no_files":            {src: "func f() int { return 1 + 2 }", tok: token.ADD, muts: []mutator.Type{ab}, noFiles: true},
 		"const_conv_typeparam":      {src: "func f[T ~int | ~float64]() T { return T(1 + 2) }", tok: token.ADD, muts: []mutator.Type{ab}},
 		"const_conv_typeparam_rune": {src: "func f[T ~int32 | ~float64]() T { return T('a' + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
-		// &v.r with a nil v panics among the witness's arguments, before
-		// the site records its reach.
-		"const_float_selector_lhs": {src: "type b struct{ r float64 }\nfunc f(v *b) { v.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_embedded_ptr": {src: "type in struct{ r float64 }\ntype b struct{ *in }\nfunc f(v b) { v.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_inner_ptr":    {src: "type c struct{ r float64 }\ntype b struct{ c *c }\nfunc f(v b) { v.c.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_lhs_index":    {src: "func f(s []float64, i int) { s[i+1] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_lhs_multi":    {src: "func g() int { return 0 }\nfunc f() { var r float64; var n int; r, n = 1.5 * 2, g(); _, _ = r, n }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_method":       {src: "type b struct{}\nfunc (b) m(r float32, n int) {}\nfunc g() int { return 0 }\nfunc f(v *b) { v.m(1.5 * 2, g()) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_field_func":   {src: "type b struct{ fn func(float64) }\nfunc f(v *b) { v.fn(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_define":       {src: "func f() float64 { r := 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_map":          {src: "func f(m map[int]float64) { m[1] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_lhs_call":     {src: "func f(s []float64, i func() int) { s[i()] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
+		// No witness for these -- &v.r with a nil v would panic among the
+		// witness's arguments, before the site records its reach -- so the
+		// helper is instantiated with the type the constant took.
+		"const_float_selector_lhs": {src: "type b struct{ r float64 }\nfunc f(v *b) { v.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_embedded_ptr": {src: "type in struct{ r float64 }\ntype b struct{ *in }\nfunc f(v b) { v.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_inner_ptr":    {src: "type c struct{ r float64 }\ntype b struct{ c *c }\nfunc f(v b) { v.c.r = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_lhs_index":    {src: "func f(s []float64, i int) { s[i+1] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_lhs_multi":    {src: "func g() int { return 0 }\nfunc f() { var r float64; var n int; r, n = 1.5 * 2, g(); _, _ = r, n }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_method":       {src: "type b struct{}\nfunc (b) m(r float32, n int) {}\nfunc g() int { return 0 }\nfunc f(v *b) { v.m(1.5 * 2, g()) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float32]()"},
+		"const_float_field_func":   {src: "type b struct{ fn func(float64) }\nfunc f(v *b) { v.fn(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_define":       {src: "func f() float64 { r := 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_map":          {src: "func f(m map[int]float64) { m[1] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_lhs_call":     {src: "func f(s []float64, i func() int) { s[i()] = 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
 		"const_float32":            {src: "func g(r float32) {}\nfunc f() { g(1e38 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(g)"},
+		"const_float_struct_kv":    {src: "type d float64\ntype b struct{ lo d }\nfunc f() b { return b{lo: -1.5} }", tok: token.SUB, muts: []mutator.Type{ab, in}, want: "_zzSite1[d]()"},
+		"const_float_struct_pos":   {src: "type b struct{ lo, hi float64 }\nfunc f() b { return b{1, 1.5 * 2} }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float64]()"},
+		"const_float_map_any":      {src: "import \"math\"\nfunc f() map[string]any { return map[string]any{\"min\": -math.MaxFloat64} }", tok: token.SUB, muts: []mutator.Type{ab, in}, want: "_zzSite1[float64]()"},
+		"const_float_slice_lit":    {src: "func f() []float32 { return []float32{1.5 * 2} }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[float32]()"},
+		"const_float_send":         {src: "type d float64\nfunc f(c chan d) { c <- 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[d]()"},
+		"const_float_alias":        {src: "type d float64\ntype al = d\nfunc f() []al { return []al{1.5 * 2} }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1[al]()"},
+		"const_float_shadowed":     {src: "func f() any { float64 := 1; _ = float64; return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}, refusal: "not nameable"},
+		"const_float_kv_shadowed":  {src: "type F float64\ntype b struct{ r F }\nfunc f() b { F := 0; _ = F; return b{r: 1.5 * 2} }", tok: token.MUL, muts: []mutator.Type{ab}, refusal: "not nameable"},
+		"const_float_call_neither": {src: "type F float64\ntype b struct{}\nfunc (b) m(r F) {}\nfunc f(v *b) { F := 0; _ = F; v.m(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}, refusal: "qualified name; type fixture.F is not nameable"},
 		"const_float32_overflow":   {src: "func g(r float32) {}\nfunc f() { g(3e38 / 2) }", tok: token.QUO, muts: []mutator.Type{ab}},
-		// A helper returns plain bool, which a named bool context rejects.
-		"named_bool_ordered": {src: "type nb bool\nfunc f(a, b int) nb { return a < b }", tok: token.LSS, muts: []mutator.Type{cn}},
-		"named_bool_xor":     {src: "type nb bool\nfunc f(a, b int) nb { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}},
-		"generic_map_nested": {src: "type MapC interface{ ~map[string]int }\nfunc f[M interface{ MapC }](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
-		"generic_map_inc":    {src: "func f[M ~map[string]int](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
-		"foreign_mutator":    {src: "func f(a, b int) int { return a + b }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
-		"duplicate_mutator":  {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, muts: []mutator.Type{cn, cn}},
-		"no_mutants":         {src: "func f(a, b int) bool { return a < b }", tok: token.LSS},
-		"tok_mismatch":       {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, siteTok: token.GTR, muts: []mutator.Type{cn}},
-		"assign_stmt":        {src: "func f(a int) { a += 1 }", tok: token.ADD_ASSIGN, muts: []mutator.Type{mutator.InvertAssignments}, want: "switch _zzActive { case 1: _zzReached(); a -= 1; default: a += 1 }"},
-		"nested_outer":       {src: "func f(a, b, c int) bool { return a+b < c }", tok: token.LSS, muts: []mutator.Type{cb}, want: "_zzLSS(1, 0, a+b, c)"},
+		// A helper returns plain bool: a named bool context converts it to the
+		// type the comparison took, which a conversion already does.
+		"named_bool_conv":     {src: "type nb bool\nfunc f(a, b string) nb { return nb(a == b) }", tok: token.EQL, muts: []mutator.Type{cn}, want: "_zzXor(1, a == b)"},
+		"named_bool_conv_lss": {src: "type nb bool\nfunc f(a, b int) any { return nb((a < b)) }", tok: token.LSS, muts: []mutator.Type{cb}, want: "_zzLSS(1, 0, a, b)"},
+		"named_bool_param":    {src: "func f[P ~bool](a, b int) P { return a != b }", tok: token.NEQ, muts: []mutator.Type{cn}, want: "P(_zzXor(1, a != b))"},
+		"named_bool_local":    {src: "func f(a, b int) any { type lb bool; var x lb = a > b; return x }", tok: token.GTR, muts: []mutator.Type{cn}, want: "lb(_zzGTR(0, 1, a, b))"},
+		"named_bool_alias":    {src: "type nb bool\ntype al = nb\nfunc f(a, b int) al { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, want: "al(_zzXor(1, a == b))"},
+		"named_bool_shadowed": {src: "type nb bool\nfunc f(a, b int) nb { nb := 0; _ = nb; return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, refusal: "not nameable"},
+		"named_bool_generic":  {src: "type nb[T any] bool\nfunc f(a, b int) nb[int] { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, refusal: "type arguments"},
+		"named_bool_no_files": {src: "type nb bool\nfunc f(a, b int) nb { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, noFiles: true, refusal: "no scope holds the site"},
+		"named_bool_ordered":  {src: "type nb bool\nfunc f(a, b int) nb { return a < b }", tok: token.LSS, muts: []mutator.Type{cn}, want: "nb(_zzLSS(0, 1, a, b))"},
+		"named_bool_xor":      {src: "type nb bool\nfunc f(a, b int) nb { return a == b }", tok: token.EQL, muts: []mutator.Type{cn}, want: "nb(_zzXor(1, a == b))"},
+		"generic_map_nested":  {src: "type MapC interface{ ~map[string]int }\nfunc f[M interface{ MapC }](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
+		"generic_map_inc":     {src: "func f[M ~map[string]int](m M) { m[\"a\"]++ }", tok: token.INC, muts: []mutator.Type{id}},
+		"foreign_mutator":     {src: "func f(a, b int) int { return a + b }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
+		"duplicate_mutator":   {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, muts: []mutator.Type{cn, cn}},
+		"no_mutants":          {src: "func f(a, b int) bool { return a < b }", tok: token.LSS},
+		"tok_mismatch":        {src: "func f(a, b int) bool { return a < b }", tok: token.LSS, siteTok: token.GTR, muts: []mutator.Type{cn}},
+		"assign_stmt":         {src: "func f(a int) { a += 1 }", tok: token.ADD_ASSIGN, muts: []mutator.Type{mutator.InvertAssignments}, want: "switch _zzActive { case 1: _zzReached(); a -= 1; default: a += 1 }"},
+		"nested_outer":        {src: "func f(a, b, c int) bool { return a+b < c }", tok: token.LSS, muts: []mutator.Type{cb}, want: "_zzLSS(1, 0, a+b, c)"},
 	}
 	runRewriterCases(t, cases)
 }
@@ -401,6 +423,8 @@ type rewriterCase struct {
 	refusal string // with want empty, a text the refusal must contain
 	// bareInfo drops info.Uses, which the float witness form needs.
 	bareInfo bool
+	// noScopes drops info.Scopes, which spelling a type needs.
+	noScopes bool
 	// noFiles gives NewRewriter no files to find a site's context in.
 	noFiles bool
 	// goarch, if set, is the GOARCH whose type sizes NewRewriter gets.
@@ -458,6 +482,9 @@ func runRewriterCases(t *testing.T, cases map[string]rewriterCase) {
 			f, info := typeCheck(t, fset, "p.go", src)
 			if tc.bareInfo {
 				info.Uses = nil
+			}
+			if tc.noScopes {
+				info.Scopes = nil
 			}
 			var node ast.Node
 			ast.Inspect(f, func(n ast.Node) bool {

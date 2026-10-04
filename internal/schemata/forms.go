@@ -230,25 +230,27 @@ func (r *rewriter) binary(s Site, e *ast.BinaryExpr, inner func(ast.Node) string
 		if err != nil {
 			return "", err
 		}
-		if err := r.boolResult(e); err != nil {
+		conv, err := r.boolResult(e)
+		if err != nil {
 			return "", err
 		}
 		// The comparison stays as written, an argument of its own: no
 		// operand types to match, and nothing to re-parenthesise.
-		return r.call("Xor", id, inner(e)), nil
+		return convert(conv, r.call("Xor", id, inner(e))), nil
 	case token.LSS, token.LEQ, token.GTR, token.GEQ:
 		id, err := ids(s, mutator.ConditionalsBoundary, mutator.ConditionalsNegation)
 		if err != nil {
 			return "", err
 		}
-		if err := r.boolResult(e); err != nil {
+		conv, err := r.boolResult(e)
+		if err != nil {
 			return "", err
 		}
 		if err := r.operands(e, orderedConstraint); err != nil {
 			return "", err
 		}
 
-		return r.call(orderedHelpers[e.Op], id, operandText(e, inner)...), nil
+		return convert(conv, r.call(orderedHelpers[e.Op], id, operandText(e, inner)...)), nil
 	case token.SUB:
 		id, err := ids(s, mutator.ArithmeticBase, mutator.InvertNegatives)
 		if err != nil {
@@ -419,20 +421,22 @@ func operandText(e *ast.BinaryExpr, inner func(ast.Node) string) []string {
 	}
 }
 
-// boolResult refuses a comparison whose result is used as a named boolean
-// type: the helpers return bool, which such a context does not accept.
-func (r *rewriter) boolResult(e ast.Expr) error {
-	return plainBool(r.info, e)
+// boolResult returns the type a comparison's helper call, which returns
+// bool, is converted to (see namedBool).
+func (r *rewriter) boolResult(e ast.Expr) (string, error) {
+	return namedBool(r.info, e, r.nonParenParent(e), r.spellAt(e.Pos()))
 }
 
-// plainBool refuses an expression whose type is not bool or untyped bool.
-func plainBool(info *types.Info, e ast.Expr) error {
-	t := info.Types[e].Type
-	if t == nil || !types.Identical(t, types.Typ[types.Bool]) && !types.Identical(t, types.Typ[types.UntypedBool]) {
-		return fmt.Errorf("%w: comparison of type %v, not bool", ErrUnsupported, t)
+// nonParenParent returns e's nearest ancestor that is not a parenthesis, or nil.
+func (r *rewriter) nonParenParent(e ast.Expr) ast.Node {
+	n, _ := r.parent(e)
+	for {
+		p, paren := n.(*ast.ParenExpr)
+		if !paren {
+			return n
+		}
+		n = r.parents[p]
 	}
-
-	return nil
 }
 
 // operands refuses a binary site unless both operands have one type, which

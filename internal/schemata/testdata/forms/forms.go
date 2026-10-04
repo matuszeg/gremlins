@@ -227,3 +227,51 @@ func LorShort(a, b bool) (bool, int) {
 func LandNamed(a, b flag) flag { return a && b }
 
 func MaskTest(a, b int, c bool) bool { return a&b == 0 && c }
+
+// The comparisons below take the named type flag from their contexts, as
+// cel-go's types.Bool(v == id) does; FlagConv is that site.
+func FlagConv(v, id string) any { return flag(v == id) }
+
+func FlagConvLess(a, b int) any { return flag((a < b)) }
+
+func FlagReturn(a, b float64) flag { return a <= b }
+
+func FlagAssign(a, b int) flag {
+	var f flag
+	f = a != b
+	return f
+}
+
+func FlagVar(a, b int) flag {
+	var f flag = a > b
+	return f
+}
+
+func flagID(f flag) flag { return f }
+
+func FlagArg(a, b int) flag { return flagID(a >= b) }
+
+type flagBox struct{ f, g flag }
+
+func FlagField(a, b int) flagBox { return flagBox{f: a == b, g: a < b} }
+
+func FlagSlice(a, b int) []flag { return []flag{a != b, a <= b} }
+
+func FlagMap(a, b int) map[flag]flag { return map[flag]flag{a > b: a == b} }
+
+func FlagSend(a, b int) flag {
+	c := make(chan flag, 1)
+	c <- a >= b
+	return <-c
+}
+
+// FlagOperand compares a flag with a comparison, itself in a flag context.
+func FlagOperand(f flag, a, b int) flag { return f == (a < b) }
+
+func FlagParam[P ~bool](a, b int) P { return a == b }
+
+func FlagLocal(a, b string) any {
+	type local bool
+	var x local = a < b
+	return x
+}

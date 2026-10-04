@@ -52,3 +52,6 @@ func Sum(rs ...ratio) ratio {
 }
 
 func Pick[T ~float64](x T) T { return x }
+
+// Level is an exported float type, which the app package names as foo.Level.
+type Level float64

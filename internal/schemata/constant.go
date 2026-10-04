@@ -89,7 +89,7 @@ func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (st
 	if err != nil {
 		return "", err
 	}
-	out, err := constantForm(r.info, r.sizes, e, c, r.prefix, r.h, ctx, inner)
+	out, err := constantForm(r.info, r.sizes, e, c, r.prefix, r.h, ctx, inner, r.spellAt(e.Pos()))
 	if err != nil {
 		return "", err
 	}
@@ -168,17 +168,21 @@ func (r *rewriter) context(e ast.Expr) (ast.Node, *ast.FuncDecl, error) {
 //     A constant of a typed operand, or of an untyped rune, adds that
 //     operand times 0, so that an interface or inference context still sees
 //     the constant's type.
-//   - basic bool: PBool<n>(id1, ..., c0, c1, ...), a helper per arity.
+//   - a boolean type: PBool<n>(id1, ..., c0, c1, ...), a helper per arity,
+//     converted to the type when it is not bool (see namedBool).
 //   - float32 or float64, as a call argument, the right side of an
 //     assignment or an operand of a binary expression: PSite<id>(witness), a
 //     helper per site (named after its first mutant) returning T(c0) or
 //     T(cK) for the T it infers from the witness -- the callee, &lhs, or the
 //     other operand -- which is how a type only another package can name is
 //     reached.
+//   - float32 or float64 anywhere else, or where no witness is found:
+//     PSite<id>[T](), the same helper instantiated with the type T the
+//     constant took, if spell can name it at the site.
 //
 // Anything else is refused with ErrUnsupported, as is a value that does not
 // fit the type.
-func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, c folded, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
+func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, c folded, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string, spell spellFunc) (string, error) {
 	// In a conversion T(c) the shift form's untyped 1 takes the type T, which
 	// for a type parameter is not an integer type the shift accepts, whatever
 	// type go/types records for c.
@@ -193,11 +197,11 @@ func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, c folded, pre
 	case b == nil || b.Info()&types.IsUntyped != 0 && b.Kind() != types.UntypedBool:
 		return "", fmt.Errorf("%w: constant of type %v", ErrUnsupported, t)
 	case b.Info()&types.IsBoolean != 0:
-		return boolForm(info, e, c, prefix, h)
+		return boolForm(info, e, c, prefix, h, ctx, spell)
 	case b.Info()&types.IsInteger != 0:
 		return intForm(info, sizes, e, c, b, prefix, h, inner)
 	case b.Kind() == types.Float32 || b.Kind() == types.Float64:
-		return floatForm(info, e, c, b, prefix, h, ctx, inner)
+		return floatForm(info, e, c, b, prefix, h, ctx, inner, spell)
 	}
 
 	return "", fmt.Errorf("%w: constant of type %v", ErrUnsupported, t)
@@ -480,8 +484,9 @@ func hostSizes() types.Sizes {
 }
 
 // boolForm calls the helper of the site's arity.
-func boolForm(info *types.Info, e ast.Expr, c folded, prefix string, h *HelperSet) (string, error) {
-	if err := plainBool(info, e); err != nil {
+func boolForm(info *types.Info, e ast.Expr, c folded, prefix string, h *HelperSet, ctx ast.Node, spell spellFunc) (string, error) {
+	conv, err := namedBool(info, e, ctx, spell)
+	if err != nil {
 		return "", err
 	}
 	n := len(c.ids)
@@ -503,12 +508,12 @@ func boolForm(info *types.Info, e ast.Expr, c folded, prefix string, h *HelperSe
 		"func %[1]s(%[2]sint, %[3]s bool) bool {\n\tswitch {\n%[4]s\t}\n\treturn c0\n}",
 		name, strings.TrimSuffix(params.String(), ", ")+" ", strings.Join(cs, ", "), arms.String()))
 
-	return name + "(" + args.String() + strings.Join(vals, ", ") + ")", nil
+	return convert(conv, name+"("+args.String()+strings.Join(vals, ", ")+")"), nil
 }
 
 // floatForm is the witness form, in a call argument, assignment or binary
-// expression context.
-func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
+// expression context, else the explicit form.
+func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string, spell spellFunc) (string, error) {
 	vals := append([]constant.Value{c.c0}, c.cs...)
 	lits := make([]string, len(vals))
 	for i, v := range vals {
@@ -519,13 +524,37 @@ func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix st
 		lits[i] = lit
 	}
 	name := prefix + "Site" + strconv.Itoa(c.ids[0])
+	typeParams, witnessType, witness, err := floatWitness(info, e, b, ctx, inner)
+	call := name + "(" + witness + ")"
+	if err != nil {
+		t, serr := spell(info.Types[e].Type)
+		if serr != nil {
+			return "", fmt.Errorf("%w; %s", err, strings.TrimPrefix(serr.Error(), ErrUnsupported.Error()+": "))
+		}
+		typeParams, witnessType, call = "T ~"+b.Name(), "", name+"["+t+"]()"
+	}
+	var arms strings.Builder
+	for i, id := range c.ids {
+		fmt.Fprintf(&arms, "\tif %[1]sActive != 0 && %[1]sActive == %[2]d {\n\t\t%[1]sReached()\n\t\treturn T(%[3]s)\n\t}\n", prefix, id, lits[i+1])
+	}
+	h.AddRaw(fmt.Sprintf("// %[1]s is a float constant's value, in the type T inferred from the witness\n"+
+		"// or given explicitly.\n"+
+		"func %[1]s[%[2]s](%[3]s) T {\n%[4]s\treturn T(%[5]s)\n}",
+		name, typeParams, witnessType, arms.String(), lits[0]))
+
+	return call, nil
+}
+
+// floatWitness returns the type parameters, the parameter type and the
+// argument of the witness form of e, a float constant of type b in the
+// context ctx, or why it has none.
+func floatWitness(info *types.Info, e ast.Expr, b *types.Basic, ctx ast.Node, inner func(ast.Node) string) (string, string, string, error) {
 	core := "~" + b.Name()
-	var typeParams, witnessType, witness string
 	switch ctx := ctx.(type) {
 	case *ast.CallExpr:
 		sig, err := witnessCallee(info, e, ctx, b)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
 		i := slices.IndexFunc(ctx.Args, func(a ast.Expr) bool { return ast.Unparen(a) == e })
 		var tps, ps, rs []string
@@ -542,43 +571,40 @@ func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix st
 			tps = append(tps, "R"+strconv.Itoa(j))
 			rs = append(rs, "R"+strconv.Itoa(j))
 		}
-		typeParams = "T " + core
+		typeParams := "T " + core
 		if len(tps) > 0 {
 			typeParams += ", " + strings.Join(tps, ", ") + " any"
 		}
-		witnessType = "func(" + strings.Join(ps, ", ") + ")"
+		witnessType := "func(" + strings.Join(ps, ", ") + ")"
 		if len(rs) > 0 {
 			witnessType += " (" + strings.Join(rs, ", ") + ")"
 		}
-		witness = inner(ctx.Fun)
+
+		return typeParams, witnessType, inner(ctx.Fun), nil
 	case *ast.AssignStmt:
 		lhs, err := witnessLHS(info, e, ctx, b)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
-		typeParams, witnessType, witness = "T "+core, "*T", "&"+inner(lhs)
+
+		return "T " + core, "*T", "&" + inner(lhs), nil
 	case *ast.BinaryExpr:
 		other, err := witnessOperand(info, e, ctx, b)
 		if err != nil {
-			return "", err
+			return "", "", "", err
 		}
-		typeParams, witnessType, witness = "T "+core, "T", inner(other)
-	default:
-		return "", fmt.Errorf("%w: float constant in a %T", ErrUnsupported, ctx)
-	}
-	var arms strings.Builder
-	for i, id := range c.ids {
-		fmt.Fprintf(&arms, "\tif %[1]sActive != 0 && %[1]sActive == %[2]d {\n\t\t%[1]sReached()\n\t\treturn T(%[3]s)\n\t}\n", prefix, id, lits[i+1])
-	}
-	h.AddRaw(fmt.Sprintf("// %[1]s is a float constant's value, in the type T inferred from the witness.\n"+
-		"func %[1]s[%[2]s](%[3]s) T {\n%[4]s\treturn T(%[5]s)\n}",
-		name, typeParams, witnessType, arms.String(), lits[0]))
 
-	return name + "(" + witness + ")", nil
+		return "T " + core, "T", inner(other), nil
+	}
+
+	return "", "", "", fmt.Errorf("%w: float constant in a %T", ErrUnsupported, ctx)
 }
 
 // floatLit spells v as an untyped constant expression of its exact value,
-// refusing a value that overflows b.
+// refusing a value that overflows b. Its integers are spelled as float
+// literals: an untyped integer constant of over 512 bits overflows the
+// compiler, where a float one of the same value -- math.MaxFloat64, whose
+// integer value takes 1024 bits -- does not.
 func floatLit(v constant.Value, b *types.Basic) (string, error) {
 	v = constant.ToFloat(v)
 	f, _ := constant.Float64Val(v)
@@ -591,10 +617,10 @@ func floatLit(v constant.Value, b *types.Basic) (string, error) {
 		return "", fmt.Errorf("%w: value %v does not fit %v", ErrUnsupported, v, b)
 	}
 	if constant.Compare(den, token.EQL, constant.MakeInt64(1)) {
-		return num.ExactString(), nil
+		return num.ExactString() + ".0", nil
 	}
 
-	return num.ExactString() + " / " + den.ExactString() + ".0", nil
+	return num.ExactString() + ".0 / " + den.ExactString() + ".0", nil
 }
 
 // witnessCallee returns the signature of the call ctx that e is an argument
