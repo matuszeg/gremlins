@@ -146,6 +146,11 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 	}
 	var typeDrops []typeDrop
 	retried := map[siteID]bool{}
+	// blank holds, by file, the imports the rendered sites left unused (see
+	// unusedImports). It is learned only in a round whose every error is
+	// such an import, and forgotten when a round drops sites, any of which
+	// may hold the import's last use.
+	blank := map[string]map[string]bool{}
 	for round := 0; round < rounds; round++ {
 		h := &HelperSet{}
 		rw := newRW(pkg.TypesInfo, pkg.TypesSizes, pkg.Syntax, prefix, h)
@@ -153,6 +158,7 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 		spans := map[string][]renderedSpan{}
 		for _, f := range files {
 			out, fileSpans, errs := render(pkg.Fset, f.file, f.src, f.sites, rw)
+			out, fileSpans = blankImports(out, fileSpans, blank[f.path])
 			for _, e := range errs {
 				dropped = append(dropped, e)
 				f.sites = removeSite(f.sites, e.Site)
@@ -177,6 +183,23 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 		}
 		if len(typeErrs) == 0 {
 			return overlay, liveSites(files), dropped
+		}
+		rendered := map[string]bool{}
+		for path := range spans {
+			rendered[path] = true
+		}
+		unused, rest := unusedImports(typeErrs, overlay, rendered)
+		if len(rest) == 0 && learn(blank, unused) {
+			// learn adds an import at least each time, so this repeats at
+			// most once per import, each time for a round more.
+			rounds++
+
+			continue
+		}
+		if len(rest) > 0 {
+			// The unused imports are found again once this round's drops
+			// are made, if they still are unused.
+			typeErrs, blank = rest, map[string]map[string]bool{}
 		}
 		bad, unattributable := attribute(typeErrs, overlay, spans)
 		if unattributable != "" {

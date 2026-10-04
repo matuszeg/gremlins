@@ -183,3 +183,78 @@ func TestRemoveSite(t *testing.T) {
 		})
 	}
 }
+
+// TestUnusedImport holds the unused-import match to exactly the type
+// checker's error at an import spec's position in a rendered file.
+func TestUnusedImport(t *testing.T) {
+	t.Parallel()
+	const src = "package p\n\nimport (\n\t\"math\"\n\tm \"math\"\n\t_ \"os\"\n\t\"C\"\n)\n"
+	const file = "/p.go"
+	at := func(s string) int { return strings.Index(src, s) }
+	cases := map[string]struct {
+		e        typeError
+		rendered bool
+		want     string
+	}{
+		"unnamed":        {e: typeError{file: file, offset: at(`"math"`), msg: `p.go:4:2: "math" imported and not used`}, rendered: true, want: ` "math"`},
+		"named":          {e: typeError{file: file, offset: at(`m "math"`), msg: `p.go:5:2: "math" imported as m and not used`}, rendered: true, want: `m "math"`},
+		"blank":          {e: typeError{file: file, offset: at(`_ "os"`), msg: `"os" imported and not used`}, rendered: true},
+		"cgo":            {e: typeError{file: file, offset: at(`"C"`), msg: `"C" imported and not used`}, rendered: true},
+		"other_message":  {e: typeError{file: file, offset: at(`"math"`), msg: `undefined: math`}, rendered: true},
+		"not_at_a_spec":  {e: typeError{file: file, offset: at(`import`), msg: `"math" imported and not used`}, rendered: true},
+		"not_rendered":   {e: typeError{file: file, offset: at(`"math"`), msg: `"math" imported and not used`}},
+		"unparsable":     {e: typeError{file: "/q.go", offset: 0, msg: `"math" imported and not used`}, rendered: true},
+		"not_in_overlay": {e: typeError{file: "/r.go", offset: 0, msg: `"math" imported and not used`}, rendered: true},
+	}
+	overlay := map[string][]byte{file: []byte(src), "/q.go": []byte("package")}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := unusedImport(tc.e, overlay, map[string]bool{tc.e.file: tc.rendered})
+			if got != tc.want || ok != (tc.want != "") {
+				t.Errorf("unusedImport = %q, %v; want %q", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// TestBlankImports checks the in-place edit: the named import's name is
+// replaced, the unnamed import gets "_ " before its path, other imports and
+// the line count are untouched, and each span after an edit moves by its
+// change in length.
+func TestBlankImports(t *testing.T) {
+	t.Parallel()
+	src := []byte("package p\n\nimport (\n\t\"fmt\"\n\t\"math\"\n\tstr \"strings\"\n)\n\nvar x = 1\n")
+	site := strings.Index(string(src), "1\n")
+	spans := []renderedSpan{{start: site, end: site + 1}}
+	out, moved := blankImports(src, spans, map[string]bool{` "math"`: true, `str "strings"`: true})
+	want := "package p\n\nimport (\n\t\"fmt\"\n\t_ \"math\"\n\t_ \"strings\"\n)\n\nvar x = 1\n"
+	if string(out) != want {
+		t.Errorf("got\n%s\nwant\n%s", out, want)
+	}
+	if got := string(out[moved[0].start:moved[0].end]); got != "1" || spans[0].start != site {
+		t.Errorf("span moved to %q (the input span at %d, was %d)", got, spans[0].start, site)
+	}
+	if got, _ := blankImports([]byte("package"), spans, map[string]bool{"x": true}); string(got) != "package" {
+		t.Errorf("unparsable source changed: %q", got)
+	}
+	if got, _ := blankImports(src, spans, nil); !slices.Equal(got, src) {
+		t.Errorf("no keys changed the source: %q", got)
+	}
+}
+
+// TestLearn checks that learn reports progress only for an import not yet
+// blanked: one reported unused again although blanked ends the repair.
+func TestLearn(t *testing.T) {
+	t.Parallel()
+	blank := map[string]map[string]bool{}
+	if !learn(blank, map[string]map[string]bool{"/p.go": {` "math"`: true}}) {
+		t.Error("a new import is not progress")
+	}
+	if learn(blank, map[string]map[string]bool{"/p.go": {` "math"`: true}}) {
+		t.Error("an import already blanked is progress")
+	}
+	if !learn(blank, map[string]map[string]bool{"/p.go": {` "math"`: true, ` "os"`: true}}) {
+		t.Error("a new import beside a blanked one is not progress")
+	}
+}
