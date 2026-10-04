@@ -349,7 +349,7 @@ func (r *rewriter) constantGroup(g Site, inner func(ast.Node) string) (string, e
 		// Each refused for its own reason.
 		return "", &refusedMutantsError{refused: refused, all: true}
 	}
-	out, err := constantForm(r.info, r.sizes, m, c, r.prefix, r.h, ctx, inner)
+	out, err := constantForm(r.info, r.sizes, m, c, r.prefix, r.h, ctx, inner, r.spellAt(m.Pos()))
 	if err != nil {
 		return "", err
 	}
