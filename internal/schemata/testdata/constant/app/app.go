@@ -122,7 +122,8 @@ func Land() bool {
 
 // Pi keeps math used outside the sites, which the forms below replace with
 // their values: this harness renders with Render alone, without
-// RewritePackage's repair of an import the rewrite left unused.
+// RewritePackage's repair of an import the rewrite left unused, which
+// imports_test.go covers.
 func Pi() float64 { return math.Pi }
 
 type dec float64
@@ -171,4 +172,21 @@ func Unexported() any { return foo.Box{R: 1.5 * 2}.R } // refused *: foo's ratio
 func Shadowed() any {
 	float64 := 1
 	return []any{float64, 0.5 * 3} // refused *: float64 names a variable here
+}
+
+// drBase - drTiny's mutant drBase + drTiny lies within half a float64 ulp
+// of a float32 rounding midpoint: rounded to float64 first, then to
+// float32, it gives 1, where the plain mutant rounds it once, to
+// 1.0000001.
+const (
+	drBase = 1.000000059604644775390625                  // 1 + 2^-24
+	drTiny = 5.5511151231257827021181583404541015625e-17 // 2^-54
+)
+
+func DoubleRound() any { return []float32{drBase - drTiny} }
+
+func DoubleRoundAssign() any {
+	var x float32
+	x = drBase - drTiny
+	return x
 }

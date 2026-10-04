@@ -188,7 +188,7 @@ func rewritePackage(ctx context.Context, pkg *packages.Package, sites []Site, ta
 		for path := range spans {
 			rendered[path] = true
 		}
-		unused, rest := unusedImports(typeErrs, overlay, rendered)
+		unused, rest := unusedImports(typeErrs, overlay, rendered, repairableIn(pkg, files))
 		if len(rest) == 0 && learn(blank, unused) {
 			// learn adds an import at least each time, so this repeats at
 			// most once per import, each time for a round more.

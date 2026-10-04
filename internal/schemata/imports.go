@@ -20,8 +20,12 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"slices"
 	"strconv"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // A constant form replaces a constant with its value, which can remove a
@@ -31,7 +35,11 @@ import (
 // `"math"` or `m "math"` becomes `_ "math"` -- which keeps the package's
 // init side effects, all the original's import still guarantees, and the
 // file's lines. Imports are file-scoped, and so is the error: what other
-// files of the package import or use plays no part.
+// files of the package import or use plays no part. Only an import every
+// use of which, in the original file, lies inside a site placed with a
+// constant form is repaired: that form drops the constant's text, which has
+// no effect to lose. Any other lost use -- a form that dropped an operand --
+// stays a type error.
 
 // importKey identifies an import spec of a file by its name, empty when it
 // has none, and its path literal, as written: a file can import one path
@@ -62,11 +70,11 @@ func fileImports(src []byte) (*token.File, []*ast.ImportSpec, bool) {
 // an import spec of a file in rendered, as the type checker reports it: at
 // the spec's name if it has one, else at its path. A blank import is never
 // unused, and cgo's "C" is left alone.
-func unusedImports(errs []typeError, overlay map[string][]byte, rendered map[string]bool) (map[string]map[string]bool, []typeError) {
+func unusedImports(errs []typeError, overlay map[string][]byte, rendered map[string]bool, repairable func(file, key string) bool) (map[string]map[string]bool, []typeError) {
 	found := map[string]map[string]bool{}
 	var rest []typeError
 	for _, e := range errs {
-		if key, ok := unusedImport(e, overlay, rendered); ok {
+		if key, ok := unusedImport(e, overlay, rendered); ok && repairable(e.file, key) {
 			if found[e.file] == nil {
 				found[e.file] = map[string]bool{}
 			}
@@ -155,4 +163,76 @@ func learn(blank, unused map[string]map[string]bool) bool {
 	}
 
 	return added
+}
+
+// constantUsesOnly reports whether every use, in the original syntax syn of
+// a file, of its import whose importKey is key lies inside one of sites
+// that is placed with a constant form: a constant-valued expression, or a
+// constant group. A use of a dot import is a use of any package-level object
+// of the imported package. An import the type information does not hold is
+// not repairable.
+func constantUsesOnly(info *types.Info, syn *ast.File, sites []Site, key string) bool {
+	var pn *types.PkgName
+	for _, spec := range syn.Imports {
+		if importKey(spec) != key {
+			continue
+		}
+		var obj types.Object
+		if spec.Name != nil {
+			obj = info.Defs[spec.Name]
+		} else {
+			obj = info.Implicits[spec]
+		}
+		pn, _ = obj.(*types.PkgName)
+	}
+	if pn == nil {
+		return false
+	}
+	dot := pn.Name() == "."
+	for id, obj := range info.Uses {
+		if id.Pos() < syn.FileStart || id.Pos() > syn.FileEnd {
+			continue
+		}
+		used := obj == pn
+		if dot && obj.Pkg() == pn.Imported() && obj.Parent() == pn.Imported().Scope() {
+			used = true
+		}
+		if used && !slices.ContainsFunc(sites, func(s Site) bool {
+			return constantSite(info, s) && s.Node.Pos() <= id.Pos() && id.End() <= s.Node.End()
+		}) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// constantSite reports whether s is placed with a constant form.
+func constantSite(info *types.Info, s Site) bool {
+	if len(s.Members) > 0 {
+		return true
+	}
+	e, ok := s.Node.(ast.Expr)
+
+	return ok && info.Types[e].Value != nil
+}
+
+// repairableIn returns, for the package's files as rendered this round,
+// whether the import key of the file at path is repairable: every use of it
+// lies inside a site of the file placed with a constant form.
+func repairableIn(pkg *packages.Package, files []*sourceFile) func(path, key string) bool {
+	return func(path, key string) bool {
+		for _, f := range files {
+			if f.path != path {
+				continue
+			}
+			for _, syn := range pkg.Syntax {
+				if pkg.Fset.File(syn.Pos()) == f.file {
+					return constantUsesOnly(pkg.TypesInfo, syn, f.sites, key)
+				}
+			}
+		}
+
+		return false
+	}
 }
