@@ -86,7 +86,7 @@ func TestBuildAllKillsTheWholeBuildAtTheDeadline(t *testing.T) {
 	workDir := t.TempDir()
 
 	start := time.Now()
-	_, errs := schemata.BuildAll(context.Background(), modRoot, workDir, "", nil, []string{"slow"}, time.Second)
+	_, errs := schemata.BuildAll(context.Background(), modRoot, workDir, "", nil, []string{"slow"}, time.Second, 0)
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Errorf("BuildAll returned after %s with a 1s allowance", elapsed)
 	}

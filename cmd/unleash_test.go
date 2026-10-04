@@ -162,6 +162,11 @@ func TestUnleash(t *testing.T) {
 			defValue: "0",
 		},
 		{
+			name:     "test-memory-limit",
+			flagType: "string",
+			defValue: "",
+		},
+		{
 			name:     "threshold-efficacy",
 			flagType: "float64",
 			defValue: "0",

@@ -430,7 +430,7 @@ func TestBuildAll(t *testing.T) {
 			}
 			before := snapshot(t, modRoot)
 
-			b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", rewritten, testPkgs, 5*time.Minute)
+			b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", rewritten, testPkgs, 5*time.Minute, 0)
 
 			if after := snapshot(t, modRoot); !maps.Equal(before, after) {
 				t.Error("BuildAll changed the original module")
@@ -497,7 +497,7 @@ func TestBuildAllReportsMissingTestFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{"oldgo"}, 5*time.Minute)
+	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{"oldgo"}, 5*time.Minute, 0)
 	if _, ok := b.Binaries["oldgo"]; ok || errs["oldgo"] != nil || !b.NoTests["oldgo"] {
 		t.Errorf("binary %v, error %v, NoTests %v; want oldgo recorded as having no tests", b.Binaries, errs["oldgo"], b.NoTests)
 	}
@@ -526,7 +526,7 @@ func TestBuildAllEmbedsOriginalSourcePaths(t *testing.T) {
 		t.Fatalf("sites dropped: %v", dropped)
 	}
 	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "",
-		map[string]map[string][]byte{"fixture/caller": files}, []string{"fixture/caller"}, 5*time.Minute)
+		map[string]map[string][]byte{"fixture/caller": files}, []string{"fixture/caller"}, 5*time.Minute, 0)
 	if err := errs["fixture/caller"]; err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func TestBuildAllHonoursAllowance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{"twopkgs/ok", "twopkgs/bad"}, time.Nanosecond)
+	_, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "", nil, []string{"twopkgs/ok", "twopkgs/bad"}, time.Nanosecond, 0)
 	for _, p := range []string{"twopkgs/ok", "twopkgs/bad"} {
 		if !errors.Is(errs[p], context.DeadlineExceeded) {
 			t.Errorf("%s: error %v, want the deadline", p, errs[p])

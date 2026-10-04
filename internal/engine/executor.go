@@ -36,6 +36,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/engine/workerpool"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
+	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/procgroup"
 )
@@ -117,6 +118,9 @@ type MutantExecutorDealer struct {
 	compileAllowance  time.Duration
 	dryRun            bool
 	testCPU           int
+	// testMemoryLimit caps the address space of every test process the
+	// dealer's executors and schema preparation start.
+	testMemoryLimit memlimit.Limit
 	// overlays is shared by every copy of the dealer, so each worker's
 	// overlay file for a schema build is written once per run, not once per
 	// mutant.
@@ -254,6 +258,7 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		// of the two flags deciding it.
 		testExecutionTime: cappedExecutionTime(timeout),
 		compileAllowance:  compileAllowance(),
+		testMemoryLimit:   testMemoryLimit(),
 		execContext:       exec.CommandContext,
 		overlays:          newOverlayCache(),
 		schemaCounts:      &schemaCounts{},
@@ -312,6 +317,31 @@ func compileAllowance() time.Duration {
 	return d
 }
 
+// TestMemoryLimit reads --test-memory-limit: the cap on the address space of
+// each test process a run starts, zero for none.
+func TestMemoryLimit() (memlimit.Limit, error) {
+	raw := configuration.Get[string](configuration.UnleashTestMemoryLimitKey)
+	l, err := memlimit.Parse(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s (--test-memory-limit): %w", configuration.UnleashTestMemoryLimitKey, err)
+	}
+
+	return l, nil
+}
+
+// testMemoryLimit is TestMemoryLimit for the dealer, which has no error to
+// return: cmd/unleash refuses a malformed value before a dealer is made, so
+// one reaching here is reported and the run goes uncapped, as it would
+// without the flag.
+func testMemoryLimit() memlimit.Limit {
+	l, err := TestMemoryLimit()
+	if err != nil {
+		log.Errorf("%v; running test processes without a memory limit\n", err)
+	}
+
+	return l
+}
+
 // positiveDuration reads a Go duration from a string configuration key. It
 // reports ok=false when the key is unset, unparseable, or non-positive, so the
 // caller applies its own fallback.
@@ -363,6 +393,7 @@ func (m MutantExecutorDealer) NewExecutor(mut mutator.Mutator, outCh chan<- muta
 		testCPU:           m.testCPU,
 		testExecutionTime: m.testExecutionTime,
 		compileAllowance:  m.compileAllowance,
+		testMemoryLimit:   m.testMemoryLimit,
 		runCtx:            runCtx,
 	}
 
@@ -388,6 +419,7 @@ type mutantExecutor struct {
 	buildTags         string
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
+	testMemoryLimit   memlimit.Limit
 	dryRun            bool
 	testCPU           int
 }
@@ -613,7 +645,7 @@ func (m *mutantExecutor) runTestCommand(ctx context.Context, rootDir string, sel
 	// Set up process group for killing entire process tree
 	procgroup.Setup(cmd)
 
-	err := run(ctx, cmd)
+	err := run(ctx, cmd, m.testMemoryLimit)
 
 	// The run-phase watchdog is read before either deadline, because it is
 	// evidence and they are the lack of it. Two things follow from that order.
@@ -841,7 +873,10 @@ func (m *mutantExecutor) getTestArgs(sel testRun) []string {
 	return append(args, sel.pkgs...)
 }
 
-func run(ctx context.Context, cmd *exec.Cmd) error {
+// run starts cmd with its address space capped at limit, and waits for it or
+// for ctx to end, whichever comes first, killing its process group either way.
+func run(ctx context.Context, cmd *exec.Cmd, limit memlimit.Limit) error {
+	memlimit.Wrap(cmd, limit)
 	if err := cmd.Start(); err != nil {
 		return err
 	}

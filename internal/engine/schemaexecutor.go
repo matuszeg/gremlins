@@ -313,7 +313,7 @@ func (s *schemaExecutor) runOne(reach string, tests []string, r binaryRun) (runR
 	cmd.WaitDelay = outputDrainGrace
 	procgroup.Setup(cmd)
 
-	err := run(ctx, cmd)
+	err := run(ctx, cmd, m.testMemoryLimit)
 
 	exitCode := -1 // never started: classifyDirect's contract
 	if cmd.ProcessState != nil {

@@ -41,6 +41,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
+	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/report"
 	"github.com/go-gremlins/gremlins/internal/schemata"
@@ -193,11 +194,11 @@ func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, w
 	d := engine.NewExecutorDealer(mod, wdd, time.Second, opts...)
 	var calls atomic.Int32
 	prepare := func(ctx context.Context, m gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-		testPkgs func(string) []string, allowance time.Duration, nullRun schemata.NullRunFunc,
+		testPkgs func(string) []string, allowance time.Duration, memLimit memlimit.Limit, nullRun schemata.NullRunFunc,
 	) (schemata.Plan, error) {
 		calls.Add(1)
 
-		return schemata.Prepare(ctx, m, workDir, tags, runnable, testPkgs, allowance, nullRun)
+		return schemata.Prepare(ctx, m, workDir, tags, runnable, testPkgs, allowance, memLimit, nullRun)
 	}
 	eng := engine.New(mod, engine.CodeData{Cov: prof}, d, engine.WithPrepare(prepare))
 	res := eng.Run(context.Background())

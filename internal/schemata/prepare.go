@@ -32,6 +32,7 @@ import (
 
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
+	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 )
 
@@ -73,7 +74,8 @@ const nullFailed = "null-mutant run failed: "
 // The mutants get ids 1..N in the order runnable lists them. Mutants of one
 // package at one operator token form one Site. Each package is loaded with
 // tags and rewritten; every package testPkgs names for a package with a
-// placed site has its test binary built in workDir within allowance. One with
+// placed site has its test binary built in workDir within allowance, each
+// build's go command capped at memLimit as BuildAll caps it. One with
 // no test files has none, and is no failure: its run passes without reach.
 // Each binary then runs once without a mutant selected through nullRun,
 // given the package's directory in mod -- the original source, which nullRun
@@ -89,7 +91,7 @@ const nullFailed = "null-mutant run failed: "
 // removes. A relative mod.Root is taken from the working directory. The error
 // is the context's, when it ends first.
 func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-	testPkgs func(pkg string) []string, allowance time.Duration, nullRun NullRunFunc,
+	testPkgs func(pkg string) []string, allowance time.Duration, memLimit memlimit.Limit, nullRun NullRunFunc,
 ) (Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return Plan{}, err
@@ -121,7 +123,7 @@ func Prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 	p.netUnselected(need)
 	if len(all) > 0 {
 		start := time.Now()
-		b, errs := BuildAll(ctx, mod.Root, workDir, tags, rewritten, all, allowance)
+		b, errs := BuildAll(ctx, mod.Root, workDir, tags, rewritten, all, allowance, memLimit)
 		log.Infof("schemata: built %d packages in %s\n", len(b.Binaries), time.Since(start).Round(time.Millisecond))
 		if err := ctx.Err(); err != nil {
 			return Plan{}, err

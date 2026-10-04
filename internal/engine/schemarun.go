@@ -261,7 +261,7 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 	}
 
 	plan, err := mu.prepare(ctx, mod, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance,
-		d.schemaNullRun(ctx, workDir, targets))
+		d.testMemoryLimit, d.schemaNullRun(ctx, workDir, targets))
 	if err != nil {
 		return plan, err
 	}
@@ -450,7 +450,7 @@ func (m MutantExecutorDealer) nullRun(ctx context.Context, bin, dir, overlay str
 	cmd.WaitDelay = outputDrainGrace
 	procgroup.Setup(cmd)
 
-	err := run(ctx, cmd)
+	err := run(ctx, cmd, m.testMemoryLimit)
 	switch {
 	case err == nil:
 		return nil

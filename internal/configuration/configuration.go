@@ -60,6 +60,7 @@ const (
 	UnleashThresholdMCoverageKey = "unleash.threshold.mutant-coverage"
 	UnleashOutputDiffStatusesKey = "unleash.output-diff-statuses"
 	UnleashOnShutdownStatusKey   = "unleash.on-shutdown-status"
+	UnleashTestMemoryLimitKey    = "unleash.test-memory-limit"
 )
 
 const (

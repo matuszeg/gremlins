@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
+	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/procgroup"
 )
 
@@ -75,13 +76,15 @@ type Build struct {
 // -- and compiles the test binary of every package in testPkgs in the copy
 // with `go test -c -overlay`, which lays the rewritten files over the copy's,
 // at most runtime.NumCPU() at a time, all within allowance (a path listed
-// twice is built once). A package
+// twice is built once). Each build's go command, and the compiler and linker
+// it starts, run with their address space capped at memLimit, zero for none;
+// the caller is not capped. A package
 // whose files cannot be written or whose binary does not build has its error
 // in the returned map and no binary; the other packages keep theirs. A
 // package that builds without test files is in Build.NoTests, with neither.
 // If the module cannot be copied, every package has that error.
 func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[string]map[string][]byte,
-	testPkgs []string, allowance time.Duration,
+	testPkgs []string, allowance time.Duration, memLimit memlimit.Limit,
 ) (Build, map[string]error) {
 	// A path listed twice would start two `go test -c` writing one binary.
 	testPkgs = uniquePackages(testPkgs)
@@ -153,7 +156,7 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			bin := filepath.Join(binDir, names[p])
-			err := buildTest(ctx, dir, goTmp, overlay, bin, tags, p)
+			err := buildTest(ctx, dir, goTmp, overlay, bin, tags, p, memLimit)
 			mu.Lock()
 			defer mu.Unlock()
 			if errors.Is(err, ErrNoTestBinary) {
@@ -241,8 +244,8 @@ func writeOverlay(workDir, dir, src string, rels []string) (string, error) {
 // overlay file laid over it, to bin, with goTmp as the go command's GOTMPDIR. The go command runs in its own
 // process group, and the deadline kills the whole group: killing only the go
 // command would leave its compile and link processes running, competing with
-// whatever runs next.
-func buildTest(ctx context.Context, dir, goTmp, overlay, bin, tags, pkg string) error {
+// whatever runs next. The go command's address space is capped at memLimit.
+func buildTest(ctx context.Context, dir, goTmp, overlay, bin, tags, pkg string, memLimit memlimit.Limit) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("schemata: build %s: %w", pkg, err)
 	}
@@ -257,6 +260,7 @@ func buildTest(ctx context.Context, dir, goTmp, overlay, bin, tags, pkg string) 
 	procgroup.Setup(cmd)
 	cmd.Cancel = func() error { return procgroup.Kill(cmd) }
 	cmd.WaitDelay = waitDelay
+	memlimit.Wrap(cmd, memLimit)
 	out, err := cmd.CombinedOutput()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return fmt.Errorf("schemata: build %s: %w\n%s", pkg, ctxErr, out)

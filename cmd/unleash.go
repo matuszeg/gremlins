@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/exclusion"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
+	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/mutator"
 	"github.com/go-gremlins/gremlins/internal/report"
 )
@@ -72,6 +74,7 @@ const (
 	paramTimeoutMax         = "timeout-max"
 	paramCompileAllowance   = "compile-allowance"
 	paramOnShutdownStatus   = "on-shutdown-status"
+	paramTestMemoryLimit    = "test-memory-limit"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -172,6 +175,14 @@ func cleanUp(wd string) {
 }
 
 func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Results, error) {
+	memLimit, err := engine.TestMemoryLimit()
+	if err != nil {
+		return report.Results{}, err
+	}
+	if memLimit != 0 && !memlimit.Enforced {
+		log.Infof("--%s is not enforced on %s: test processes run without a memory limit\n", paramTestMemoryLimit, runtime.GOOS)
+	}
+
 	fDiff, err := diff.New(mod.CallingDir)
 	if err != nil {
 		return report.Results{}, err
@@ -287,6 +298,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramSchemata, CfgKey: configuration.UnleashSchemataKey, DefaultV: true, Usage: "compile every mutant into one set of test binaries and switch between them at run time; --schemata=false restores one build per mutant; set GREMLINS_SCHEMATA_KEEP=<dir> to keep the binaries, the rewritten source and an index of mutant ids in <dir>"},
 		{Name: paramTimeoutMax, CfgKey: configuration.UnleashTimeoutMaxKey, DefaultV: "", Usage: "absolute ceiling on a single mutant's test run, as a Go duration (e.g. '15s'); caps the coefficient-derived timeout so a non-terminating mutant cannot exhaust the machine. Empty means no ceiling"},
 		{Name: paramCompileAllowance, CfgKey: configuration.UnleashCompileAllowanceKey, DefaultV: "", Usage: "time a mutant is allowed to COMPILE, as a Go duration (e.g. '2m'), on top of the bound on its test run; the two together form the deadline that also bounds a compile that has hung. Empty uses the default"},
+		{Name: paramTestMemoryLimit, CfgKey: configuration.UnleashTestMemoryLimitKey, DefaultV: "", Usage: "cap on the address space of each test process gremlins starts (go test, the test binaries, the schemata builds), in bytes with an optional K, M, G or T suffix (e.g. '2500M'); a runaway mutant then dies alone instead of exhausting the machine. Gremlins itself is not capped. Linux only; empty or 0 means no cap"},
 		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 

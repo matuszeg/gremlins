@@ -128,7 +128,7 @@ func buildSchemaFixture(t *testing.T) schemaFixture {
 		t.Fatalf("sites dropped: %v", dropped)
 	}
 	b, errs := schemata.BuildAll(context.Background(), modRoot, t.TempDir(), "",
-		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg, notestPkg, gorunPkg}, 5*time.Minute)
+		map[string]map[string][]byte{calcPkg: files}, []string{calcPkg, usePkg, notestPkg, gorunPkg}, 5*time.Minute, 0)
 	for p, err := range errs {
 		if err != nil {
 			t.Fatalf("build %s: %v", p, err)

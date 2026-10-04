@@ -728,6 +728,51 @@ the default allowance in place.
     indicate an issue.
 [//]: # (@formatter:on)
 
+### Test memory limit
+
+:material-flag: `--test-memory-limit` · :material-sign-direction:
+Default: `""` (no limit) · Linux only
+
+A cap on the address space of each test process Gremlins starts: the `go test`
+of a mutant without schemata, each run of a schema test binary, the null runs,
+and the `go test -c` that builds the schema binaries. The compiler, linker and
+test binaries those start inherit it. Gremlins itself is not capped.
+
+The value is a number of bytes with an optional `K`, `M`, `G` or `T` suffix,
+each a power of 1024 and optionally followed by `B` or `iB` (`2500M`, `2.5G`,
+`2560000K`). Empty or `0` means no limit. A malformed value stops the run
+before it starts.
+
+This is the protection `ulimit -v` around the whole run used to give against
+a mutant that never terminates and allocates on every pass — see
+[Timeout max](#timeout-max) — but per test process: the runaway test binary
+alone dies of the limit, and the other workers carry on. Wrapping Gremlins in
+`ulimit -v` instead caps Gremlins too, and with schemata Gremlins type-checks
+the module in-process, which can need more address space than a test binary
+should get.
+
+```shell
+gremlins unleash --test-memory-limit=2500M
+```
+
+A test binary killed by the limit is judged the way it was under `ulimit -v`.
+The Go runtime ends it with `fatal error: out of memory` and exit status 2,
+not with a signal. Without schemata, `go test` folds that into a failing test
+and the mutant is `KILLED`. With schemata, a run that fails after reaching the
+mutant is `KILLED` as well. A limit too small for the `go` command, the
+compiler or the linker shows as `NOT VIABLE`, as it did under `ulimit -v`.
+
+The limit is set before each process executes, the way `ulimit -v` sets it,
+not on the process after it has started. The difference matters: the Go
+runtime sizes the address space it reserves at start-up by the limit it
+finds, so a binary capped after it started has already reserved more and
+can die of the limit before running a test. Gremlins starts each process
+through a copy of itself that sets the limit and then executes the command in
+its place, keeping the same process, arguments, environment and directory.
+
+On other platforms the flag is accepted, and the run says once that the limit
+is not enforced.
+
 ### On-shutdown status
 
 :material-flag: `--on-shutdown-status` · :material-sign-direction: Default: `not-run`
