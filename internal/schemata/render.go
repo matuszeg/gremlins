@@ -20,6 +20,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/token"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -79,6 +80,10 @@ type siteNode struct {
 // rendered) and is reported as a SiteError, as is every site that does not
 // lie in file. If src is not file.Size() bytes, every site is reported and
 // src is returned unchanged.
+//
+// A constant group's rewrite can place some of its mutants and refuse the
+// others: each refused mutant is reported as a SiteError of the group
+// holding that one mutant, and the rewrite is spliced in for the rest.
 //
 // A site whose rewrite asks for duplication -- a compile-time site in a
 // function body, see NewRewriter -- keeps its text too, and is placed: the
@@ -181,7 +186,12 @@ func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, 
 	original := splice(src, n.start, n.end, n.children)
 	text, err := rw(n.site, inner)
 	var dup *dupError
+	var some *refusedMutantsError
 	switch {
+	case errors.As(err, &some) && strings.Count(text, "\n") == strings.Count(string(src[n.start:n.end]), "\n"):
+		// The rewrite places the group's other mutants.
+		errs = append(errs, some.refused...)
+		n.site.Muts = withoutMutants(n.site.Muts, some.refused)
 	case errors.As(err, &dup):
 		text = original
 		n.fallback = true
@@ -198,6 +208,18 @@ func renderNode(fset *token.FileSet, file *token.File, src []byte, n *siteNode, 
 	n.rendered = text
 
 	return errs
+}
+
+// withoutMutants is muts without the mutants of the sites in refused.
+func withoutMutants(muts []Mutant, refused []SiteError) []Mutant {
+	gone := map[int]bool{}
+	for _, e := range refused {
+		for _, m := range e.Site.Muts {
+			gone[m.ID] = true
+		}
+	}
+
+	return slices.DeleteFunc(slices.Clone(muts), func(m Mutant) bool { return gone[m.ID] })
 }
 
 // splice returns src[start:end] with every site in sites (sorted, disjoint)

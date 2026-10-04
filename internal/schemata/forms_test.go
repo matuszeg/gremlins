@@ -323,6 +323,8 @@ func TestNewRewriter(t *testing.T) {
 		"const_float_qualified":  {src: "import \"math\"\nfunc f() float64 { return math.Abs((1.5 * 2)) }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(math.Abs)"},
 		"const_float_value_lhs":  {src: "type b struct{ r float64 }\nfunc f(v b) float64 { v.r = 1.5 * 2; return v.r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&v.r)"},
 		"const_float_nested_lhs": {src: "type c struct{ r float64 }\ntype b struct{ c c }\nfunc f(v b) float64 { v.c.r = 1.5 * 2; return v.c.r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&v.c.r)"},
+		"const_float_binary":     {src: "func f(x float64) float64 { return x * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, want: "_zzSite1(x)"},
+		"const_float_binary_sel": {src: "type b struct{ r float64 }\nfunc f(v b) float64 { return (1.5 + 1) - v.r }", tok: token.ADD, muts: []mutator.Type{ab}, want: "_zzSite1(v.r)"},
 		"const_float_assign":     {src: "func f() float64 { var r float64; r = 1.5 * 2; return r }", tok: token.MUL, muts: []mutator.Type{ab}, want: "_zzSite1(&r)"},
 		// Constant-valued sites that stay refused.
 		"const_decl":             {src: "const k = 2 * 3", tok: token.MUL, muts: []mutator.Type{ab}},
@@ -347,7 +349,8 @@ func TestNewRewriter(t *testing.T) {
 		"const_named_bool":          {src: "type nb bool\nfunc f() nb { return 1 < 2 }", tok: token.LSS, muts: []mutator.Type{cn}},
 		"const_foreign_mutator":     {src: "func f() int { return 1 + 2 }", tok: token.ADD, muts: []mutator.Type{mutator.InvertBitwise}},
 		"const_float_return":        {src: "func f() float64 { return 1.5 * 2 }", tok: token.MUL, muts: []mutator.Type{ab}},
-		"const_float_binary":        {src: "func f(x float64) float64 { return x * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}},
+		"const_float_binary_call":   {src: "func g() float64 { return 1 }\nfunc f() float64 { return g() * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "more than a name or selector"},
+		"const_float_binary_deref":  {src: "type b struct{ r float64 }\nfunc f(p *b) float64 { return p.r * (1.5 + 1) }", tok: token.ADD, muts: []mutator.Type{ab}, refusal: "through a pointer"},
 		"const_float_variadic":      {src: "func g(r ...float64) {}\nfunc f() { g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
 		"const_float_generic":       {src: "func g[T ~float64](r T) T { return r }\nfunc f() float64 { return g(1.5 * 2) }", tok: token.MUL, muts: []mutator.Type{ab}},
 		"const_float_builtin":       {src: "func f(s []float64) []float64 { return append(s, 1.5*2) }", tok: token.MUL, muts: []mutator.Type{ab}},

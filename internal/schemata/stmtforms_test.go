@@ -129,6 +129,7 @@ func renderFixture(t *testing.T, name string, mts []mutator.Type) *stmtFixture {
 	}
 	sites, plain := discoverFor(f, mts)
 	sites, fx.plain, fx.gone = viable(t, src, fx.fset, sites, plain)
+	sites = schemata.GroupConstantSites(info, []*ast.File{f}, sites)
 
 	prefix := schemata.ChoosePrefix([]*ast.File{f, df})
 	h := &schemata.HelperSet{}

@@ -36,8 +36,14 @@ type Mutant struct {
 }
 
 // Site is an AST node with the mutants that apply to it.
+//
+// A constant group (see GroupConstantSites) is one Site for the sites inside
+// a maximal constant-valued expression: Node is that expression, Tok is
+// token.ILLEGAL, Members are the operator sites inside it, and Muts are all
+// their mutants.
 type Site struct {
-	Node ast.Node
-	Tok  token.Token
-	Muts []Mutant
+	Node    ast.Node
+	Tok     token.Token
+	Muts    []Mutant
+	Members []Site
 }

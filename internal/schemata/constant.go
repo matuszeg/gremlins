@@ -82,18 +82,31 @@ func (r *rewriter) constant(s Site, e ast.Expr, inner func(ast.Node) string) (st
 	if fn != nil {
 		return "", r.dupSite(s, e, fn)
 	}
-	out, err := constantForm(r.info, r.sizes, e, s, r.prefix, r.h, ctx, inner)
+	if x, ok := ctx.(ast.Expr); ok && r.info.Types[x].Value != nil {
+		return "", fmt.Errorf("%w: operand of a constant expression", ErrUnsupported)
+	}
+	c, err := foldSite(r.info, e, s)
 	if err != nil {
 		return "", err
 	}
-	// The replacement is one line; the original's line breaks go after its
-	// opening parenthesis, where they cannot end a statement.
-	if n := strings.Count(inner(e), "\n"); n > 0 {
+	out, err := constantForm(r.info, r.sizes, e, c, r.prefix, r.h, ctx, inner)
+	if err != nil {
+		return "", err
+	}
+
+	return keepLines(out, inner(e)), nil
+}
+
+// keepLines returns the one-line replacement out of the text orig with
+// orig's line breaks put after out's first opening parenthesis, where they
+// cannot end a statement.
+func keepLines(out, orig string) string {
+	if n := strings.Count(orig, "\n"); n > 0 {
 		i := strings.Index(out, "(") + 1
 		out = out[:i] + strings.Repeat("\n", n) + out[i:]
 	}
 
-	return out, nil
+	return out
 }
 
 // context returns e's context: its nearest ancestor that is not a
@@ -143,11 +156,11 @@ func (r *rewriter) context(e ast.Expr) (ast.Node, *ast.FuncDecl, error) {
 	return nil, nil, fmt.Errorf("%w: %s", ErrUnsupported, compileTime)
 }
 
-// constantForm returns the replacement for the constant-valued site e, whose
-// context -- nearest non-parenthesis ancestor -- is ctx. The original value
-// c0 and each mutant's value cK are folded exactly, as the compiler folds
-// them, with the mutated operator; which form spells them depends on the
-// type the constant takes in its context:
+// constantForm returns the replacement for the constant-valued expression e,
+// whose context -- nearest non-parenthesis ancestor -- is ctx and is not
+// constant. c holds e's original value c0 and each mutant's value cK, folded
+// exactly, as the compiler folds them, with the mutated operator; which form
+// spells them depends on the type the constant takes in its context:
 //
 //   - an integer type: the shift form, a non-constant expression of
 //     untyped constants whose type the context gives, as it gave the
@@ -156,18 +169,16 @@ func (r *rewriter) context(e ast.Expr) (ast.Node, *ast.FuncDecl, error) {
 //     operand times 0, so that an interface or inference context still sees
 //     the constant's type.
 //   - basic bool: PBool<n>(id1, ..., c0, c1, ...), a helper per arity.
-//   - float32 or float64, as a call argument or the right side of an
-//     assignment: PSite<id>(witness), a helper per site (named after its
-//     first mutant) returning T(c0) or
-//     T(cK) for the T it infers from the witness -- the callee, or &lhs --
-//     which is how a type only another package can name is reached.
+//   - float32 or float64, as a call argument, the right side of an
+//     assignment or an operand of a binary expression: PSite<id>(witness), a
+//     helper per site (named after its first mutant) returning T(c0) or
+//     T(cK) for the T it infers from the witness -- the callee, &lhs, or the
+//     other operand -- which is how a type only another package can name is
+//     reached.
 //
-// Anything else is refused with ErrUnsupported, as is a site whose mutant
-// cannot be folded (a division by zero) or does not fit the type.
-func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, s Site, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
-	if x, ok := ctx.(ast.Expr); ok && info.Types[x].Value != nil {
-		return "", fmt.Errorf("%w: operand of a constant expression", ErrUnsupported)
-	}
+// Anything else is refused with ErrUnsupported, as is a value that does not
+// fit the type.
+func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, c folded, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
 	// In a conversion T(c) the shift form's untyped 1 takes the type T, which
 	// for a type parameter is not an integer type the shift accepts, whatever
 	// type go/types records for c.
@@ -175,10 +186,6 @@ func constantForm(info *types.Info, sizes types.Sizes, e ast.Expr, s Site, prefi
 		if _, basic := info.Types[call.Fun].Type.Underlying().(*types.Basic); !basic {
 			return "", fmt.Errorf("%w: constant converted to %v", ErrUnsupported, info.Types[call.Fun].Type)
 		}
-	}
-	c, err := foldSite(info, e, s)
-	if err != nil {
-		return "", err
 	}
 	t := info.Types[e].Type
 	b, _ := t.Underlying().(*types.Basic)
@@ -206,6 +213,38 @@ type folded struct {
 
 // foldSite folds the site's original value and each present mutant's.
 func foldSite(info *types.Info, e ast.Expr, s Site) (folded, error) {
+	op, mts := siteMutators(e)
+	if mts == nil {
+		return folded{}, fmt.Errorf("%w: constant %s site", ErrUnsupported, op)
+	}
+	all, err := ids(s, mts...)
+	if err != nil {
+		return folded{}, err
+	}
+	out := folded{c0: info.Types[e].Value}
+	for i, id := range all {
+		if id == 0 {
+			continue
+		}
+		to, ok := constMutation(mts[i], op)
+		if !ok {
+			return folded{}, fmt.Errorf("%w: no %s mutation of %s", ErrUnsupported, mts[i], op)
+		}
+		v, err := fold(info, e, to)
+		if err != nil {
+			return folded{}, err
+		}
+		out.ids = append(out.ids, id)
+		out.cs = append(out.cs, v)
+	}
+
+	return out, nil
+}
+
+// siteMutators returns the operator of the site e and the mutator types
+// whose mutants a constant site of it takes, in their fixed order; nil for
+// an operator no constant form folds.
+func siteMutators(e ast.Expr) (token.Token, []mutator.Type) {
 	var mts []mutator.Type
 	var op token.Token
 	switch e := e.(type) {
@@ -234,31 +273,8 @@ func foldSite(info *types.Info, e ast.Expr, s Site) (folded, error) {
 			mts = []mutator.Type{mutator.ArithmeticBase}
 		}
 	}
-	if mts == nil {
-		return folded{}, fmt.Errorf("%w: constant %s site", ErrUnsupported, op)
-	}
-	all, err := ids(s, mts...)
-	if err != nil {
-		return folded{}, err
-	}
-	out := folded{c0: info.Types[e].Value}
-	for i, id := range all {
-		if id == 0 {
-			continue
-		}
-		to, ok := constMutation(mts[i], op)
-		if !ok {
-			return folded{}, fmt.Errorf("%w: no %s mutation of %s", ErrUnsupported, mts[i], op)
-		}
-		v, err := fold(info, e, to)
-		if err != nil {
-			return folded{}, err
-		}
-		out.ids = append(out.ids, id)
-		out.cs = append(out.cs, v)
-	}
 
-	return out, nil
+	return op, mts
 }
 
 // fold evaluates e with its operator replaced by op, as go/types folds a
@@ -274,44 +290,49 @@ func fold(info *types.Info, e ast.Expr, op token.Token) (constant.Value, error) 
 
 		return constant.UnaryOp(op, x, 0), nil
 	case *ast.BinaryExpr:
-		x, y := info.Types[e.X].Value, info.Types[e.Y].Value
-		if x == nil || y == nil {
-			return nil, fmt.Errorf("%w: operand without a constant value", ErrUnsupported)
-		}
-		switch op { //nolint:exhaustive // the comparisons and the rest are handled below
-		case token.LAND, token.LOR:
-			if x.Kind() != constant.Bool || y.Kind() != constant.Bool {
-				return nil, fmt.Errorf("%w: logical operands %v and %v", ErrUnsupported, x, y)
-			}
-
-			return constant.BinaryOp(x, op, y), nil
-		case token.AND, token.OR, token.XOR, token.AND_NOT, token.SHL, token.SHR:
-			return foldBitwise(x, op, y)
-		}
-		if op.IsOperator() && op.Precedence() == token.EQL.Precedence() {
-			return constant.MakeBool(constant.Compare(x, op, y)), nil
-		}
-		if !numeric(x) || !numeric(y) {
-			return nil, fmt.Errorf("%w: operands %v and %v", ErrUnsupported, x, y)
-		}
-		if (op == token.QUO || op == token.REM) && constant.Sign(y) == 0 {
-			return nil, fmt.Errorf("%w: mutant divides by zero", ErrUnsupported)
-		}
-		if op == token.QUO && integerOperation(info, e) {
-			x, y = constant.ToInt(x), constant.ToInt(y)
-			if x.Kind() != constant.Int || y.Kind() != constant.Int {
-				return nil, fmt.Errorf("%w: integer division of non-integers", ErrUnsupported)
-			}
-			op = token.QUO_ASSIGN // go/constant's integer division
-		}
-		if op == token.REM && (x.Kind() != constant.Int || y.Kind() != constant.Int) {
-			return nil, fmt.Errorf("%w: remainder of non-integers", ErrUnsupported)
-		}
-
-		return constant.BinaryOp(x, op, y), nil
+		return foldBinary(info, e, op, info.Types[e.X].Value, info.Types[e.Y].Value)
 	}
 
 	return nil, fmt.Errorf("%w: constant %T", ErrUnsupported, e)
+}
+
+// foldBinary evaluates x op y, the operands of e with e's operator replaced
+// by op, as fold does.
+func foldBinary(info *types.Info, e *ast.BinaryExpr, op token.Token, x, y constant.Value) (constant.Value, error) {
+	if x == nil || y == nil {
+		return nil, fmt.Errorf("%w: operand without a constant value", ErrUnsupported)
+	}
+	switch op { //nolint:exhaustive // the comparisons and the rest are handled below
+	case token.LAND, token.LOR:
+		if x.Kind() != constant.Bool || y.Kind() != constant.Bool {
+			return nil, fmt.Errorf("%w: logical operands %v and %v", ErrUnsupported, x, y)
+		}
+
+		return constant.BinaryOp(x, op, y), nil
+	case token.AND, token.OR, token.XOR, token.AND_NOT, token.SHL, token.SHR:
+		return foldBitwise(x, op, y)
+	}
+	if op.IsOperator() && op.Precedence() == token.EQL.Precedence() {
+		return constant.MakeBool(constant.Compare(x, op, y)), nil
+	}
+	if !numeric(x) || !numeric(y) {
+		return nil, fmt.Errorf("%w: operands %v and %v", ErrUnsupported, x, y)
+	}
+	if (op == token.QUO || op == token.REM) && constant.Sign(y) == 0 {
+		return nil, fmt.Errorf("%w: mutant divides by zero", ErrUnsupported)
+	}
+	if op == token.QUO && integerOperation(info, e) {
+		x, y = constant.ToInt(x), constant.ToInt(y)
+		if x.Kind() != constant.Int || y.Kind() != constant.Int {
+			return nil, fmt.Errorf("%w: integer division of non-integers", ErrUnsupported)
+		}
+		op = token.QUO_ASSIGN // go/constant's integer division
+	}
+	if op == token.REM && (x.Kind() != constant.Int || y.Kind() != constant.Int) {
+		return nil, fmt.Errorf("%w: remainder of non-integers", ErrUnsupported)
+	}
+
+	return constant.BinaryOp(x, op, y), nil
 }
 
 // foldBitwise folds a bitwise operator or a shift. Its operands are
@@ -429,10 +450,7 @@ func bitTerm(prefix string, id int) string {
 // uintptr depend on. With no sizes it assumes the host's.
 func fitsInt(v constant.Value, b *types.Basic, sizes types.Sizes) bool {
 	if sizes == nil {
-		sizes = types.SizesFor("gc", build.Default.GOARCH)
-	}
-	if sizes == nil {
-		sizes = types.SizesFor("gc", "amd64")
+		sizes = hostSizes()
 	}
 	bits := uint(64)
 	switch sizes.Sizeof(b) {
@@ -450,6 +468,15 @@ func fitsInt(v constant.Value, b *types.Basic, sizes types.Sizes) bool {
 	}
 
 	return constant.Compare(v, token.GEQ, lo) && constant.Compare(v, token.LSS, hi)
+}
+
+// hostSizes are the gc compiler's sizes for the host's GOARCH, or amd64's.
+func hostSizes() types.Sizes {
+	if s := types.SizesFor("gc", build.Default.GOARCH); s != nil {
+		return s
+	}
+
+	return types.SizesFor("gc", "amd64")
 }
 
 // boolForm calls the helper of the site's arity.
@@ -479,7 +506,8 @@ func boolForm(info *types.Info, e ast.Expr, c folded, prefix string, h *HelperSe
 	return name + "(" + args.String() + strings.Join(vals, ", ") + ")", nil
 }
 
-// floatForm is the witness form, in a call argument or assignment context.
+// floatForm is the witness form, in a call argument, assignment or binary
+// expression context.
 func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix string, h *HelperSet, ctx ast.Node, inner func(ast.Node) string) (string, error) {
 	vals := append([]constant.Value{c.c0}, c.cs...)
 	lits := make([]string, len(vals))
@@ -529,6 +557,12 @@ func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix st
 			return "", err
 		}
 		typeParams, witnessType, witness = "T "+core, "*T", "&"+inner(lhs)
+	case *ast.BinaryExpr:
+		other, err := witnessOperand(info, e, ctx, b)
+		if err != nil {
+			return "", err
+		}
+		typeParams, witnessType, witness = "T "+core, "T", inner(other)
 	default:
 		return "", fmt.Errorf("%w: float constant in a %T", ErrUnsupported, ctx)
 	}
@@ -663,6 +697,33 @@ func witnessLHS(info *types.Info, e ast.Expr, st *ast.AssignStmt, b *types.Basic
 	}
 
 	return lhs, nil
+}
+
+// witnessOperand returns the other operand of the binary expression bin
+// that e is an operand of, if it can be passed as the witness: of the type b
+// the constant took, and, evaluated a second time, without effect and unable
+// to panic -- identifiers and selectors only, dereferencing no pointer.
+func witnessOperand(info *types.Info, e ast.Expr, bin *ast.BinaryExpr, b *types.Basic) (ast.Expr, error) {
+	var other ast.Expr
+	switch ast.Unparen(e) {
+	case ast.Unparen(bin.X):
+		other = bin.Y
+	case ast.Unparen(bin.Y):
+		other = bin.X
+	default:
+		return nil, fmt.Errorf("%w: float constant not an operand of its binary context", ErrUnsupported)
+	}
+	tv := info.Types[other]
+	switch {
+	case tv.Type == nil || untyped(tv.Type) || !types.Identical(tv.Type.Underlying(), b):
+		return nil, fmt.Errorf("%w: float constant's other operand is a %v", ErrUnsupported, tv.Type)
+	case !callFree(other):
+		return nil, fmt.Errorf("%w: float constant's other operand is more than a name or selector", ErrUnsupported)
+	case !derefFree(info, other):
+		return nil, fmt.Errorf("%w: float constant's other operand goes through a pointer", ErrUnsupported)
+	}
+
+	return other, nil
 }
 
 // derefFree reports whether evaluating &x, for x of identifiers and selectors
