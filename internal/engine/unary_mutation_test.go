@@ -18,8 +18,6 @@ package engine_test
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
@@ -110,14 +108,5 @@ func TestUnaryOperatorsAreNotMutatedAsBinaryOnes(t *testing.T) {
 
 			t.Fatalf("expected a %s mutant, got %s", tc.want, describe(got))
 		})
-	}
-}
-
-// writeFile writes a fixture file into dir, failing the test if it cannot.
-func writeFile(t *testing.T, dir, name, content string) {
-	t.Helper()
-
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
-		t.Fatalf("writing %s: %v", name, err)
 	}
 }

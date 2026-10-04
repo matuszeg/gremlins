@@ -23,7 +23,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 
@@ -35,9 +34,11 @@ import (
 	"github.com/go-gremlins/gremlins/internal/mutator"
 )
 
-// wantTimeout is the -timeout go is given: the mutant's own bound plus the two
-// seconds that keep go's timeout from firing before Gremlins' own.
-var wantTimeout = (2*time.Second + expectedTimeout*engine.DefaultTimeoutCoefficient).String()
+// wantTimeout is the -timeout go is given: the mutant's run bound, verbatim.
+// The two seconds that used to be added here are gone with the bound split —
+// go's -timeout now bounds the RUN and the context deadline bounds compile plus
+// run, so there is no longer a race between them to bias.
+var wantTimeout = (expectedTimeout * engine.DefaultTimeoutCoefficient).String()
 
 type selectorStub struct {
 	tests  []coverage.TestID
