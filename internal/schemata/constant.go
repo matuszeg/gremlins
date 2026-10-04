@@ -533,14 +533,20 @@ func floatForm(info *types.Info, e ast.Expr, c folded, b *types.Basic, prefix st
 		}
 		typeParams, witnessType, call = "T ~"+b.Name(), "", name+"["+t+"]()"
 	}
+	// Each value is converted to b, the constant's basic type, before T: an
+	// untyped constant converted to a type parameter takes its default type,
+	// float64, first, and a float32 T would then round it twice -- a value
+	// near a float32 rounding midpoint would round otherwise than the plain
+	// mutant, which converts the exact constant to float32 once. b(lit) is
+	// that one rounding; b to T, of underlying type b, is exact.
 	var arms strings.Builder
 	for i, id := range c.ids {
-		fmt.Fprintf(&arms, "\tif %[1]sActive != 0 && %[1]sActive == %[2]d {\n\t\t%[1]sReached()\n\t\treturn T(%[3]s)\n\t}\n", prefix, id, lits[i+1])
+		fmt.Fprintf(&arms, "\tif %[1]sActive != 0 && %[1]sActive == %[2]d {\n\t\t%[1]sReached()\n\t\treturn T(%[4]s(%[3]s))\n\t}\n", prefix, id, lits[i+1], b.Name())
 	}
 	h.AddRaw(fmt.Sprintf("// %[1]s is a float constant's value, in the type T inferred from the witness\n"+
 		"// or given explicitly.\n"+
-		"func %[1]s[%[2]s](%[3]s) T {\n%[4]s\treturn T(%[5]s)\n}",
-		name, typeParams, witnessType, arms.String(), lits[0]))
+		"func %[1]s[%[2]s](%[3]s) T {\n%[4]s\treturn T(%[6]s(%[5]s))\n}",
+		name, typeParams, witnessType, arms.String(), lits[0], b.Name()))
 
 	return call, nil
 }

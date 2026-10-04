@@ -99,7 +99,10 @@ func buildApp(t *testing.T, files map[string][]byte) string {
 // refusals to be exactly the marked sites, and the schema binary, run with
 // each mutant id (and with none), to print what the plain token mutant
 // prints. A refused site keeps its text, so its mutants leave the schema
-// printing what the original prints, and never record a reach.
+// printing what the original prints, and never record a reach. It renders
+// with Render alone, so app keeps math used outside the sites (func Pi):
+// RewritePackage's repair of an import a rewrite left unused is
+// TestRewritePackageBlanksAnImportARewriteLeftUnused, in imports_test.go.
 func TestConstantFormsBehave(t *testing.T) {
 	t.Parallel()
 	fooSrc, src, driver := readFixture(t, "foo/foo.go"), readFixture(t, "app/app.go"), readFixture(t, "app/app_test.go")

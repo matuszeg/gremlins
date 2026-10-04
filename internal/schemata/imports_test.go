@@ -19,7 +19,9 @@ package schemata_test
 import (
 	"bytes"
 	"context"
+	"go/ast"
 	"go/token"
+	"go/types"
 	"maps"
 	"os"
 	"path/filepath"
@@ -78,6 +80,23 @@ func TestRewritePackageBlanksAnImportARewriteLeftUnused(t *testing.T) {
 			factory: breakTok(token.ADD),
 			imp:     "import _ \"math\"\n",
 			reason:  "undefined: _gremlinsNope",
+		},
+		"dot_import": {
+			src: "package p\n\nimport . \"math\"\n\nfunc F() any { return []any{-MaxFloat64} }\n",
+			imp: "import _ \"math\"\n",
+		},
+		// A form that drops an operand holding the import's last use is a
+		// defect the repair must not hide: only a constant form's dropped
+		// text is repaired.
+		"lost_by_another_form": {
+			src:     "package p\n\nimport \"math\"\n\nfunc F() float64 { return math.Abs(2) + 1 }\n",
+			factory: dropTok(token.ADD),
+			reason:  "unattributable type error: ",
+		},
+		"dot_import_lost_by_another_form": {
+			src:     "package p\n\nimport . \"math\"\n\nfunc F() float64 { return Abs(2) + 1 }\n",
+			factory: dropTok(token.ADD),
+			reason:  "unattributable type error: ",
 		},
 		"unattributable_error": {
 			src:     "package p\n\nimport \"math\"\n\nfunc F() any { return []any{-math.MaxFloat64} }\n",
@@ -158,5 +177,21 @@ func TestRewritePackageBlanksAnImportARewriteLeftUnused(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// dropTok returns a rewriter factory that wraps NewRewriter but rewrites
+// every binary site whose token is tok to 0, dropping its operands.
+func dropTok(tok token.Token) schemata.RewriterFactory {
+	return func(info *types.Info, sizes types.Sizes, files []*ast.File, prefix string, h *schemata.HelperSet) schemata.Rewriter {
+		rw := schemata.NewRewriter(info, sizes, files, prefix, h)
+
+		return func(s schemata.Site, inner func(ast.Node) string) (string, error) {
+			if _, ok := s.Node.(*ast.BinaryExpr); ok && s.Tok == tok {
+				return "0", nil
+			}
+
+			return rw(s, inner)
+		}
 	}
 }

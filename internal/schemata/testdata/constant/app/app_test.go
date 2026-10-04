@@ -75,4 +75,6 @@ func TestPrint(t *testing.T) {
 	show("Define", Define)
 	show("Unexported", Unexported)
 	show("Shadowed", Shadowed)
+	show("DoubleRound", DoubleRound)
+	show("DoubleRoundAssign", DoubleRoundAssign)
 }
