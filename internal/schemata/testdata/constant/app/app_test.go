@@ -57,6 +57,8 @@ func TestPrint(t *testing.T) {
 	show("Shift", func() any { return Shift(3) })
 	show("Variadic", Variadic)
 	show("Generic", Generic)
+	show("LenString", func() any { return LenString(1) })
+	show("LenStringConst", func() any { return LenStringConst(1) })
 	show("K", func() any { return k })
 	show("SetAnd", SetAnd)
 	show("SetShl", SetShl)

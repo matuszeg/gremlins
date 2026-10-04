@@ -99,6 +99,14 @@ func Variadic() any { return foo.Sum(0.5 + 1) } // refused +: a variadic float a
 
 func Generic() any { return foo.Pick(2.5 * 2) } // refused *: a generic callee
 
+const lenBase = 127
+
+// LenString's len is of a constant string, whose value -- not its type --
+// gives the length: the + inside cannot be folded through string(...).
+func LenString(n int) int { return len(string(rune(127+1)))*3 + n } // refused +: behind a string conversion
+
+func LenStringConst(n int) int { return len(string(rune(lenBase+1)))*3 + n } // refused +: behind a string conversion
+
 func SetAnd() any { return foo.Set(6 & 3) }
 
 func SetShl() any { return foo.Set(1 << 4) }
