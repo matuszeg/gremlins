@@ -62,3 +62,15 @@ var (
 
 // ErrNewlineChanged exposes errNewlineChanged.
 var ErrNewlineChanged = errNewlineChanged
+
+// BuildFunc exposes buildFunc, the seam a test builds a package through.
+type BuildFunc = buildFunc
+
+// BuildTest exposes buildTest, the build BuildAll uses.
+var BuildTest BuildFunc = buildTest
+
+// BuildAllWith exposes buildAll, BuildAll with an injected build.
+var BuildAllWith = buildAll
+
+// PrepareWith exposes prepare, Prepare with an injected build.
+var PrepareWith = prepare

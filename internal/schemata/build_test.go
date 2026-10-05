@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -541,9 +542,9 @@ func TestBuildAllEmbedsOriginalSourcePaths(t *testing.T) {
 	}
 }
 
-// TestBuildAllHonoursAllowance checks that the compile allowance bounds the
-// build: an allowance already spent fails every package.
-func TestBuildAllHonoursAllowance(t *testing.T) {
+// TestBuildAllHonoursTimeout checks that the timeout bounds the build and its
+// retry: a timeout already spent fails every package, as timed out.
+func TestBuildAllHonoursTimeout(t *testing.T) {
 	t.Parallel()
 	modRoot, err := filepath.Abs("testdata/twopkgs")
 	if err != nil {
@@ -553,6 +554,9 @@ func TestBuildAllHonoursAllowance(t *testing.T) {
 	for _, p := range []string{"twopkgs/ok", "twopkgs/bad"} {
 		if !errors.Is(errs[p], context.DeadlineExceeded) {
 			t.Errorf("%s: error %v, want the deadline", p, errs[p])
+		}
+		if want := "schemata: build " + p + " timed out after a retry\n"; !strings.HasPrefix(fmt.Sprint(errs[p]), want) {
+			t.Errorf("%s: error %q, want it to start %q", p, errs[p], want)
 		}
 	}
 }

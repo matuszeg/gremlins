@@ -151,6 +151,11 @@ func TestUnleash(t *testing.T) {
 			defValue: "true",
 		},
 		{
+			name:     "schemata-build-timeout",
+			flagType: "string",
+			defValue: "",
+		},
+		{
 			name:      "tags",
 			shorthand: "t",
 			flagType:  "string",
