@@ -69,12 +69,6 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 			cached: oneTest(base, "shell"),
 			now:    fingerprint{Shell: "other", Inputs: inputsHash, Decls: base},
 		},
-		// Nothing in the package changed, yet the build ID did — so the change
-		// was in a dependency, which no profile of this package covers.
-		"nothing in the package changed": {
-			cached: oneTest(base, "shell"),
-			now:    fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
-		},
 		// init runs before every test in the binary.
 		"an init changed": {
 			cached: oneTest(map[string]declPrint{
@@ -109,6 +103,17 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 				"a.go:F":     base["a.go:F"],
 				"a.go:G":     base["a.go:G"],
 				"a.go:T.Str": decl("a.go", 13, 15, "m", kindMethod),
+			}},
+		},
+		// A new package-level function named like a predeclared identifier
+		// rebinds every existing use of that identifier without a line of the
+		// use changing: `min(x, 10)` calls the new function from then on.
+		"an added function shadows a predeclared identifier": {
+			cached: oneTest(base, "shell"),
+			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
+				"a.go:F":   base["a.go:F"],
+				"a.go:G":   base["a.go:G"],
+				"a.go:min": decl("a.go", 13, 15, "m", ""),
 			}},
 		},
 		// A dependency moved, alone or alongside a change here. Its lines are
@@ -267,5 +272,86 @@ func TestReusableDropsAChangedTestByName(t *testing.T) {
 	}
 	if _, still := kept["TestF"]; still {
 		t.Error("want the changed test dropped from what is kept")
+	}
+}
+
+// An unchanged fingerprint under a moved build ID used to mean a dependency had
+// changed, because nothing else could move it. Inputs now records every
+// dependency, the toolchain and the build environment, so with those equal too
+// what is left is the checkout path the binary embeds — and every mapping is
+// still the answer.
+func TestReusableKeepsEverythingWhenOnlyTheBuildIDMoved(t *testing.T) {
+	t.Parallel()
+
+	decls := map[string]declPrint{
+		"a.go:F": decl("a.go", 3, 7, "f", ""),
+		"a.go:G": decl("a.go", 9, 11, "g", ""),
+	}
+	cached := cachedPackage{
+		Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: decls},
+		Tests: map[string]Profile{
+			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
+			"TestG": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 2}}},
+		},
+	}
+
+	kept, ok := reusable(cached, fingerprint{Shell: "shell", Inputs: inputsHash, Decls: decls})
+	if !ok {
+		t.Fatal("want every mapping kept, got a whole-package re-map")
+	}
+	if diff := cmp.Diff(cached.Tests, kept); diff != "" {
+		t.Errorf("want every mapping kept where it was (-want +got):\n%s", diff)
+	}
+}
+
+// The shell drops whitespace between declarations, so blank lines added above a
+// function move it without moving the shell or any declaration's hash. Nothing
+// changed in that case either, but the lines did, and a mapping kept at its old
+// numbers would answer about the wrong ones.
+func TestReusableMovesEverythingWhenOnlyWhitespaceMoved(t *testing.T) {
+	t.Parallel()
+
+	cached := cachedPackage{
+		Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
+			"a.go:F": decl("a.go", 3, 7, "f", ""),
+		}},
+		Tests: map[string]Profile{
+			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
+		},
+	}
+	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
+		"a.go:F": decl("a.go", 5, 9, "f", ""),
+	}}
+
+	kept, ok := reusable(cached, now)
+	if !ok {
+		t.Fatal("want the mapping kept, got a whole-package re-map")
+	}
+	want := map[string]Profile{
+		"TestF": {"a.go": {{StartLine: 6, StartCol: 1, EndLine: 8, EndCol: 2}}},
+	}
+	if diff := cmp.Diff(want, kept); diff != "" {
+		t.Errorf("the mapping was not moved with its code (-want +got):\n%s", diff)
+	}
+}
+
+// Only a predeclared name is rebound silently. Any other new name either
+// conflicts with something already declared, which does not compile, or is
+// reached only through a call site that is a change of its own.
+func TestReusableKeepsMappingsAcrossAnAddedOrdinaryFunction(t *testing.T) {
+	t.Parallel()
+
+	base := map[string]declPrint{"a.go:F": decl("a.go", 3, 7, "f", "")}
+	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
+		"a.go:F":       base["a.go:F"],
+		"a.go:Minimum": decl("a.go", 9, 11, "m", ""),
+	}}
+
+	kept, ok := reusable(oneTest(base, "shell"), now)
+	if !ok {
+		t.Fatal("want the mapping kept, got a whole-package re-map")
+	}
+	if _, still := kept["TestF"]; !still {
+		t.Error("want TestF kept")
 	}
 }

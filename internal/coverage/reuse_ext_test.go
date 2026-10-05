@@ -262,18 +262,235 @@ func Extra(v []int) int {
 	}
 }
 
-// The build ID moves when a dependency changes, and no profile of this package
-// covers a dependency — so an unchanged fingerprint under a changed build ID is
-// exactly the case where the map cannot say which tests were reached.
+// A dependency's lines are in no profile of this package, so a change there
+// alone looks clean to every mapping. What the binary is built from besides the
+// package says it is not.
 func TestAChangeOutsideThePackageReMapsAllOfIt(t *testing.T) {
 	h := newCacheHarness(t)
 
 	h.buildCalc("")
+	h.edit("vm/vm.go", vmSource+`
+func Extra(v []int) int {
+	return len(v) + 1
+}
+`)
 	h.buildCalc(changedCalc)
 
 	want := []string{"TestDouble", "TestTriple"}
 	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
 		t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
+	}
+}
+
+// A dependency's embedded files and test data are part of what it is built
+// from, below its own directory. A change there alone leaves the package's
+// fingerprint and every dependency's Go files as they were, which is exactly
+// the case that would otherwise reuse the whole map.
+func TestAChangeBelowADependencyReMapsAllOfIt(t *testing.T) {
+	h := newCacheHarness(t)
+	asset := filepath.Join(h.pkgRoot, "vm", "static", "limits.json")
+	if err := os.MkdirAll(filepath.Dir(asset), 0o750); err != nil {
+		t.Fatalf("cannot create the fixture directory: %v", err)
+	}
+	writeFixture(t, asset, `{"max": 10}`)
+
+	h.buildCalc("")
+	writeFixture(t, asset, `{"max": 20}`)
+	h.buildCalc(changedCalc)
+
+	want := []string{"TestDouble", "TestTriple"}
+	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+		t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
+	}
+}
+
+// With the package, its dependencies and the build environment all as they
+// were, a moved build ID is left with nothing to say: Go folds the checkout
+// path into it, and the path decides nothing a test executes.
+func TestAMovedBuildIDAloneReMapsNothing(t *testing.T) {
+	h := newCacheHarness(t)
+
+	first := h.buildCalc("")
+	second := h.buildCalc(changedCalc)
+
+	if got := h.testsRun(); len(got) != 0 {
+		t.Errorf("want nothing re-mapped, got %v", got)
+	}
+	if diff := cmp.Diff(first.Union(), second.Union(), blockOrder()); diff != "" {
+		t.Errorf("the kept map covers different code (-want +got):\n%s", diff)
+	}
+}
+
+// moveTo copies the fixture to another directory and maps from there from now
+// on, which is what a CI runner restoring another runner's cache sees.
+func (h *cacheHarness) moveTo() {
+	h.t.Helper()
+
+	dst := filepath.Join(h.t.TempDir(), "elsewhere")
+	if err := os.CopyFS(dst, os.DirFS(h.pkgRoot)); err != nil {
+		h.t.Fatalf("cannot copy the fixture: %v", err)
+	}
+	h.pkgRoot = dst
+}
+
+// A fleet of CI runners each checks the module out under its own directory, and
+// the cache is only worth restoring if a map made in one of them is good in
+// another. The checkout path reaches the build ID, and it used to reach the
+// cache directory's name and every dependency's entry in Inputs as well.
+func TestAMapIsReusedFromAnotherCheckout(t *testing.T) {
+	testCases := map[string]struct {
+		rootAtFixture bool
+		workspace     bool
+	}{
+		// Its dependencies are named by their path inside the module.
+		"an ordinary checkout": {rootAtFixture: true},
+		// Its dependencies are outside the module root, like a replace target
+		// or a go.work member, and are named by import path.
+		"dependencies outside the module root": {},
+		// GOWORK is an absolute path, different in every checkout.
+		"a checkout with a workspace": {rootAtFixture: true, workspace: true},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			h := newCacheHarness(t)
+			h.rootAtFixture = tc.rootAtFixture
+			if tc.workspace {
+				h.workFile()
+			}
+
+			first := h.buildCalc("")
+			h.moveTo()
+			if tc.workspace {
+				h.workFile()
+			}
+			second := h.buildCalc("example.com/calc=built-in-another-directory")
+
+			if got := h.testsRun(); len(got) != 0 {
+				t.Errorf("want nothing re-mapped from another checkout, got %v", got)
+			}
+			if diff := cmp.Diff(first.Union(), second.Union(), blockOrder()); diff != "" {
+				t.Errorf("the reused map covers different code (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// buildEnvironmentChanges are the changes that decide what a package's test
+// binary is compiled to without a byte of source changing. Each must stop a
+// map from being reused on its own; reused across one, an amd64 map would
+// answer for an arm64 build, or a map made without a build tag for a build with
+// it.
+func buildEnvironmentChanges(t *testing.T) map[string]func(h *cacheHarness) {
+	t.Helper()
+
+	changes := map[string]func(h *cacheHarness){}
+	for _, name := range []string{
+		"GOOS", "GOARCH", "GOAMD64", "GOARM", "GOARM64", "GO386", "GOPPC64",
+		"GORISCV64", "GOWASM", "GOMIPS", "GOMIPS64", "CGO_ENABLED",
+		"GOEXPERIMENT", "GOFLAGS", "GOWORK", "GOFIPS140",
+		"CC", "CXX", "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS",
+	} {
+		// Appended, so that GOWORK stays as workFile set it unless it is the
+		// name being changed: the helper takes the last value it is given.
+		changes[name] = func(h *cacheHarness) { h.goEnv += "\n" + name + "=changed-by-the-test" }
+	}
+	// A workspace file changes which module versions are built against.
+	// Its path is the same on both runs; what it says is not.
+	for _, file := range []string{"go.work", "go.work.sum"} {
+		changes[file] = func(h *cacheHarness) {
+			path := filepath.Join(filepath.Dir(h.workFile()), file)
+			if err := os.WriteFile(path, []byte("changed by the test\n"), 0o600); err != nil {
+				h.t.Fatalf("cannot write %s: %v", file, err)
+			}
+		}
+	}
+
+	return changes
+}
+
+// workFile puts a workspace file and its checksums beside the fixture and
+// points GOWORK at it, the same on every run.
+func (h *cacheHarness) workFile() string {
+	h.t.Helper()
+
+	path := filepath.Join(h.pkgRoot, "go.work")
+	for name, content := range map[string]string{
+		"go.work":     "go 1.25\n\nuse ./calc\n",
+		"go.work.sum": "example.com/thing v1.0.0 h1:abc=\n",
+	} {
+		if err := os.WriteFile(filepath.Join(h.pkgRoot, name), []byte(content), 0o600); err != nil {
+			h.t.Fatalf("cannot write %s: %v", name, err)
+		}
+	}
+	h.goEnv = "GOWORK=" + path
+
+	return path
+}
+
+func TestABuildEnvironmentChangeReMapsThePackage(t *testing.T) {
+	for name, change := range buildEnvironmentChanges(t) {
+		t.Run(name, func(t *testing.T) {
+			// Alone, nothing else would stop the whole map being reused. With a
+			// change to Double that would narrow to TestDouble on its own, the
+			// environment is what says TestTriple is stale too.
+			for _, withEdit := range []bool{false, true} {
+				h := newCacheHarness(t)
+				h.workFile()
+				h.buildCalc("")
+
+				change(h)
+				if withEdit {
+					h.edit("calc/calc.go", calcSourceDoubleGrown)
+				}
+				h.buildCalc(changedCalc)
+
+				want := []string{"TestDouble", "TestTriple"}
+				if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+					t.Errorf("edit %v: want the whole package re-mapped (-want +got):\n%s", withEdit, diff)
+				}
+			}
+		})
+	}
+}
+
+// calcUsingMin is calc with a function that calls the builtin min, appended so
+// that the lines the profiles name do not move.
+const calcUsingMin = calcSource + `
+func Clip(n int) int {
+	return min(n, 10)
+}
+`
+
+// A new top-level name that is also a predeclared identifier rebinds every use
+// of that identifier in the package, and none of those uses changes: Clip calls
+// the new min from then on. It does not matter what kind of declaration it is.
+func TestAnAddedPredeclaredNameReMapsThePackage(t *testing.T) {
+	testCases := map[string]string{
+		"a function": `
+func min(a, b int) int {
+	return a
+}
+`,
+		"a var":   "\nvar max = 3\n",
+		"a const": "\nconst cap = 4\n",
+		"a type":  "\ntype any = int\n",
+	}
+
+	for name, added := range testCases {
+		t.Run(name, func(t *testing.T) {
+			h := newCacheHarness(t)
+			h.edit("calc/calc.go", calcUsingMin)
+			h.buildCalc("")
+
+			h.edit("calc/calc.go", calcUsingMin+added)
+			h.buildCalc(changedCalc)
+
+			want := []string{"TestDouble", "TestTriple"}
+			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+				t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 

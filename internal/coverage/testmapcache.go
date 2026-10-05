@@ -30,13 +30,16 @@ import (
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
-// Version 3 records the package's source fingerprint beside its mappings, so
+// Version 4 is shared between checkouts: its directory is named from the
+// module alone, its Inputs name nothing by absolute path and fold in the build
+// environment and compile flags, and an entry whose fingerprint and Inputs both
+// agree is reused whole across a moved build ID. Version 3 records the package's source fingerprint beside its mappings, so
 // that a changed package can keep the mappings the change could not have
 // touched. Version 2 was one file per package. Version 1 was one file per
 // module, which meant a run had to write back every package it had not looked
 // at or lose them — and a scoped run, which is the recommended workflow, looks
 // at one.
-const cacheVersion = 3
+const cacheVersion = 4
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
@@ -107,8 +110,17 @@ func (c *Coverage) cacheScope() string {
 
 // cacheDirPath is where this module's per-package map files live. It is outside
 // the module, under the user's cache directory unless a caller names another,
-// so that a checkout stays clean and two checkouts of the same module do not
-// share a map.
+// so that a checkout stays clean.
+//
+// It is named from the module name alone, so that every checkout of a module
+// shares one map. A CI fleet checks a module out under a different work
+// directory on every runner, and a map named after the checkout path could only
+// ever be read back by the runner that wrote it. Sharing is safe because no
+// entry is trusted for where it was found: an entry is used whole only while
+// its package's build ID agrees, and in part only while its fingerprint and
+// Inputs do — and neither of those names a path. Two checkouts writing at once
+// cannot tear a file, because every save is a rename; at worst one overwrites
+// the other's entry, and the loser re-maps next time.
 func (c *Coverage) cacheDirPath(key string) (string, error) {
 	base := c.cacheDir
 	if base == "" {
@@ -118,12 +130,7 @@ func (c *Coverage) cacheDirPath(key string) (string, error) {
 			return "", err
 		}
 	}
-	modName, modRoot := c.mod.Name, c.mod.Root
-	root, err := filepath.Abs(modRoot)
-	if err != nil {
-		root = modRoot
-	}
-	sum := sha256.Sum256([]byte(modName + "\x00" + root))
+	sum := sha256.Sum256([]byte(c.mod.Name))
 
 	return filepath.Join(base, "gremlins", "testmap", hex.EncodeToString(sum[:]), key), nil
 }

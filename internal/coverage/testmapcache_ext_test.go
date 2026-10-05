@@ -43,6 +43,14 @@ type cacheHarness struct {
 	cacheDir string
 	pkgRoot  string
 	logPath  string
+	// goEnv is what the fake go reports for the build environment, beyond its
+	// defaults, as goEnvEnv carries it.
+	goEnv string
+	// rootAtFixture makes the fixture directory the module root, so that its
+	// packages are inside the module rather than reached from outside it — the
+	// shape of an ordinary checkout, as against a replace target or a go.work
+	// member.
+	rootAtFixture bool
 }
 
 func newCacheHarness(t *testing.T) *cacheHarness {
@@ -82,8 +90,14 @@ func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestM
 		callingDir = suffix
 	}
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: callingDir}
+	if h.rootAtFixture {
+		// The builder changes into the module root, and the suite's working
+		// directory has to survive that.
+		h.t.Chdir(h.pkgRoot)
+		mod.Root = h.pkgRoot
+	}
 	cov := coverage.NewWithCmd(
-		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg),
+		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv),
 		h.t.TempDir(), mod,
 		coverage.WithTestMapCacheDir(h.cacheDir))
 
@@ -203,7 +217,11 @@ func TestMapCacheRemapsOnlyThePackageWhoseBuildIDChanged(t *testing.T) {
 	h := newCacheHarness(t)
 
 	h.build("TestTestMapHelperProcess", "")
-	h.build("TestTestMapHelperProcess", "example.com/vm=changed-by-a-dependency")
+	// A change vm's own mapping cannot narrow across, so that what is re-mapped
+	// is decided by the build IDs alone. The packages built on vm keep theirs
+	// here, standing for packages the change did not reach.
+	h.edit("vm/vm.go", vmSource+"\nconst limit = 3\n")
+	h.build("TestTestMapHelperProcess", "example.com/vm=changed-by-an-edit")
 
 	want := []string{"TestSizeAscending"}
 	if diff := cmp.Diff(want, h.testsRun()); diff != "" {

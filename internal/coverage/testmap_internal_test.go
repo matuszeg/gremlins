@@ -18,7 +18,9 @@ package coverage
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -315,10 +317,10 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		"a file that is not json":  "{not json",
 		"a file from another version": `{"version":999,"import_path":"example.com/p",` +
 			`"build_id":"id","tests":{}}`,
-		"a file naming another package": `{"version":2,"import_path":"example.com/other",` +
+		"a file naming another package": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/other",` +
 			`"build_id":"id","tests":{}}`,
-		"a file with no tests map": `{"version":2,"import_path":"example.com/p","build_id":"id"}`,
-		"a file with no build ID": `{"version":2,"import_path":"example.com/p",` +
+		"a file with no tests map": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/p","build_id":"id"}`,
+		"a file with no build ID": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/p",` +
 			`"build_id":"","tests":{}}`,
 	}
 	for name, content := range unusable {
@@ -386,15 +388,27 @@ func TestCachePathIsOutsideTheModule(t *testing.T) {
 		t.Errorf("want the cache under %s, got %s", dir, path)
 	}
 
-	// Two checkouts of the same module must not share a map: the same code at
-	// two paths can still map differently, and the second would inherit it.
+	// Two checkouts of the same module share a map: that is what lets a CI
+	// runner use a map another runner made under its own work directory. Each
+	// entry still has to agree with the package's build ID, or with its
+	// fingerprint and Inputs, before anything in it is used.
 	other := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: t.TempDir()}}
 	otherPath, err := other.cacheDirPath("key")
 	if err != nil {
 		t.Fatalf("cacheDirPath() error: %v", err)
 	}
-	if path == otherPath {
-		t.Error("two checkouts of the same module must not share a cache directory")
+	if path != otherPath {
+		t.Errorf("want two checkouts of one module to share a cache directory, got %s and %s", path, otherPath)
+	}
+
+	// Two modules never do, wherever they are.
+	another := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.org", Root: "."}}
+	anotherPath, err := another.cacheDirPath("key")
+	if err != nil {
+		t.Fatalf("cacheDirPath() error: %v", err)
+	}
+	if path == anotherPath {
+		t.Error("two modules must not share a cache directory")
 	}
 
 	// The key names a directory rather than living inside the files, so a map
@@ -422,5 +436,89 @@ func TestCacheFilePathSeparatesImportPaths(t *testing.T) {
 	// An import path holds separators, so it cannot be a file name as it is.
 	if filepath.Dir(a) != dir {
 		t.Errorf("want the file directly under %s, got %s", dir, a)
+	}
+}
+
+// The flags a test binary is compiled with decide what it is, so a change to
+// them must stop a map being reused even where nothing else would: they are
+// read from one place for the compile and for Inputs.
+func TestBuildInputsChangeWithTheCompileFlags(t *testing.T) {
+	t.Parallel()
+
+	inputsWith := func(change func(c *Coverage)) string {
+		t.Helper()
+
+		root := t.TempDir()
+		c := &Coverage{
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture"},
+			// No dependencies: the flags are the only thing that differs.
+			cmdContext: func(string, ...string) *exec.Cmd { return exec.Command("true") },
+		}
+		change(c)
+		sum, ok := c.buildInputsOf(&testPackage{importPath: "example.com/p", dir: root})
+		if !ok {
+			t.Fatal("buildInputsOf() failed")
+		}
+
+		return sum
+	}
+
+	plain := inputsWith(func(*Coverage) {})
+	if plain != inputsWith(func(*Coverage) {}) {
+		t.Fatal("want the same inputs from the same flags, wherever the module is")
+	}
+	changes := map[string]func(c *Coverage){
+		"build tags": func(c *Coverage) { c.buildTags = "integration" },
+		"the coverage scope": func(c *Coverage) {
+			c.crossPackage = true
+			c.coverPkg = "example.com/..."
+		},
+	}
+	for name, change := range changes {
+		if inputsWith(change) == plain {
+			t.Errorf("want %s to change the inputs", name)
+		}
+	}
+}
+
+func TestTestBuildFlags(t *testing.T) {
+	t.Parallel()
+
+	c := &Coverage{buildTags: "integration"}
+	want := []string{"-tags", "integration", "-coverpkg", "example.com/p"}
+	if diff := cmp.Diff(want, c.testBuildFlags("example.com/p")); diff != "" {
+		t.Errorf("testBuildFlags() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestTestIDNamesThePackageAndTheTest(t *testing.T) {
+	t.Parallel()
+
+	if got := (TestID{Pkg: "example.com/p", Name: "TestF"}).String(); got != "example.com/p.TestF" {
+		t.Errorf("String() = %q", got)
+	}
+}
+
+// Without a directory named for it the cache goes under the user's cache
+// directory, and a user with none still gets a run, just not a cache.
+func TestCachePathDefaultsToTheUserCacheDirectory(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", base)
+	t.Setenv("HOME", base)
+
+	c := &Coverage{mod: gomodule.GoModule{Name: "example.com", Root: "."}}
+	path, err := c.cacheDirPath("key")
+	if err != nil {
+		t.Fatalf("cacheDirPath() error: %v", err)
+	}
+	if !strings.HasPrefix(path, base) {
+		t.Errorf("want the cache under %s, got %s", base, path)
+	}
+
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+	if _, err := c.cacheDirPath("key"); err == nil {
+		t.Error("want an error when there is no user cache directory")
 	}
 }
