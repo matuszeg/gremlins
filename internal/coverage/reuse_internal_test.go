@@ -75,7 +75,7 @@ func testFn(name, test, hash string, mentions ...string) declPrint {
 func pkg() (fingerprint, cachedPackage) {
 	printed := func() fingerprint {
 		return fingerprint{
-			pkgPrint: pkgPrint{Whole: "whole", Decls: map[string]declPrint{
+			pkgPrint: pkgPrint{Whole: "whole", Typed: true, Decls: map[string]declPrint{
 				"a.go:F":           fn("F", 3, 7, "f", "limit"),
 				"a.go:G":           fn("G", 9, 11, "g"),
 				"a.go:const limit": spec(kindConst, "limit", 13, "limit"),
@@ -84,7 +84,7 @@ func pkg() (fingerprint, cachedPackage) {
 				"a_test.go:helper": testFn("helper", "", "h"),
 			}},
 			Inputs: inputsHash,
-			Deps: map[string]pkgPrint{"example.com/dep": {Whole: "dep-whole", Decls: map[string]declPrint{
+			Deps: map[string]pkgPrint{"example.com/dep": {Whole: "dep-whole", Typed: true, Decls: map[string]declPrint{
 				"dep/dep.go:Clamp":     {Hash: "clamp", Sig: "clamp-sig", Names: []string{"Clamp"}, header: idents("Clamp"), text: idents("Clamp")},
 				"dep/dep.go:Size":      {Hash: "size", Sig: "size-sig", Names: []string{"Size"}, header: idents("Size"), text: idents("Size", "count")},
 				"dep/dep.go:type Box":  {Hash: "box", Kind: kindType, Names: []string{"Box"}, header: idents("Box"), text: idents("Box")},
@@ -138,6 +138,15 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 		"an import added where nothing observes initialisation": {
 			change: func(now *fingerprint, _ *cachedPackage) {
 				now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+			},
+			kept: []string{"TestF", "TestG"},
+		},
+		// A variable added or removed is a changed name, and the others kept
+		// their order around it.
+		"a variable added among others that kept their order": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.InitOrder = []string{"a", "gone", "b"}
+				now.InitOrder = []string{"new", "a", "b"}
 			},
 			kept: []string{"TestF", "TestG"},
 		},
@@ -355,6 +364,30 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 		},
 		"the package's whole print moved": func(now *fingerprint, _ *cachedPackage) {
 			now.Whole = "other"
+		},
+		// The order is a fact only the type-checker has, so a print it could
+		// not read is one nothing can be narrowed from.
+		"the package could not be type-checked": func(now *fingerprint, _ *cachedPackage) {
+			now.Typed = false
+		},
+		"the cached package was not type-checked": func(_ *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Typed = false
+		},
+		"a dependency could not be type-checked": func(now *fingerprint, _ *cachedPackage) {
+			dep := now.Deps["example.com/dep"]
+			dep.Typed = false
+			now.Deps["example.com/dep"] = dep
+		},
+		// Two variables both prints initialise traded places, which no
+		// entity's print shows.
+		"two variables initialised in the other order": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.InitOrder = []string{"a", "b", "c"}
+			now.InitOrder = []string{"b", "a"}
+		},
+		"a dependency's variables initialised in the other order": func(now *fingerprint, cached *cachedPackage) {
+			was, dep := cached.Fingerprint.Deps["example.com/dep"], now.Deps["example.com/dep"]
+			was.InitOrder, dep.InitOrder = []string{"a", "b"}, []string{"b", "a"}
+			cached.Fingerprint.Deps["example.com/dep"], now.Deps["example.com/dep"] = was, dep
 		},
 		"a dependency's whole print moved": func(now *fingerprint, _ *cachedPackage) {
 			now.Deps["example.com/dep"] = pkgPrint{Whole: "other", Decls: now.Deps["example.com/dep"].Decls}

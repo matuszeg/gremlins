@@ -91,7 +91,12 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 		return fingerprint{}, false
 	}
 
-	return fingerprint{pkgPrint: c.printPackage(pkg.importPath, files, true, below)}, true
+	printed := c.printPackage(pkg.importPath, files, true, below)
+	if facts, typed := c.typeFactsOf(pkg.importPath, true); typed {
+		printed.InitOrder, printed.Typed = facts.initOrder, true
+	}
+
+	return fingerprint{pkgPrint: printed}, true
 }
 
 // hashDataSubtrees hashes what a package's directory holds below its top level

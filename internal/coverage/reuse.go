@@ -83,7 +83,7 @@ type span struct {
 // instrumented only ever sees types that instrumented code named.
 //
 // What runs before any test is the initialisation of every linked package,
-// and it reaches every test without a name. Three things decide it, and each
+// and it reaches every test without a name. Four things decide it, and each
 // is held somewhere a change to it re-maps the package. What runs: an init or
 // a var initialised by a call is an entity that re-maps on any change, and so
 // is a var whose initialiser formats a value — fmt.Errorf calls an operand's
@@ -91,11 +91,31 @@ type span struct {
 // only over literals and errors errors.New made. Which packages are linked:
 // every linked import path is in Inputs, the standard library's included,
 // because a package newly linked — crypto/md5 registering MD5 with crypto —
-// changes what untouched code does. And in what order: a package is
-// initialised after everything it imports, so a file's set of imported paths
-// changing can move it, and with it what an init or a var reading another
-// package sees; when that happens and anything instrumented observes the
-// order, the package is re-mapped.
+// changes what untouched code does. In what order within a package: a
+// package's variables are initialised in declaration order, except that each
+// waits for every variable its initialiser depends on — found through the
+// bodies of the functions it calls, transitively, executed or not — so
+// swapping two lines that print the same, or a body no test runs newly naming
+// a variable, reorders it. That order is taken from the type-checker
+// (types.Info.InitOrder, see typeFacts), and two variables both prints
+// initialise trading places re-maps the package, as does a package the
+// type-checker could not read. And in what order across packages: a package
+// is initialised after everything it imports, so a file's set of imported
+// paths changing can move it, and with it what an init or a var reading
+// another package sees; when that happens and anything instrumented observes
+// the order, the package is re-mapped. The type-checker sees one package at a
+// time, so the order across them is still read off the import sets: that rule
+// and the order within a package hold different facts, and neither subsumes
+// the other — a plain var reading a package whose init is not instrumented is
+// seen by the first alone.
+//
+// The rule behind all of it: a fact the compiler derives is asked of the
+// compiler. Every hole the closure has had was one — an init order worked out
+// through function bodies, a dependency only a tagged file links — read off
+// the syntax, or not read at all, and adding patterns for them one at a time
+// is a race against the language. A print holds what the source says; what
+// the toolchain works out from it comes from the toolchain, under the same
+// build tags the test binary is compiled with, or the package is re-mapped.
 //
 // Matching is by name and deliberately over-approximate. Within one package
 // directory — the package, its test files and its external test package — any
@@ -111,6 +131,9 @@ type span struct {
 // Everything the closure has no name to follow, wherever in the binary's
 // in-scope packages it happens:
 //
+//   - a package, or an instrumented dependency, the type-checker could not
+//     read, before or after, and two variables trading places in the order a
+//     package initialises them;
 //   - a change to what the binary is built from that no profile records: a
 //     dependency outside every main module, a main module's go.mod, the set of
 //     packages linked, the toolchain, the build environment, the compile flags
@@ -247,7 +270,7 @@ type pkgDelta struct {
 func (cl *closure) add(was, now pkgPrint) *pkgDelta {
 	d := &pkgDelta{was: was, now: now, changed: map[string]bool{}, names: map[string]bool{}, reached: map[string]bool{}}
 	cl.pkgs = append(cl.pkgs, d)
-	if was.Whole != now.Whole {
+	if was.Whole != now.Whole || !was.Typed || !now.Typed || !sameInitOrder(was.InitOrder, now.InitOrder) {
 		cl.whole = true
 
 		return d

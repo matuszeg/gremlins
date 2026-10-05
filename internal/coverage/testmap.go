@@ -344,6 +344,9 @@ func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool
 	if c.crossPackage {
 		return narrowing{}
 	}
+	// The instrumented dependencies are type-checked in one load, before
+	// reading them asks for each.
+	c.loadTypes(false, c.instrumentedImports(pkg))
 	// Read first and returned however the rest goes: every new mapping needs
 	// them to keep a dependency's blocks out of its profile.
 	sources, depsOK := c.dependencySources(pkg)

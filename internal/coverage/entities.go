@@ -63,6 +63,13 @@ type pkgPrint struct {
 	// build listing said what it is, and under "?" and its path when it did
 	// not, which makes any change to the file's imports reach the whole file.
 	Imports map[string]map[string]string `json:"imports,omitempty"`
+
+	// InitOrder is the order the package's variables are initialised in, as
+	// the type-checker derives it (see typeFacts), and Typed says it was
+	// derived at all. A print the type-checker could not read is never
+	// narrowed from: the order is a fact no token of the source holds.
+	InitOrder []string `json:"init_order,omitempty"`
+	Typed     bool     `json:"typed,omitempty"`
 }
 
 // The kinds of entity. A function is the empty kind.
@@ -107,7 +114,8 @@ type declPrint struct {
 	// initialised before this one, and that order moves when an import is
 	// added or removed anywhere in the binary (see closure.reordered). A call
 	// that runs at initialisation is kindRun instead, which is the same thing
-	// and more.
+	// and more. It is the order across packages, which no package's
+	// type-check sees; the order within one is pkgPrint.InitOrder.
 	Observes bool `json:"observes,omitempty"`
 	// File is the name the coverage profile uses, not the name on disk, so
 	// that a span can be compared against a profile without translating

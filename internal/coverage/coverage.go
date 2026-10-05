@@ -67,6 +67,13 @@ type Coverage struct {
 	// pkgNames is each listed package's name by import path, which is what
 	// an unnamed import binds.
 	pkgNames map[string]string
+	// types is what the type-checker said about each package, and
+	// typesTried every package it was asked about, whatever it said (see
+	// typeFactsOf). typeLoader replaces go/packages for the tests that
+	// stand a fake in for the go command; nil is the real one.
+	types      map[typesKey]typeFacts
+	typesTried map[typesKey]bool
+	typeLoader typeLoader
 
 	// When profilePath is set, Run parses that pre-computed profile instead
 	// of gathering coverage itself, and reports profileElapsed as the test

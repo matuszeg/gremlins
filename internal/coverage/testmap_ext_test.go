@@ -249,7 +249,7 @@ func buildMap(t *testing.T, helper string) *coverage.TestMap {
 	// Every test gets its own cache directory: the real one belongs to whoever
 	// is running the suite, and a shared one would let one test answer another.
 	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(t.TempDir()))
+		coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes())
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {
