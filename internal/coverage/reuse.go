@@ -77,13 +77,20 @@ type span struct {
 // now satisfies. Each of those mentions the name somewhere a test's record
 // sees: in code it executed (the profile or Deps), in a header the closure
 // follows (a type nested in a type, a function returning one), or in the
-// test's own source. A method declared through an alias belongs to the type
-// the alias names, which code can name without naming the alias, so a local
-// type's alias carries the type's name as well as its own. An added name is a
-// changed name because it can rebind an existing mention — a new
-// package-level `min` captures every `min(x, 10)` in the package without a
-// byte of them changing — and it is the mention that is followed, so that case
-// needs nothing of its own. Reflection inside a package that is not
+// test's own source. A method added, removed or re-signed is a change to its
+// receiver type, not to its own name: a call reaches the method only through
+// a value of the type, and every such value is made by code that names it — a
+// literal, a conversion, a declaration, a signature or field of a type that
+// names it, reflection over another such value — which the test executed, or
+// mentions, or the closure follows. Matching the method's own name as well
+// would dirty every test calling any method so spelled — t.Fatalf, for a
+// test type that gains a Fatalf. A method declared through an alias belongs
+// to the type the alias names, which code can name without naming the alias,
+// so a local type's alias carries the type's name as well as its own. An
+// added name is a changed name because it can rebind an existing mention — a
+// new package-level `min` captures every `min(x, 10)` in the package without
+// a byte of them changing — and it is the mention that is followed, so that
+// case needs nothing of its own. Reflection inside a package that is not
 // instrumented only ever sees types that instrumented code named.
 //
 // What runs before any test is the initialisation of every linked package,

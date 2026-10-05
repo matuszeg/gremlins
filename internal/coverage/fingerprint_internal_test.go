@@ -286,7 +286,7 @@ func TestFingerprintDescribesEveryEntity(t *testing.T) {
 		// The span starts at the declaration, not at its doc comment: a doc
 		// comment growing must not read as the body having moved.
 		"pkg/a.go:F":            {Names: []string{"F"}, Start: 9, End: 11},
-		"pkg/a.go:TK.M":         {Kind: kindMethod, Names: []string{"M", "T"}, Start: 13, End: 15},
+		"pkg/a.go:TK.M":         {Kind: kindMethod, Names: []string{"T"}, Start: 13, End: 15},
 		"pkg/a.go:init#0":       {Kind: kindInit, Start: 17, End: 19},
 		"pkg/a.go:_#0":          {Kind: kindBlank, Start: 21, End: 21},
 		"pkg/a.go:type T":       {Kind: kindType, Names: []string{"T"}, Start: 24, End: 24},
@@ -510,8 +510,8 @@ func () C() {}
 func (x other.T) D() {}
 `})
 	want := map[string][]string{
-		"pkg/a.go:PairKV.A": {"A", "Pair"},
-		"pkg/a.go:U.B":      {"B", "U"},
+		"pkg/a.go:PairKV.A": {"Pair"},
+		"pkg/a.go:U.B":      {"U"},
 		"pkg/a.go:C":        {"C"},
 		"pkg/a.go:otherT.D": {"D"},
 	}

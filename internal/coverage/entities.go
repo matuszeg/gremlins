@@ -112,7 +112,12 @@ type declPrint struct {
 	// a changed name instead. Empty for every other kind.
 	Sig string `json:"sig,omitempty"`
 	// Names are the names the entity declares, and so the names a change to
-	// it changes. A method declares its own name and its receiver type's.
+	// it changes. A method's is its receiver type's: what a method added,
+	// removed or re-signed changes is that type's method set, and every value
+	// of the type is made by code that names it (see reusable). Its own name
+	// would match every call of any method so spelled — a test type's Fatalf
+	// every t.Fatalf in the package. Only a receiver no name can be read off
+	// falls back to the method's own name.
 	Names []string `json:"names,omitempty"`
 	Kind  string   `json:"kind,omitempty"`
 	// Linked says a //go:linkname directive binds the declaration to a symbol
@@ -564,7 +569,7 @@ func (ps *printSet) printFunc(st *fileState, fn *ast.FuncDecl) {
 		d.Kind = kindMethod
 		d.Names = []string{name}
 		if recv := receiverName(fn); recv != "" {
-			d.Names = append(d.Names, recv)
+			d.Names = []string{recv}
 		}
 	case name == "init":
 		d.Kind = kindInit
