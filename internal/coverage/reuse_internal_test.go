@@ -113,16 +113,16 @@ func keptNames(kept map[string]Profile) []string {
 	return names
 }
 
+// reachesReg stands for a package's reach once it imports reg.
+const reachesReg = "reaches reg"
+
 // Each change here is attributable, and the mappings it could not have
 // reached are kept: by body to the tests that executed it, by name to whatever
 // names it.
 func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 	t.Parallel()
 
-	testCases := map[string]struct {
-		change func(now *fingerprint, cached *cachedPackage)
-		kept   []string
-	}{
+	testCases := map[string]keepCase{
 		"nothing": {
 			change: func(*fingerprint, *cachedPackage) {},
 			kept:   []string{"TestF", "TestG"},
@@ -132,14 +132,6 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 				now.Decls["a.go:F"] = fn("F", 3, 7, "f2", "limit")
 			},
 			kept: []string{"TestG"},
-		},
-		// The order packages are initialised in may have moved, and nothing
-		// instrumented runs at initialisation to see it.
-		"an import added where nothing observes initialisation": {
-			change: func(now *fingerprint, _ *cachedPackage) {
-				now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
-			},
-			kept: []string{"TestF", "TestG"},
 		},
 		// A variable added or removed is a changed name, and the others kept
 		// their order around it.
@@ -305,6 +297,18 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 		},
 	}
 
+	runKeepCases(t, testCases)
+}
+
+// keepCase is a change and the mappings reuse must keep across it.
+type keepCase struct {
+	change func(now *fingerprint, cached *cachedPackage)
+	kept   []string
+}
+
+func runKeepCases(t *testing.T, testCases map[string]keepCase) {
+	t.Helper()
+
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -324,6 +328,43 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The order packages are initialised in moves only with what a package
+// reaches by import, and only an initialiser can see it.
+func TestReusableKeepsWhatTheOrderCannotReach(t *testing.T) {
+	t.Parallel()
+
+	runKeepCases(t, map[string]keepCase{
+		// The order packages are initialised in may have moved, and nothing
+		// instrumented runs at initialisation to see it.
+		"an import added where nothing observes initialisation": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+				now.Reach = reachesReg
+			},
+			kept: []string{"TestF", "TestG"},
+		},
+		// The package reached reg already, so it is initialised where it
+		// was, and the init sees what it saw.
+		"an import added that the package already reached, beside an init": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:init#0"] = declPrint{Hash: "i", Kind: kindInit, File: "a.go", Start: 20, End: 22}
+				now.Decls["a.go:init#0"] = declPrint{Hash: "i", Kind: kindInit, File: "a.go", Start: 20, End: 22}
+				now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+			},
+			kept: []string{"TestF", "TestG"},
+		},
+		// TestMain runs once every package is initialised.
+		"a package reaching more beside TestMain": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindMain, File: "a_test.go"}
+				now.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindMain, File: "a_test.go"}
+				now.Reach = reachesReg
+			},
+			kept: []string{"TestF", "TestG"},
+		},
+	})
 }
 
 // Everything here re-maps the whole package. The direction matters: a mapping
@@ -434,25 +475,32 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 		},
 		// A package's imports are its place in the order packages are
 		// initialised in, and something initialised sees that order.
-		"an import added beside an init": func(now *fingerprint, cached *cachedPackage) {
+		"a package reaching more beside an init": func(now *fingerprint, cached *cachedPackage) {
 			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i")
 			now.Decls["a.go:init#0"] = initAt("i")
-			now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+			now.Reach = reachesReg
 		},
-		"an import moved to another path beside a var run at initialisation": func(now *fingerprint, cached *cachedPackage) {
-			cached.Fingerprint.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+		"a package reaching other packages beside a var run at initialisation": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Reach = reachesReg
 			cached.Fingerprint.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s")
 			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s")
-			now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg2"}}
+			now.Reach = "reaches reg2"
 		},
-		"an import removed where a dependency's var reads another package": func(now *fingerprint, cached *cachedPackage) {
-			cached.Fingerprint.Imports = map[string]map[string]string{"a_test.go": {"reg": "example.com/reg"}}
+		"a dependency reaching more beside an init in the package": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i")
+			now.Decls["a.go:init#0"] = initAt("i")
+			dep := now.Deps["example.com/dep"]
+			dep.Reach = reachesReg
+			now.Deps["example.com/dep"] = dep
+		},
+		"a package reaching less where a dependency's var reads another package": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Reach = reachesReg
 			observes := declPrint{Hash: "o", Kind: kindVar, Names: []string{"Snapshot"}, Observes: true}
 			cached.Fingerprint.Deps["example.com/dep"].Decls["dep/dep.go:var Snapshot"] = observes
 			setDep(now, "dep/dep.go:var Snapshot", observes)
 		},
 		"a TestMain": func(now *fingerprint, _ *cachedPackage) {
-			now.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindRun, File: "a_test.go"}
+			now.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindMain, File: "a_test.go"}
 		},
 		// Nothing to pair it by.
 		"a blank declaration changed": func(now *fingerprint, cached *cachedPackage) {
