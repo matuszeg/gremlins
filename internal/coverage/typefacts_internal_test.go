@@ -72,21 +72,30 @@ func TestSameInitOrderComparesWhatBothInitialise(t *testing.T) {
 
 	testCases := map[string]struct {
 		was, now []string
-		want     bool
+		// first and second are the variables initOrderSwap names, empty
+		// when the orders agree.
+		first, second string
 	}{
-		"the same":               {was: []string{"a", "b"}, now: []string{"a", "b"}, want: true},
-		"one added and one gone": {was: []string{"a", "gone", "b"}, now: []string{"new", "a", "b"}, want: true},
-		"two trading places":     {was: []string{"a", "b"}, now: []string{"b", "a"}},
+		"the same":               {was: []string{"a", "b"}, now: []string{"a", "b"}},
+		"one added and one gone": {was: []string{"a", "gone", "b"}, now: []string{"new", "a", "b"}},
+		"two trading places":     {was: []string{"c", "a", "b"}, now: []string{"c", "b", "a"}, first: "a", second: "b"},
 		// A name twice in one list is not something a type-checker says,
-		// and it is not taken as agreement.
-		"a name listed twice": {was: []string{"a", "a"}, now: []string{"a"}},
+		// and it is not taken as agreement, on either side.
+		"a name listed twice before": {was: []string{"a", "a"}, now: []string{"a"}, first: "a", second: "a"},
+		"a name listed twice after":  {was: []string{"b"}, now: []string{"b", "b"}, first: "b", second: "b"},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := sameInitOrder(tc.was, tc.now); got != tc.want {
-				t.Errorf("sameInitOrder(%v, %v) = %v, want %v", tc.was, tc.now, got, tc.want)
+			agree := tc.first == ""
+			if got := sameInitOrder(tc.was, tc.now); got != agree {
+				t.Errorf("sameInitOrder(%v, %v) = %v, want %v", tc.was, tc.now, got, agree)
+			}
+			first, second, swapped := initOrderSwap(tc.was, tc.now)
+			if first != tc.first || second != tc.second || swapped == agree {
+				t.Errorf("initOrderSwap(%v, %v) = %q, %q, %v, want %q, %q, %v",
+					tc.was, tc.now, first, second, swapped, tc.first, tc.second, !agree)
 			}
 		})
 	}

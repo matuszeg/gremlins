@@ -379,10 +379,13 @@ func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool
 	if !hit {
 		return n
 	}
-	reuse, narrowed := reusable(cached, fp)
-	if narrowed {
-		n.reuse = reuse
+	reuse, why := reusable(cached, fp)
+	if why != "" {
+		log.Infof("testmap: re-mapping all of %s: %s\n", pkg.importPath, why)
+
+		return n
 	}
+	n.reuse = reuse
 
 	return n
 }

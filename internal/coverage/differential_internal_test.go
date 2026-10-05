@@ -558,3 +558,28 @@ func TestDifferentialKnownExposures(t *testing.T) {
 		},
 	})
 }
+
+// A whole-package re-map is the expensive outcome, so the run says which
+// package it was and what forced it.
+func TestDifferentialAWholeRemapLogsItsReason(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs real test binaries")
+	}
+	log.Reset()
+	var out bytes.Buffer
+	log.Init(&out, &bytes.Buffer{})
+	t.Cleanup(log.Reset)
+
+	m := &diffModule{t: t, root: t.TempDir()}
+	m.write(diffBase)
+	cache := t.TempDir()
+	m.build(cache)
+	m.write(map[string]string{"calc/extra.go": "//go:build !never\n\npackage calc\n\nfunc extra() int {\n\treturn 1\n}\n"})
+	out.Reset()
+	m.build(cache)
+
+	want := "testmap: re-mapping all of " + diffPkg + ": the package: something outside every declaration changed"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("want the log to say %q, got:\n%s", want, out.String())
+	}
+}
