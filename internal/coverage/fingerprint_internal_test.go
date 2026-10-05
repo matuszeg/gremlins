@@ -111,10 +111,6 @@ func TestFingerprintWholeHoldsWhatNoEntityCarries(t *testing.T) {
 			{"a.go": plainSource},
 			{"a.go": plainSource, "b_arm64_test.go": "package pkg\n"},
 		},
-		"a test file": {
-			{"a.go": plainSource},
-			{"a.go": plainSource, "b_test.go": "package pkg\n"},
-		},
 		"a directive outside every declaration": {
 			{"a.go": plainSource},
 			{"a.go": "//go:debug panicnil=1\n\n" + plainSource},
@@ -158,6 +154,16 @@ func TestFingerprintWholeIgnoresWhatAnEntityCarries(t *testing.T) {
 		"an added plain file": {
 			{"a.go": plainSource},
 			{"a.go": plainSource, "b.go": "package pkg\n\nconst limit = 3\n"},
+		},
+		// A test file's name constrains nothing but which binary it is
+		// compiled into, and its declarations carry that.
+		"an added test file": {
+			{"a.go": plainSource},
+			{"a.go": plainSource, "b_test.go": "package pkg\n\nfunc helper() int {\n\treturn 1\n}\n"},
+		},
+		"a file renamed to a test file": {
+			{"a.go": plainSource, "b.go": "package pkg\n\nfunc helper() int {\n\treturn 1\n}\n"},
+			{"a.go": plainSource, "b_test.go": "package pkg\n\nfunc helper() int {\n\treturn 1\n}\n"},
 		},
 		"a moved function": {
 			{"a.go": plainSource + "\nfunc G() int {\n\treturn 2\n}\n"},

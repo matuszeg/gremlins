@@ -261,6 +261,21 @@ func TestATestFileChangeReMapsOnlyTheTestsThatNameIt(t *testing.T) {
 			after: files{"calc/util_test.go": "package calc\n\nimport \"testing\"\n\nfunc check(t *testing.T, ok bool) {\n\tif !ok {\n\t\tt.Error(\"no\")\n\t}\n}\n"},
 			want:  []string{"TestTriple"},
 		},
+		// A test file is entities like any other: what it declares is added,
+		// and nothing names it.
+		"a test file added": {
+			after: files{"calc/extra_test.go": "package calc\n\nfunc unused() int {\n\treturn 1\n}\n"},
+		},
+		// The helper is removed from one file and added in another, and
+		// TestTriple names it.
+		"a helper moved into a test file of its own": {
+			before: files{"calc/triple_test.go": tripleWithHelper("_ = got == expected")},
+			after: files{
+				"calc/triple_test.go": "package calc\n\nimport \"testing\"\n\nfunc TestTriple(t *testing.T) {\n\twant(t, Triple(2), 6)\n}\n",
+				"calc/want_test.go":   "package calc\n\nimport \"testing\"\n\nfunc want(t *testing.T, got, expected int) {\n\t_ = got == expected\n}\n",
+			},
+			want: []string{"TestTriple"},
+		},
 		// A changed name of the package reaches a test that names it, though
 		// no profile records a line of the test.
 		"a constant only a test names": {
@@ -350,7 +365,9 @@ func TestAChangeEveryTestCanReachReMapsThePackage(t *testing.T) {
 			after:  files{"calc/extra.go": "//go:build linux\n\npackage calc\n"},
 		},
 		"a file named for a platform": {after: files{"calc/extra_linux.go": "package calc\n"}},
-		"a test file added":           {after: files{"calc/extra_test.go": "package calc\n"}},
+		// A test file is entities like any other, but a platform suffix
+		// before its _test still decides when it is compiled.
+		"a test file added for a platform": {after: files{"calc/extra_linux_test.go": "package calc\n"}},
 		"a cgo preamble": {
 			before: files{"calc/cgo.go": "package calc\n\n// #define N 1\nimport \"C\"\n"},
 			after:  files{"calc/cgo.go": "package calc\n\n// #define N 2\nimport \"C\"\n"},
