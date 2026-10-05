@@ -573,6 +573,53 @@ func TestDifferentialPackageInitOrder(t *testing.T) {
 	})
 }
 
+// A var reads another package's state through a name no selector carries: a
+// dot import, or a same-package var holding its address. Only the
+// type-checker can say what such a name is, so it is asked. With an internal
+// TestMain, and z's module sorting after testing, calc is initialised before
+// z only while it does not reach it — TestMain itself observes nothing.
+func TestDifferentialPackageInitOrderUnqualifiedReads(t *testing.T) {
+	zmod := func(zpath, initGo string, testMain bool) map[string]string {
+		fs := map[string]string{
+			"go.mod":            "module example.com/m\n\ngo 1.22\n\nrequire " + zpath + " v0.0.0\n\nreplace " + zpath + " => ./zmod\n",
+			"zmod/go.mod":       "module " + zpath + "\n\ngo 1.22\n",
+			"zmod/reg/reg.go":   "package reg\n\nvar Names []string\n",
+			"zmod/z.go":         "package z\n\nimport \"" + zpath + "/reg\"\n\nfunc init() {\n\treg.Names = append(reg.Names, \"z\")\n}\n\nfunc Name() string {\n\treturn \"z\"\n}\n",
+			"calc/init.go":      "package calc\n\nimport . \"" + zpath + "/reg\"\n\n" + initGo,
+			"calc/calc.go":      diffCalc("\n// Name is for the external test.\nfunc Name() string {\n\treturn \"calc\"\n}\n", "if seen > 0 {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+			"calc/calc_test.go": diffRemoved,
+			"calc/x_test.go": "package calc_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/calc\"\n\t\"" + zpath + "\"\n)\n\n" +
+				"func TestDouble(t *testing.T) {\n\t_ = calc.Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = calc.Triple(2)\n}\n\n" +
+				"func TestZ(t *testing.T) {\n\t_ = z.Name() + calc.Name()\n}\n",
+		}
+		if testMain {
+			fs["calc/main_test.go"] = "package calc\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(m.Run())\n}\n"
+		}
+
+		return fs
+	}
+	name := func(zpath string) map[string]string {
+		return map[string]string{"calc/name.go": "package calc\n\nimport \"" + zpath + "\"\n\nfunc name() string {\n\treturn z.Name()\n}\n"}
+	}
+	dot := "var seen = len(Names)\n"
+	alias := "var names = &Names\n\nvar seen = len(*names)\n"
+	all := []string{"TestDouble", "TestTriple", "TestZ"}
+	runDifferential(t, map[string]diffCase{
+		"a plain var reading another package through a dot import": {
+			before: zmod("example.com/z", dot, false), after: name("example.com/z"), remapped: all,
+		},
+		"a plain var reading another package through a dot import, beside TestMain": {
+			before: zmod("zz.example/z", dot, true), after: name("zz.example/z"), remapped: all,
+		},
+		"a plain var reading another package through a pointer to it": {
+			before: zmod("example.com/z", alias, false), after: name("example.com/z"), remapped: all,
+		},
+		"a plain var reading another package through a pointer to it, beside TestMain": {
+			before: zmod("zz.example/z", alias, true), after: name("zz.example/z"), remapped: all,
+		},
+	})
+}
+
 // What reuse is known not to see, asserted so that it stays documented.
 func TestDifferentialKnownExposures(t *testing.T) {
 	caller := "_, _, line, _ := runtime.Caller(0)\n\tif line > 7 {\n\t\treturn 1\n\t}\n\treturn n * 2"

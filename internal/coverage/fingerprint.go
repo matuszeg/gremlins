@@ -91,10 +91,7 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 		return fingerprint{}, false
 	}
 
-	printed := c.printPackage(pkg.importPath, files, true, below)
-	if facts, typed := c.typeFactsOf(pkg.importPath, true); typed {
-		printed.InitOrder, printed.Reach, printed.Typed = facts.initOrder, facts.reach, true
-	}
+	printed := c.printPackage(pkg.importPath, files, true, below, c.typedFacts(pkg.importPath, true))
 
 	return fingerprint{pkgPrint: printed}, true
 }

@@ -103,11 +103,7 @@ func (c *Coverage) readDepSource(dep dependency) *depSource {
 	if !ok {
 		return nil
 	}
-	printed := c.printPackage(dep.importPath, files, false, below)
-
-	if facts, typed := c.typeFactsOf(dep.importPath, false); typed {
-		printed.InitOrder, printed.Reach, printed.Typed = facts.initOrder, facts.reach, true
-	}
+	printed := c.printPackage(dep.importPath, files, false, below, c.typedFacts(dep.importPath, false))
 
 	src := &depSource{
 		stored: pkgPrint{
