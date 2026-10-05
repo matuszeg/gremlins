@@ -133,6 +133,14 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 			},
 			kept: []string{"TestG"},
 		},
+		// The order packages are initialised in may have moved, and nothing
+		// instrumented runs at initialisation to see it.
+		"an import added where nothing observes initialisation": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+			},
+			kept: []string{"TestF", "TestG"},
+		},
 		// G names F without executing it — it passes F as a value — so F's
 		// body cannot reach TestG, and its signature can.
 		"a body of a function another passes as a value": {
@@ -390,6 +398,25 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 		"a var becoming one run at initialisation": func(now *fingerprint, cached *cachedPackage) {
 			cached.Fingerprint.Decls["a.go:var start"] = spec(kindVar, "start", 15, "s")
 			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s2")
+		},
+		// A package's imports are its place in the order packages are
+		// initialised in, and something initialised sees that order.
+		"an import added beside an init": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i")
+			now.Decls["a.go:init#0"] = initAt("i")
+			now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+		},
+		"an import moved to another path beside a var run at initialisation": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg"}}
+			cached.Fingerprint.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s")
+			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s")
+			now.Imports = map[string]map[string]string{"a.go": {"reg": "example.com/reg2"}}
+		},
+		"an import removed where a dependency's var reads another package": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Imports = map[string]map[string]string{"a_test.go": {"reg": "example.com/reg"}}
+			observes := declPrint{Hash: "o", Kind: kindVar, Names: []string{"Snapshot"}, Observes: true}
+			cached.Fingerprint.Deps["example.com/dep"].Decls["dep/dep.go:var Snapshot"] = observes
+			setDep(now, "dep/dep.go:var Snapshot", observes)
 		},
 		"a TestMain": func(now *fingerprint, _ *cachedPackage) {
 			now.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindRun, File: "a_test.go"}

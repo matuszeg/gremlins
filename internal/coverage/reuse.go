@@ -66,18 +66,36 @@ type span struct {
 // # Why that is enough
 //
 // A test is affected by a change it did not execute only if it reaches the
-// changed thing by name. The routes there are few: a value of a type built
-// somewhere, a constant read, a function passed as a value — as huma.Register
-// takes a handler and reflects over its signature — a type nested in another,
-// an interface a type now satisfies. Each of those mentions the name somewhere
-// a test's record sees: in code it executed (the profile or Deps), in a header
-// the closure follows (a type nested in a type, a function returning one), or
-// in the test's own source. An added name is a changed name because it can
-// rebind an existing mention — a new package-level `min` captures every
-// `min(x, 10)` in the package without a byte of them changing — and it is the
-// mention that is followed, so that case needs nothing of its own. Reflection
-// inside a package that is not instrumented only ever sees types that
-// instrumented code named.
+// changed thing by name, or the change is to what runs before any test does.
+// The routes by name are few: a value of a type built somewhere, a constant
+// read, a function passed as a value — as huma.Register takes a handler and
+// reflects over its signature — a type nested in another, an interface a type
+// now satisfies. Each of those mentions the name somewhere a test's record
+// sees: in code it executed (the profile or Deps), in a header the closure
+// follows (a type nested in a type, a function returning one), or in the
+// test's own source. A method declared through an alias belongs to the type
+// the alias names, which code can name without naming the alias, so a local
+// type's alias carries the type's name as well as its own. An added name is a
+// changed name because it can rebind an existing mention — a new
+// package-level `min` captures every `min(x, 10)` in the package without a
+// byte of them changing — and it is the mention that is followed, so that case
+// needs nothing of its own. Reflection inside a package that is not
+// instrumented only ever sees types that instrumented code named.
+//
+// What runs before any test is the initialisation of every linked package,
+// and it reaches every test without a name. Three things decide it, and each
+// is held somewhere a change to it re-maps the package. What runs: an init or
+// a var initialised by a call is an entity that re-maps on any change, and so
+// is a var whose initialiser formats a value — fmt.Errorf calls an operand's
+// String or Error method there and then, so it is allowed as a plain entity
+// only over literals and errors errors.New made. Which packages are linked:
+// every linked import path is in Inputs, the standard library's included,
+// because a package newly linked — crypto/md5 registering MD5 with crypto —
+// changes what untouched code does. And in what order: a package is
+// initialised after everything it imports, so a file's set of imported paths
+// changing can move it, and with it what an init or a var reading another
+// package sees; when that happens and anything instrumented observes the
+// order, the package is re-mapped.
 //
 // Matching is by name and deliberately over-approximate. Within one package
 // directory — the package, its test files and its external test package — any
@@ -94,9 +112,13 @@ type span struct {
 // in-scope packages it happens:
 //
 //   - a change to what the binary is built from that no profile records: a
-//     dependency outside every main module, the toolchain, the build
-//     environment, the compile flags (Inputs), or the set of instrumented
-//     dependencies itself;
+//     dependency outside every main module, a main module's go.mod, the set of
+//     packages linked, the toolchain, the build environment, the compile flags
+//     (Inputs), or the set of instrumented dependencies itself;
+//   - a file's set of imported paths changing, in any instrumented package,
+//     while anything instrumented observes the order of initialisation: an
+//     init, a var initialised by a call or by reading another package, or
+//     TestMain;
 //   - an init added, removed, changed, or mentioning an affected name; a var
 //     whose initialiser calls something at initialisation, on the same terms;
 //     TestMain on the same terms: each runs for every test;
@@ -113,6 +135,17 @@ type span struct {
 // few. A mapping wrongly kept would mean a test that could kill a mutant is
 // not run, so the mutant reports LIVED — a red result nobody can reproduce,
 // which is why every case that is not clearly sound resolves to re-mapping.
+//
+// # What it cannot see
+//
+// A test's behaviour can hang on something no print holds, and then a kept
+// mapping can be wrong. Each of these is a known exposure, shared with reusing
+// a map by build ID alone: a file read at run time from outside the package
+// directory; a file of the package's own source read at run time — a test
+// that parses its package's .go files sees a change to any of them, where the
+// closure sees only the entities that change names; a binary built and run by
+// a test; lines executed in a subprocess; and a nondeterministic path that
+// reuse freezes as whichever way it went when the mapping was made.
 //
 // It is deliberately not a call graph. The alternative — SSA plus
 // reachability from each test root — is a much larger build, and it is
@@ -147,7 +180,7 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 		}
 		deps[importPath] = cl.add(before, after)
 	}
-	if cl.whole || !cl.close() {
+	if cl.whole || !cl.close() || cl.reordered && cl.observesInit() {
 		return nil, false
 	}
 
@@ -183,6 +216,10 @@ type closure struct {
 	// exported is every affected name that another package can refer to.
 	exported map[string]bool
 	whole    bool
+	// reordered says some package's set of imported paths changed, which
+	// can move when packages are initialised relative to each other even
+	// though every one of them is linked before and after.
+	reordered bool
 }
 
 // pkgDelta is one package's two prints and what the change did to it.
@@ -208,6 +245,9 @@ func (cl *closure) add(was, now pkgPrint) *pkgDelta {
 		cl.whole = true
 
 		return d
+	}
+	if !samePaths(was.Imports, now.Imports) {
+		cl.reordered = true
 	}
 	rebound := reboundNames(was.Imports, now.Imports)
 	keys := map[string]bool{}
@@ -265,6 +305,62 @@ func (cl *closure) close() bool {
 				}
 				cl.affect(d, key, e.Names)
 				grew = true
+			}
+		}
+	}
+
+	return true
+}
+
+// observesInit reports whether anything in the binary's instrumented packages
+// can see the order packages are initialised in: an init, a var initialised by
+// a call or by reading another package, or TestMain. Without any, an order
+// that moved changes nothing a test executes.
+func (cl *closure) observesInit() bool {
+	for _, d := range cl.pkgs {
+		for _, decls := range []map[string]declPrint{d.was.Decls, d.now.Decls} {
+			for _, e := range decls {
+				if e.Kind == kindInit || e.Kind == kindRun || e.Observes {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// samePaths reports whether two prints' files import the same packages, file
+// by file, whatever names they bind them to. A package is initialised after
+// everything it imports, so those sets are its place in the order. They are
+// compared per file rather than per package because a directory's prints
+// hold two packages, the package and its external tests, and a path one
+// gains can be one the other already imports; a path moved from one file of
+// a package to another only costs a re-map.
+func samePaths(was, now map[string]map[string]string) bool {
+	paths := func(table map[string]string) map[string]bool {
+		out := map[string]bool{}
+		for _, path := range table {
+			out[path] = true
+		}
+
+		return out
+	}
+	files := map[string]bool{}
+	for f := range was {
+		files[f] = true
+	}
+	for f := range now {
+		files[f] = true
+	}
+	for f := range files {
+		before, after := paths(was[f]), paths(now[f])
+		if len(before) != len(after) {
+			return false
+		}
+		for path := range before {
+			if !after[path] {
+				return false
 			}
 		}
 	}

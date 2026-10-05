@@ -557,6 +557,156 @@ func F(n int) int {
 	}
 }
 
+// fmt.Errorf formats its operands while the variable is initialised, and
+// formatting a value calls its String or Error method. Only an operand that
+// can have no method of the package's is let through: a literal, or a var the
+// package declares once as errors.New of a literal — matched within the
+// package that names it, so an external test package's var of the same name
+// is not mistaken for it.
+func TestFingerprintFmtErrorfFormatsOnlyWhatRunsNothing(t *testing.T) {
+	t.Parallel()
+
+	fp := fingerprintWithNames(t, map[string]string{
+		"a.go": `package pkg
+
+import (
+	"errors"
+	"fmt"
+	e2 "errors"
+)
+
+var errBase = errors.New("base")
+
+var errAliased = e2.New("aliased")
+
+var errDup = errors.New("dup")
+
+var errPair, errOther = errors.New("a"), errors.New("b")
+
+var (
+	literals = fmt.Errorf("x %d %s %v", 1, "a", 2.5)
+	wrapped  = fmt.Errorf("w: %w", errBase)
+	aliased  = fmt.Errorf("w: %w", errAliased)
+	value    = fmt.Errorf("%v", item{})
+	named    = fmt.Errorf("%v", limit)
+	dup      = fmt.Errorf("%w", errDup)
+	paired   = fmt.Errorf("%w", errPair)
+	spread   = fmt.Errorf("%v", errBase...)
+	called   = fmt.Errorf("%d", len("x"))
+	parened  = (fmt.Errorf)("%v", item{})
+)
+`,
+		"b_linux.go": "package pkg\n\nimport \"errors\"\n\nvar errDup = errors.New(\"again\")\n",
+		"x_test.go": `package pkg_test
+
+import "fmt"
+
+var errBase = item{}
+
+var shadowed = fmt.Errorf("%w", errBase)
+`,
+	}, map[string]string{"errors": "errors", "fmt": "fmt"})
+	for key, kind := range map[string]string{
+		"pkg/a.go:var literals":      kindVar,
+		"pkg/a.go:var wrapped":       kindVar,
+		"pkg/a.go:var aliased":       kindVar,
+		"pkg/a.go:run value":         kindRun,
+		"pkg/a.go:run named":         kindRun,
+		"pkg/a.go:run dup":           kindRun,
+		"pkg/a.go:run paired":        kindRun,
+		"pkg/a.go:run spread":        kindRun,
+		"pkg/a.go:run called":        kindRun,
+		"pkg/a.go:run parened":       kindRun,
+		"pkg/x_test.go:run shadowed": kindRun,
+	} {
+		d, ok := fp.Decls[key]
+		if !ok || d.Kind != kind {
+			t.Errorf("want %s of kind %q, got %+v (present %v) among %v", key, kind, d, ok, keysOf(fp.Decls))
+		}
+	}
+}
+
+// An alias and the local type it names have one method set, so the alias
+// declares the type's name too. A type of another package, a pointer or a
+// predeclared type cannot gain a method through an alias.
+func TestFingerprintAnAliasDeclaresTheLocalTypeItNames(t *testing.T) {
+	t.Parallel()
+
+	fp := fingerprintOfSource(t, map[string]string{"a.go": `package pkg
+
+type box struct{}
+
+type Alias = box
+
+type Ext = other.Box
+
+type Ptr = *box
+
+type Int = int
+
+type Defined box
+`})
+	want := map[string][]string{
+		"pkg/a.go:type box":     {"box"},
+		"pkg/a.go:type Alias":   {"Alias", "box"},
+		"pkg/a.go:type Ext":     {"Ext"},
+		"pkg/a.go:type Ptr":     {"Ptr"},
+		"pkg/a.go:type Int":     {"Int"},
+		"pkg/a.go:type Defined": {"Defined"},
+	}
+	got := map[string][]string{}
+	for key, d := range fp.Decls {
+		got[key] = d.Names
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("type names (-want +got):\n%s", diff)
+	}
+}
+
+// A var initialised by reading another package sees whatever that package
+// held when this one was initialised, which is what an import changing the
+// order of initialisation can move. A constructor's callee, a function
+// literal's body and the package's own names read nothing of that kind.
+func TestFingerprintMarksAVarThatReadsAnotherPackage(t *testing.T) {
+	t.Parallel()
+
+	fp := fingerprintWithNames(t, map[string]string{"a.go": `package pkg
+
+import (
+	"errors"
+	"example.com/reg"
+)
+
+var (
+	snapshot = len(reg.Names)
+	errPlain = errors.New("plain")
+	deferred = func() int { return len(reg.Names) }
+	local    = F
+	plain    int
+)
+
+func F() int {
+	return 1
+}
+`}, map[string]string{"errors": "errors", "example.com/reg": "reg"})
+	got := map[string]bool{}
+	for key, d := range fp.Decls {
+		if d.Kind == kindVar {
+			got[key] = d.Observes
+		}
+	}
+	want := map[string]bool{
+		"pkg/a.go:var snapshot": true,
+		"pkg/a.go:var errPlain": false,
+		"pkg/a.go:var deferred": false,
+		"pkg/a.go:var local":    false,
+		"pkg/a.go:var plain":    false,
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("vars that read another package (-want +got):\n%s", diff)
+	}
+}
+
 // A data subtree that cannot be read is a failure to fingerprint, not a
 // subtree with nothing in it.
 func TestFingerprintOfFailsOnDataItCannotRead(t *testing.T) {

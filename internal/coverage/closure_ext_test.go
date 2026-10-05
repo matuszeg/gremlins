@@ -197,7 +197,9 @@ func TestAChangeOutsideAFunctionBodyReMapsOnlyWhatNamesIt(t *testing.T) {
 			after: files{"calc/consts.go": "package calc\n\n// factor is what Double multiplies by.\nconst factor = 2\n"},
 		},
 		// A constructor known to do nothing but build its value is a plain
-		// named entity, not a call run for every test.
+		// named entity, not a call run for every test: errors.New, and
+		// fmt.Errorf over a literal and an error errors.New made, neither of
+		// which has a method of the package's for it to call.
 		"an error variable": {
 			before: files{
 				"calc/calc.go": calcWith("", "return n*2 + len(errBad.Error())", "return n * 3"),
@@ -324,6 +326,11 @@ func TestAChangeEveryTestCanReachReMapsThePackage(t *testing.T) {
 		"an init removed": {before: files{"calc/init.go": "package calc\n\nfunc init() {}\n"}, after: files{"calc/init.go": "package calc\n"}},
 		"a var initialised by a call": {
 			after: files{"calc/vars.go": "package calc\n\nvar start = compute()\n\nfunc compute() int {\n\treturn 1\n}\n"},
+		},
+		// Errorf formats its operands there and then, and formatting a value
+		// calls its String method.
+		"a var formatting a value with fmt.Errorf": {
+			after: files{"calc/errs.go": "package calc\n\nimport \"fmt\"\n\ntype item struct{}\n\nvar errX = fmt.Errorf(\"%v\", item{})\n"},
 		},
 		"a var initialised by an invoked function literal": {
 			after: files{"calc/vars.go": "package calc\n\nvar start = func() int {\n\treturn 1\n}()\n"},

@@ -102,6 +102,13 @@ type declPrint struct {
 	// Linked says a //go:linkname directive binds the declaration to a symbol
 	// of another package, which is a change no name in this one carries.
 	Linked bool `json:"linked,omitempty"`
+	// Observes says a var's initialiser reads another package, which it does
+	// at initialisation: what it reads then depends on which packages were
+	// initialised before this one, and that order moves when an import is
+	// added or removed anywhere in the binary (see closure.reordered). A call
+	// that runs at initialisation is kindRun instead, which is the same thing
+	// and more.
+	Observes bool `json:"observes,omitempty"`
 	// File is the name the coverage profile uses, not the name on disk, so
 	// that a span can be compared against a profile without translating
 	// either. Empty for a dependency's entities, whose mappings are keys.
@@ -134,6 +141,10 @@ var testFuncPrefixes = []string{"Test", "Fuzz", "Example"}
 // named entity: they build their value and do nothing else, so a variable
 // they initialise is reached only by the code that names it. They are matched
 // by the import path the file binds the selector's package name to.
+//
+// fmt.Errorf is allowed only on terms (see formatsNothing): it formats its
+// operands, and formatting a value calls its String or Error method, which is
+// the package's code running at initialisation.
 var allowedInitCalls = map[string]string{
 	"errors": "New",
 	"fmt":    "Errorf",
@@ -187,6 +198,11 @@ type printSet struct {
 	// declared is every name the package declares at the top level, which is
 	// what says whether `len(x)` is the builtin or a call into the package.
 	declared map[string]bool
+	// stdErrors is, per package name, every var declared once and initialised
+	// by errors.New of a literal: an error whose Error method is the standard
+	// library's, and so one fmt.Errorf can format without running anything of
+	// the package.
+	stdErrors map[string]map[string]bool
 }
 
 // printPackage prints a package directory's files. withTests says whether its
@@ -202,6 +218,7 @@ func (c *Coverage) printPackage(importPath string, files []goFile, withTests boo
 		importPath: importPath,
 		out:        pkgPrint{Decls: map[string]declPrint{}, Imports: map[string]map[string]string{}},
 		declared:   map[string]bool{},
+		stdErrors:  map[string]map[string]bool{},
 	}
 	var kept []*goFile
 	packageNames := map[string]bool{}
@@ -225,6 +242,7 @@ func (c *Coverage) printPackage(importPath string, files []goFile, withTests boo
 			kept = append(kept, f)
 		}
 	}
+	ps.collectStdErrors(kept)
 	for _, f := range kept {
 		ps.printFile(f)
 	}
@@ -260,6 +278,59 @@ func collectDeclared(f *ast.File, into map[string]bool) {
 			}
 		}
 	}
+}
+
+// collectStdErrors finds, per package, the vars initialised as
+// `errors.New("literal")` and declared nowhere else in it.
+func (ps *printSet) collectStdErrors(files []*goFile) {
+	counts := map[string]map[string]int{}
+	for _, f := range files {
+		pkg := f.ast.Name.Name
+		if counts[pkg] == nil {
+			counts[pkg], ps.stdErrors[pkg] = map[string]int{}, map[string]bool{}
+		}
+		names := map[string]bool{}
+		collectDeclared(f.ast, names)
+		for name := range names {
+			counts[pkg][name]++
+		}
+		imports := ps.importTable(f.ast)
+		for _, decl := range f.ast.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, isValue := spec.(*ast.ValueSpec)
+				if isValue && len(vs.Names) == 1 && len(vs.Values) == 1 && isStdError(imports, vs.Values[0]) {
+					ps.stdErrors[pkg][vs.Names[0].Name] = true
+				}
+			}
+		}
+	}
+	for pkg, names := range ps.stdErrors {
+		for name := range names {
+			if counts[pkg][name] != 1 {
+				delete(names, name)
+			}
+		}
+	}
+}
+
+// isStdError reports whether an expression is errors.New of a literal.
+func isStdError(imports map[string]string, expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || call.Ellipsis.IsValid() {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	pkg, ok := sel.X.(*ast.Ident)
+	_, literal := call.Args[0].(*ast.BasicLit)
+
+	return ok && literal && sel.Sel.Name == "New" && imports[pkg.Name] == "errors"
 }
 
 // fileTokens is a file's tokens, scanned once.
@@ -407,20 +478,38 @@ func (ps *printSet) printImports(st *fileState) bool {
 		switch {
 		case imp.Name != nil && (imp.Name.Name == "_" || imp.Name.Name == "."):
 			ps.whole = append(ps.whole, "import\x00"+st.f.name+"\x00"+imp.Name.Name+"\x00"+path)
-		case imp.Name != nil:
-			st.imports[imp.Name.Name] = path
-		case path == "C":
+		case path == "C" && imp.Name == nil:
 			cgo = true
+		}
+	}
+	st.imports = ps.importTable(st.f.ast)
+
+	return cgo
+}
+
+// importTable is the names a file's imports bind, each to its path: under its
+// own name when it has one, under the imported package's name when the build
+// listing said what it is, and under "?" and its path when it did not. Blank,
+// dot and cgo imports bind no name to follow.
+func (ps *printSet) importTable(f *ast.File) map[string]string {
+	out := map[string]string{}
+	for _, imp := range f.Imports {
+		path, _ := strconv.Unquote(imp.Path.Value)
+		switch {
+		case imp.Name != nil && (imp.Name.Name == "_" || imp.Name.Name == "."):
+		case imp.Name != nil:
+			out[imp.Name.Name] = path
+		case path == "C":
 		default:
 			if name, ok := ps.c.pkgNames[path]; ok {
-				st.imports[name] = path
+				out[name] = path
 			} else {
-				st.imports["?"+path] = path
+				out["?"+path] = path
 			}
 		}
 	}
 
-	return cgo
+	return out
 }
 
 func (ps *printSet) printFunc(st *fileState, fn *ast.FuncDecl) {
@@ -495,7 +584,19 @@ func (ps *printSet) printGen(st *fileState, gd *ast.GenDecl) {
 		switch s := spec.(type) {
 		case *ast.TypeSpec:
 			from, to, doc := specRange(gd, s, s.Doc)
-			ps.printSpec(st, from, to, doc, kindType, []string{s.Name.Name}, identsOf(s))
+			key := ps.printSpec(st, from, to, doc, kindType, []string{s.Name.Name}, identsOf(s))
+			// An alias and the type it names are one type, with one method
+			// set: a method declared through either is a method of both, and
+			// code that names only the other reaches it. So an alias's change
+			// is a change to the type it stands for too. Only a type of this
+			// package can gain a method through an alias, so only its name is
+			// added; the other direction needs nothing of its own, here or
+			// across packages, because the alias's header names the type.
+			if base, local := s.Type.(*ast.Ident); s.Assign.IsValid() && local && ps.declared[base.Name] {
+				d := ps.out.Decls[key]
+				d.Names = append(d.Names, base.Name)
+				ps.out.Decls[key] = d
+			}
 		case *ast.ValueSpec:
 			from, to, doc := specRange(gd, s, s.Doc)
 			kind := kindConst
@@ -514,14 +615,19 @@ func (ps *printSet) printGen(st *fileState, gd *ast.GenDecl) {
 			if len(names) == 0 && kind != kindRun {
 				kind = kindBlank
 			}
-			ps.printSpec(st, from, to, doc, kind, names, identsOf(s))
+			key := ps.printSpec(st, from, to, doc, kind, names, identsOf(s))
+			if kind == kindVar && ps.readsImports(st, s) {
+				d := ps.out.Decls[key]
+				d.Observes = true
+				ps.out.Decls[key] = d
+			}
 		}
 	}
 }
 
 func (ps *printSet) printSpec(st *fileState, from, to, doc token.Pos, kind string,
 	names []string, idents map[string]bool,
-) {
+) string {
 	st.covered = append(st.covered, [2]token.Pos{doc, to})
 	base := st.f.fset.Position(from).Line
 	d := declPrint{
@@ -538,7 +644,8 @@ func (ps *printSet) printSpec(st *fileState, from, to, doc token.Pos, kind strin
 	if kind == kindRun && len(names) == 0 {
 		key = kindRun + " _"
 	}
-	ps.add(st, key, d)
+
+	return ps.add(st, key, d)
 }
 
 // add files an entity under its key. A key that is not unique in its file —
@@ -546,7 +653,9 @@ func (ps *printSet) printSpec(st *fileState, from, to, doc token.Pos, kind strin
 // order instead. Numbering pairs nothing reliably, which is why every kind
 // that can share a key is one whose change re-maps the package whatever it
 // is paired with.
-func (ps *printSet) add(st *fileState, key string, d declPrint) {
+//
+// It returns the key it filed the entity under.
+func (ps *printSet) add(st *fileState, key string, d declPrint) string {
 	d.File = st.profile
 	full := st.profile + ":" + key
 	n := st.ordinals[key]
@@ -563,6 +672,8 @@ func (ps *printSet) add(st *fileState, key string, d declPrint) {
 		d.header = d.text
 	}
 	ps.out.Decls[full] = d
+
+	return full
 }
 
 // runsAtInit reports whether a var spec's initialiser calls something when
@@ -578,7 +689,7 @@ func (ps *printSet) runsAtInit(st *fileState, s *ast.ValueSpec) bool {
 			case *ast.FuncLit:
 				return false
 			case *ast.CallExpr:
-				if !ps.pureCall(st, n.Fun) {
+				if !ps.pureCall(st, n.Fun) || !ps.formatsNothing(st, n) {
 					runs = true
 
 					return false
@@ -624,6 +735,71 @@ func (ps *printSet) pureCall(st *fileState, fun ast.Expr) bool {
 	}
 
 	return false
+}
+
+// formatsNothing reports whether a call, if it is fmt.Errorf, formats only
+// what runs nothing of the package: a literal, or an error errors.New made of
+// one (see printSet.stdErrors). Any other operand can have a String or Error
+// method, and Errorf calls it there and then. A call to anything else formats
+// nothing.
+//
+// It is asked only of a callee pureCall allowed, so a selector here is an
+// allowlisted constructor of an imported package; the callee is unwrapped as
+// pureCall unwraps it, or `(fmt.Errorf)(...)` would pass as no Errorf at all.
+func (ps *printSet) formatsNothing(st *fileState, call *ast.CallExpr) bool {
+	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return true
+	}
+	if pkg, isIdent := sel.X.(*ast.Ident); !isIdent || st.imports[pkg.Name] != "fmt" || sel.Sel.Name != "Errorf" {
+		return true
+	}
+	if call.Ellipsis.IsValid() {
+		return false
+	}
+	for _, arg := range call.Args {
+		switch a := arg.(type) {
+		case *ast.BasicLit:
+		case *ast.Ident:
+			if !ps.stdErrors[st.f.ast.Name.Name][a.Name] {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+// readsImports reports whether a var's initialiser reads another package's
+// state: a selector on an imported package's name anywhere outside a function
+// literal, other than the callee of an allowlisted constructor.
+func (ps *printSet) readsImports(st *fileState, s *ast.ValueSpec) bool {
+	callees := map[ast.Expr]bool{}
+	reads := false
+	for _, v := range s.Values {
+		ast.Inspect(v, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.FuncLit:
+				return false
+			case *ast.CallExpr:
+				if ps.pureCall(st, n.Fun) {
+					callees[n.Fun] = true
+				}
+			case *ast.SelectorExpr:
+				if pkg, ok := n.X.(*ast.Ident); ok && !callees[n] {
+					if _, bound := st.imports[pkg.Name]; bound {
+						reads = true
+					}
+				}
+			}
+
+			return !reads
+		})
+	}
+
+	return reads
 }
 
 func linked(directives []string) bool {
