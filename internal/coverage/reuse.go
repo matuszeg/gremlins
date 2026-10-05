@@ -223,8 +223,10 @@ func (cl *closure) add(was, now pkgPrint) *pkgDelta {
 		// A dependency's entities carry no file, so its keys, which start
 		// with one, are what names it.
 		file := key[:strings.LastIndex(key, ":")]
-		textChanged := !had || !has || before.Hash != after.Hash || before.Kind != after.Kind ||
-			before.Linked != after.Linked
+		// The key carries what kind of entity it is — a var that starts
+		// calling something at initialisation is another key — and a
+		// directive is in the print, so the hash is all there is to compare.
+		textChanged := !had || !has || before.Hash != after.Hash
 		r := rebound[file]
 		reboundText := has && r.reaches(after.text)
 		if !textChanged && !reboundText {
