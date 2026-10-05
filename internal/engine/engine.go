@@ -213,7 +213,7 @@ func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.F
 		return
 	}
 
-	pkg := mu.pkgName(fileName, file.Name.Name)
+	pkg := mu.pkgName(fileName)
 	position := set.Position(node.TokPos)
 	// The token is read once, before the first of its mutants is handed out:
 	// the mutants share the node, and a worker applying one rewrites it.
@@ -254,26 +254,19 @@ func (mu *Engine) viable(position token.Position, tok token.Token, mt mutator.Ty
 	return mu.viability.Viable(position, mutated)
 }
 
-func (mu *Engine) pkgName(fileName, fPkg string) string {
-	var pkg string
-	fn := fmt.Sprintf("%s/%s", mu.module.CallingDir, fileName)
-	p := filepath.Dir(fn)
-	for {
-		if strings.HasSuffix(p, fPkg) {
-			pkg = fmt.Sprintf("%s/%s", mu.module.Name, p)
-
-			break
-		}
-		d := filepath.Dir(p)
-		if d == p {
-			pkg = mu.module.Name
-
-			break
-		}
-		p = d
+// pkgName is the import path of the package fileName (relative to the calling directory)
+// belongs to: the module name plus the file's directory relative to the module root. The
+// package clause is not consulted, because an import path never depends on the package name:
+// walking up the directories for one ending in the package name sent every `package main`
+// (and every package named unlike its directory) to the module root, whose tests then ran in
+// place of the mutated package's and reported each mutant as killed.
+func (mu *Engine) pkgName(fileName string) string {
+	dir := filepath.Dir(filepath.Join(mu.module.CallingDir, fileName))
+	if dir == "." {
+		return mu.module.Name
 	}
 
-	return normalisePkgPath(pkg)
+	return normalisePkgPath(mu.module.Name + "/" + dir)
 }
 
 func normalisePkgPath(pkg string) string {

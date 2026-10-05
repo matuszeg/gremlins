@@ -755,7 +755,17 @@ func TestPackageDiscovery(t *testing.T) {
 			name:     "from subpackage, normal mode",
 			fromPkg:  "testdata/main/fixture",
 			intMode:  false,
-			wantPath: "example.com/testdata/main",
+			wantPath: "example.com/testdata/main/fixture",
+		},
+		{
+			// The fixture is `package main`: the import path is still the file's directory.
+			// loadFixture places it at the module root (testdata/ is skipped since #291), so
+			// that directory is the calling one. The walk-up this replaced answered
+			// "example.com" here and "example.com/testdata/main" for the case above.
+			name:     "a main package under cmd",
+			fromPkg:  "cmd/app",
+			intMode:  false,
+			wantPath: "example.com/cmd/app",
 		},
 	}
 	for _, tc := range testCases {
