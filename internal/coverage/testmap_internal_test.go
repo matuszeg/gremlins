@@ -494,6 +494,69 @@ func TestBuildInputsChangeWithTheCompileFlags(t *testing.T) {
 	}
 }
 
+// Which packages the binary links, the standard library's included, and the
+// go.mod of every main module it links a package of are part of what it is
+// built from: a newly linked package's initialisation runs in every test, and
+// a member's go and godebug lines change what its unchanged source does.
+func TestBuildInputsChangeWithWhatIsLinked(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	member := filepath.Join(root, "member", "go.mod")
+	vendored := filepath.Join(root, "vendored", "go.mod")
+	for _, path := range []string{member, vendored} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("cannot create the directory: %v", err)
+		}
+	}
+	inputsWith := func(memberMod, vendoredMod string, extra ...string) string {
+		t.Helper()
+
+		if err := os.WriteFile(member, []byte(memberMod), 0o600); err != nil {
+			t.Fatalf("cannot write the go.mod: %v", err)
+		}
+		if err := os.WriteFile(vendored, []byte(vendoredMod), 0o600); err != nil {
+			t.Fatalf("cannot write the go.mod: %v", err)
+		}
+		listing := strings.Join(append([]string{
+			"example.com/p\t" + root + "\ttrue\tp\t" + filepath.Join(root, "go.mod"),
+			"example.com/member/m\t" + filepath.Dir(member) + "\ttrue\tm\t" + member,
+			"example.org/vendored\t" + filepath.Dir(vendored) + "\tfalse\tvendored\t" + vendored,
+			"testing\t/nonexistent/goroot/src/testing\t\ttesting\t",
+			// The synthesised test main has no directory, and is linked.
+			"example.com/p.test\t\t\tmain\t",
+		}, extra...), "\n")
+		c := &Coverage{
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture", root: "/nonexistent/goroot"},
+			cmdContext: func(string, ...string) *exec.Cmd {
+				return exec.Command("printf", "%s\n", listing) //nolint:gosec // a fixed program, given the test's own listing
+			},
+			// The vendored directory is hashed whole; only its go.mod is
+			// of interest here, and it is the same file either way.
+			dirHashes: map[string]string{filepath.Dir(vendored): "vendored"},
+		}
+		sum, ok := c.buildInputsOf(&testPackage{importPath: "example.com/p", dir: root})
+		if !ok {
+			t.Fatal("buildInputsOf() failed")
+		}
+
+		return sum
+	}
+
+	plain := inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n")
+	if diff := cmp.Diff(plain, inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n\ngo 1.25\n")); diff != "" {
+		t.Errorf("want a go.mod outside every main module left to go.sum, got the inputs moved:\n%s", diff)
+	}
+	if inputsWith("module example.com/member\n\ngo 1.22\n\ngodebug panicnil=1\n", "module example.org/vendored\n") == plain {
+		t.Error("want a workspace member's go.mod to change the inputs")
+	}
+	if inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n",
+		"crypto/md5\t/nonexistent/goroot/src/crypto/md5\t\tmd5\t") == plain {
+		t.Error("want a newly linked standard-library package to change the inputs")
+	}
+}
+
 func TestTestBuildFlags(t *testing.T) {
 	t.Parallel()
 

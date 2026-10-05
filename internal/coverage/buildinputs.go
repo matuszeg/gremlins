@@ -26,9 +26,9 @@ import (
 
 // buildInputsOf hashes everything the package's test binary is built from
 // except the package itself and the dependencies it instruments: the source of
-// every other dependency somebody could edit, the module's requirements, the
-// toolchain, the build environment, and the flags Gremlins compiles the binary
-// with.
+// every other dependency somebody could edit, the module's requirements and
+// every main module's go.mod, the set of packages linked, the toolchain, the
+// build environment, and the flags Gremlins compiles the binary with.
 //
 // Per-test invalidation needs this, and the build ID cannot supply it. The
 // build ID folds the package's own source together with every dependency's, so
@@ -82,8 +82,8 @@ func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	deps, ok := c.dependencyDirs(pkg)
-	if !ok {
+	listing := c.listingOf(pkg)
+	if !listing.ok {
 		return "", false
 	}
 	root := c.absRoot()
@@ -100,7 +100,19 @@ func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 	} {
 		parts = append(parts, f.name+"\x00"+hashFileOrAbsent(f.path))
 	}
-	for _, dep := range deps {
+	// Every main module's go.mod, the workspace members' as well as the
+	// module's own: its go and godebug lines change what the toolchain does
+	// with source that did not change.
+	for _, goMod := range listing.goMods {
+		parts = append(parts, "gomod\x00"+relativeTo(root, goMod)+"\x00"+hashFileOrAbsent(goMod))
+	}
+	// Which packages are linked at all, the standard library and the module
+	// cache included. A package's initialisation runs in every test, so one
+	// newly linked — crypto/md5 registering MD5 with crypto — changes what
+	// code nobody edited does, and no name of it appears anywhere the
+	// closure reads.
+	parts = append(parts, "linked\x00"+strings.Join(listing.linked, "\x00"))
+	for _, dep := range listing.deps {
 		if dep.instrumented {
 			continue
 		}
@@ -188,17 +200,24 @@ type dependency struct {
 // three must agree.
 type depListing struct {
 	deps []dependency
-	ok   bool
+	// linked is the import path of every package the test binary links,
+	// sorted, whichever directory it lives in.
+	linked []string
+	// goMods is the go.mod of every main module the binary links a package
+	// of, sorted.
+	goMods []string
+	ok     bool
 }
 
 // depListFormat asks for each dependency's import path, its directory,
-// whether its module is a main module, and its package name. A package of the
-// standard library has no module and reports an empty third field.
+// whether its module is a main module, its package name, and its module's
+// go.mod. A package of the standard library has no module and reports an
+// empty third and fifth field.
 //
 // The name is what an unnamed import binds in the importing file, which a path
 // does not say: the file's import table is compared by local name (see
 // pkgPrint.Imports).
-const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end}}\t{{.Name}}"
+const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end}}\t{{.Name}}\t{{with .Module}}{{.GoMod}}{{end}}"
 
 // dependencyDirs is where the source of everything this package's tests link
 // lives, minus the package's own directory and minus what the toolchain and the
@@ -221,27 +240,34 @@ const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end
 // narrower test than "inside the module root": a nested module under the root,
 // required through a replace, is not a main module and stays in Inputs.
 func (c *Coverage) dependencyDirs(pkg *testPackage) ([]dependency, bool) {
+	listing := c.listingOf(pkg)
+
+	return listing.deps, listing.ok
+}
+
+// listingOf is the package's dependency listing, asked for once per run.
+func (c *Coverage) listingOf(pkg *testPackage) depListing {
 	if listing, done := c.depListings[pkg.importPath]; done {
-		return listing.deps, listing.ok
+		return listing
 	}
-	deps, ok := c.listDependencies(pkg)
+	listing := c.listDependencies(pkg)
 	if c.depListings == nil {
 		c.depListings = map[string]depListing{}
 	}
-	c.depListings[pkg.importPath] = depListing{deps: deps, ok: ok}
+	c.depListings[pkg.importPath] = listing
 
-	return deps, ok
+	return listing
 }
 
-func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
+func (c *Coverage) listDependencies(pkg *testPackage) depListing {
 	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", depListFormat, pkg.importPath).CombinedOutput()
 	if err != nil {
-		return nil, false
+		return depListing{}
 	}
 
 	env, ok := c.goEnv()
 	if !ok {
-		return nil, false
+		return depListing{}
 	}
 	own, err := filepath.Abs(pkg.dir)
 	if err != nil {
@@ -250,23 +276,34 @@ func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
 	root := c.absRoot()
 
 	seen := map[string]struct{}{}
+	linked, goMods := map[string]bool{}, map[string]bool{}
 	var deps []dependency
 	if c.pkgNames == nil {
 		c.pkgNames = map[string]string{}
 	}
 	for _, line := range strings.Split(string(out), "\n") {
-		importPath, rest, _ := strings.Cut(line, "\t")
-		dir, rest, _ := strings.Cut(rest, "\t")
-		main, name, _ := strings.Cut(rest, "\t")
-		dir = strings.TrimSpace(dir)
-		importPath = strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
+		fields := strings.Split(line, "\t")
+		// `go list` writes build diagnostics to the same stream, and none of
+		// them has the listing's shape.
+		if len(fields) < 2 {
+			continue
+		}
+		fields = append(fields, "", "", "")
+		importPath := strings.TrimSpace(strings.SplitN(fields[0], " [", 2)[0])
+		dir := strings.TrimSpace(fields[1])
+		main := strings.TrimSpace(fields[2]) == "true"
+		if importPath != "" {
+			linked[importPath] = true
+		}
 		// Every package's name is recorded, the toolchain's and the module
 		// cache's too: a file can import any of them without a name.
-		if name = strings.TrimSpace(name); name != "" && importPath != "" {
+		if name := strings.TrimSpace(fields[3]); name != "" && importPath != "" {
 			c.pkgNames[importPath] = name
 		}
-		// `go list` writes build diagnostics to the same stream, and a
-		// synthesised test package can report no directory at all.
+		if goMod := strings.TrimSpace(fields[4]); main && goMod != "" {
+			goMods[goMod] = true
+		}
+		// A synthesised test package can report no directory at all.
 		if dir == "" || !filepath.IsAbs(dir) {
 			continue
 		}
@@ -281,14 +318,21 @@ func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
 		if under(dir, root) {
 			label = "dir\x00" + relativeTo(root, dir)
 		}
-		deps = append(deps, dependency{
-			name: label, dir: dir, importPath: importPath,
-			instrumented: strings.TrimSpace(main) == "true",
-		})
+		deps = append(deps, dependency{name: label, dir: dir, importPath: importPath, instrumented: main})
 	}
 	sort.Slice(deps, func(i, j int) bool { return deps[i].name < deps[j].name })
 
-	return deps, true
+	return depListing{deps: deps, linked: sortedKeys(linked), goMods: sortedKeys(goMods), ok: true}
+}
+
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+
+	return out
 }
 
 // hashDir hashes every regular file of a dependency's directory, by name and
