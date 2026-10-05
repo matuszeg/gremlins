@@ -692,3 +692,36 @@ func TestDifferentialTestMain(t *testing.T) {
 		},
 	})
 }
+
+// A method is a change to its receiver type, not to every call of a method
+// so spelled: what reaches it is whatever names the type.
+func TestDifferentialMethods(t *testing.T) {
+	rec := "package calc\n\nimport \"testing\"\n\ntype rec struct {\n\ttesting.TB\n}\n\n" +
+		"func TestRec(t *testing.T) {\n\tr := &rec{TB: t}\n\tr.Logf(\"%d\", Double(1))\n}\n"
+	box := "package calc\n\ntype box struct{}\n\nfunc mk() any {\n\treturn box{}\n}\n"
+	boxTests := "package calc\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n)\n\nfunc mkT() any {\n\treturn box{}\n}\n\n" +
+		"func TestDouble(t *testing.T) {\n\t_ = Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = Triple(len(fmt.Sprint(mkT())))\n}\n\n" +
+		"func TestPlain(t *testing.T) {\n\tt.Logf(\"%d\", Triple(1))\n}\n"
+	runDifferential(t, map[string]diffCase{
+		"a test type gaining a method every test calls by that name": {
+			before: map[string]string{
+				"calc/calc_test.go": "package calc\n\nimport \"testing\"\n\n" +
+					"func TestDouble(t *testing.T) {\n\tt.Logf(\"%d\", Double(2))\n}\n\nfunc TestTriple(t *testing.T) {\n\tt.Logf(\"%d\", Triple(2))\n}\n",
+				"calc/rec_test.go": rec,
+			},
+			after:    map[string]string{"calc/rec_test.go": rec + "\nfunc (r *rec) Logf(format string, args ...any) {}\n"},
+			remapped: []string{"TestRec"},
+		},
+		// Double reaches a box only through mk, a body it executes, and
+		// TestTriple only through mkT, a helper it calls; neither names box.
+		"a method a value reaches through code that names its type": {
+			before: map[string]string{
+				"calc/calc.go":      diffCalc("\nimport \"fmt\"\n", "return n*2 + len(fmt.Sprint(mk()))", "return n * 3"),
+				"calc/box.go":       box,
+				"calc/calc_test.go": boxTests,
+			},
+			after:    map[string]string{"calc/box.go": box + "\nfunc (box) String() string {\n\treturn \"box\"\n}\n"},
+			remapped: []string{"TestDouble", "TestTriple"},
+		},
+	})
+}

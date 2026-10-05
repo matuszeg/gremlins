@@ -30,6 +30,7 @@ import (
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
+// Version 10 names a method by its receiver type alone.
 // Version 9 records what each print's package reaches by import, which is
 // what moves the order packages are initialised in, in place of comparing
 // each file's imports; and prints TestMain as its own kind, which does not
@@ -57,7 +58,7 @@ import (
 // file per package. Version 1 was one file per module, which meant a run had
 // to write back every package it had not looked at or lose them — and a
 // scoped run, which is the recommended workflow, looks at one.
-const cacheVersion = 9
+const cacheVersion = 10
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
