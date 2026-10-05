@@ -17,11 +17,14 @@
 package coverage
 
 import (
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"golang.org/x/tools/go/packages"
 
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 )
@@ -102,5 +105,39 @@ func TestSameInitOrderComparesWhatBothInitialise(t *testing.T) {
 					tc.was, tc.now, first, second, swapped, tc.first, tc.second, !agree)
 			}
 		})
+	}
+}
+
+// A package the import listing did not return, or returned without its
+// external tests, has no place in the order to compare, and so no facts.
+func TestFactsOfLeavesOutWhatTheListingMissed(t *testing.T) {
+	t.Parallel()
+
+	typed := func() *packages.Package {
+		return &packages.Package{TypesInfo: &types.Info{}, Fset: token.NewFileSet()}
+	}
+	listed := &packages.Package{Imports: map[string]*packages.Package{"fmt": {ID: "fmt"}}}
+	got := factsOf(map[string]*variants{
+		"m/whole":    {plain: typed(), xtest: typed()},
+		"m/unlisted": {plain: typed()},
+		"m/noxtest":  {plain: typed(), xtest: typed()},
+	}, map[string]*variants{
+		"m/whole":   {plain: listed, xtest: listed},
+		"m/noxtest": {plain: listed},
+	}, true)
+
+	want := map[string]typeFacts{"m/whole": {reach: hashOf([]byte("fmt\x00xtest\x00fmt"))}}
+	if diff := cmp.Diff(want, got, cmp.AllowUnexported(typeFacts{})); diff != "" {
+		t.Errorf("unexpected facts (-want +got):\n%s", diff)
+	}
+}
+
+// A load that cannot run says nothing about any package.
+func TestLoadTypesFromSourceSaysNothingWhenTheLoadFails(t *testing.T) {
+	t.Parallel()
+
+	c := &Coverage{mod: gomodule.GoModule{Name: "example.com/m", Root: filepath.Join(t.TempDir(), "missing")}}
+	if got := c.loadTypesFromSource(true, []string{"example.com/m/p"}); got != nil {
+		t.Errorf("want no facts, got %v", got)
 	}
 }

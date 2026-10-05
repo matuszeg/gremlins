@@ -126,30 +126,41 @@ func (c *Coverage) loadTypes(tests bool, importPaths []string) {
 // imports: asking the first for dependencies would type-check every one of
 // them from source.
 func (c *Coverage) loadTypesFromSource(tests bool, importPaths []string) map[string]typeFacts {
-	found, ok := c.loadVariants(packages.NeedName|packages.NeedSyntax|packages.NeedTypes|packages.NeedTypesInfo,
-		tests, importPaths)
-	if !ok {
-		return nil
+	var loads []map[string]*variants
+	for _, mode := range []packages.LoadMode{
+		packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+		packages.NeedName | packages.NeedImports | packages.NeedDeps,
+	} {
+		found, ok := c.loadVariants(mode, tests, importPaths)
+		if !ok {
+			return nil
+		}
+		loads = append(loads, found)
 	}
-	graph, ok := c.loadVariants(packages.NeedName|packages.NeedImports|packages.NeedDeps, tests, importPaths)
-	if !ok {
-		return nil
-	}
+
+	return factsOf(loads[0], loads[1], tests)
+}
+
+// factsOf reads each package's facts off its type-checked variants and the
+// same variants as the import listing returned them. A package either says
+// nothing about is left out.
+func factsOf(typed, graph map[string]*variants, tests bool) map[string]typeFacts {
 	out := map[string]typeFacts{}
-	for path, v := range found {
-		linked, inGraph := v.linked(tests), graph[path].linked(tests)
-		order, ok := initOrderOf(linked, "")
+	for path, v := range typed {
+		g := graph[path]
+		order, ok := initOrderOf(v.linked(tests), "")
+		inGraph := g.linked(tests)
 		if !ok || inGraph == nil {
 			continue
 		}
 		reach := []string{strings.Join(importClosure(inGraph), "\x00")}
 		if tests && v.xtest != nil {
 			more, xok := initOrderOf(v.xtest, xtestPrefix)
-			if !xok || graph[path].xtest == nil {
+			if !xok || g.xtest == nil {
 				continue
 			}
 			order = append(order, more...)
-			reach = append(reach, strings.Join(importClosure(graph[path].xtest), "\x00"))
+			reach = append(reach, strings.Join(importClosure(g.xtest), "\x00"))
 		}
 		out[path] = typeFacts{initOrder: order, reach: hashOf([]byte(strings.Join(reach, "\x00xtest\x00")))}
 	}
