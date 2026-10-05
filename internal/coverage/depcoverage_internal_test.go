@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"golang.org/x/tools/cover"
 
 	"github.com/go-gremlins/gremlins/internal/gomodule"
@@ -101,8 +102,8 @@ func TestSplitCoverageKeepsDependenciesOutOfTheProfile(t *testing.T) {
 		block("example.com/p/p.go", 3, 5),
 		block("example.com/dep/dep.go", 4, 6),
 		block("example.com/dep/dep.go", 6, 8),
-		// Inside the package-level function literal: in the shell, so any
-		// change to it re-maps the package whatever the profile says.
+		// Inside the package-level function literal: the var holding it is
+		// the entity a change to it is attributed to.
 		block("example.com/dep/dep.go", 11, 13),
 		// Instrumented and never executed: no part of what the test reached,
 		// though a block of a name it cannot place would otherwise record the
@@ -116,8 +117,8 @@ func TestSplitCoverageKeepsDependenciesOutOfTheProfile(t *testing.T) {
 	if diff := cmp.Diff(wantProfile, got.profile); diff != "" {
 		t.Errorf("the profile holds more than the package's own lines (-want +got):\n%s", diff)
 	}
-	if diff := cmp.Diff([]string{"dep/dep.go:Clamp"}, got.deps); diff != "" {
-		t.Errorf("want each dependency function once, by key (-want +got):\n%s", diff)
+	if diff := cmp.Diff([]string{"dep/dep.go:Clamp", "dep/dep.go:var double"}, got.deps); diff != "" {
+		t.Errorf("want each dependency entity once, by key (-want +got):\n%s", diff)
 	}
 	if !got.attributable {
 		t.Error("want every block attributed")
@@ -145,6 +146,12 @@ func TestSplitCoverageRecordsAnUnattributableDependencyAsAWhole(t *testing.T) {
 		"an unknown file": {
 			files: map[string]string{"dep.go": depSourceText},
 			block: block("example.com/dep/gen.y", 100, 101),
+		},
+		// A block of a Go file of it that no entity holds: the profile and
+		// the print disagree, and no one key can stand for it.
+		"a block outside every entity": {
+			files: map[string]string{"dep.go": depSourceText},
+			block: block("example.com/dep/dep.go", 15, 16),
 		},
 	}
 
@@ -213,21 +220,34 @@ func TestSplitCoverageLeavesACrossPackageProfileWhole(t *testing.T) {
 }
 
 // A dependency's test files are never linked into another package's test
-// binary, so its Test functions are no part of what narrowing compares; a
-// declaration's signature is printed apart from its body, because only a body
-// change is attributable to the tests that executed it.
+// binary, so nothing in them — tests, helpers, an init — is part of what
+// narrowing compares, and a change to one moves nothing; a declaration's
+// signature is printed apart from its body, because only a body change is
+// attributable to the tests that executed it.
 func TestDepSourceDescribesWhatAnotherPackageLinks(t *testing.T) {
 	t.Parallel()
 
 	c := newDepCoverage()
 	src := writeDep(t, c, map[string]string{"dep.go": depSourceText, "dep_test.go": depTestText})
 	for key := range src.stored.Decls {
-		if strings.HasPrefix(key, "test:") {
-			t.Errorf("want no test declarations in a dependency's print, got %s", key)
+		if strings.Contains(key, "_test.go") {
+			t.Errorf("want nothing of a test file in a dependency's print, got %s", key)
 		}
 	}
 	if _, ok := src.stored.Decls["dep/dep.go:Clamp"]; !ok {
 		t.Errorf("want Clamp described, got %v", src.stored.Decls)
+	}
+	// The stored print has no positions: a dependency's mappings are keys.
+	if d := src.stored.Decls["dep/dep.go:Clamp"]; d.File != "" || d.Start != 0 || d.End != 0 {
+		t.Errorf("want no positions stored for a dependency, got %+v", d)
+	}
+	testsChanged := writeDep(t, newDepCoverage(), map[string]string{
+		"dep.go":        depSourceText,
+		"dep_test.go":   "package dep\n\nimport \"testing\"\n\nfunc init() {}\n\nfunc TestMain(m *testing.M) {\n\tm.Run()\n}\n",
+		"other_test.go": "package dep\n\nvar Exported = Clamp\n",
+	})
+	if diff := cmp.Diff(src.stored, testsChanged.stored, cmpopts.IgnoreUnexported(declPrint{})); diff != "" {
+		t.Errorf("want a dependency's test files to move nothing (-want +got):\n%s", diff)
 	}
 
 	bodyChanged := writeDep(t, newDepCoverage(), map[string]string{

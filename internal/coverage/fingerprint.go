@@ -36,45 +36,19 @@ import (
 // is by definition the package that was changed, so that is the case that
 // always happens rather than the rare one.
 //
-// The fingerprint splits the package into the two things a diff can treat
-// differently: the declarations whose change can be attributed to particular
-// mappings, and everything else — imports, constants, package-level variables,
-// types, struct tags, test helpers, non-Go files — whose change cannot, and so
-// dirties the whole package.
+// It is the package's own print (see pkgPrint) — every entity of the package
+// and its test files, and the remainder hashed whole — plus one print per
+// instrumented dependency, and Inputs for everything else the binary is built
+// from. reusable reads two of them to decide which mappings a change reached.
 type fingerprint struct {
-	// Decls is every declaration whose change can be attributed, with the span
-	// it occupied when the map was made. The span is in that run's coordinates
-	// on purpose: the profiles it will be compared against are too.
-	Decls map[string]declPrint `json:"decls"`
-
-	// Shell is one hash over everything else, across every file of the
-	// package's directory. A change to any of it dirties the whole package: a
-	// `const timeout = 5` becoming `10` changes a line no coverage block
-	// contains, while the tests that execute the use site do change behaviour.
-	//
-	// It is built so that adding, removing or moving a function does not move
-	// it — declarations are cut out rather than blanked, and the whitespace
-	// they leave behind is dropped.
-	Shell string `json:"shell"`
-
-	// Others is, per file, the source order of the declarations the shell
-	// holds: package-level vars whose initialiser is a function literal, and
-	// declarations left in the shell because two of them claimed one key. Their
-	// lines are instrumented like any others, so a profile can hold them, and
-	// then knowing where they have moved to is the difference between keeping
-	// that mapping and re-making the whole package.
-	//
-	// They are matched between two fingerprints by position, which is sound
-	// exactly when the shell agrees: identical shell text means an identical
-	// sequence of them, in the same order, differing only in where the
-	// declarations around them have pushed them to.
-	Others map[string][]declPrint `json:"others,omitempty"`
+	pkgPrint
 
 	// Inputs is everything the test binary is built from except this package
-	// and the dependencies in Deps: see buildInputsOf, which fills it in. Without it a moved build ID could
-	// never be told apart from a moved dependency, and narrowing would keep
-	// stale mappings. With it, a moved build ID under an unchanged fingerprint
-	// (Deps included) and unchanged Inputs is a moved checkout, and the whole map is kept.
+	// and the dependencies in Deps: see buildInputsOf, which fills it in.
+	// Without it a moved build ID could never be told apart from a moved
+	// dependency, and narrowing would keep stale mappings. With it, a moved
+	// build ID under an unchanged fingerprint (Deps included) and unchanged
+	// Inputs is a moved checkout, and the whole map is kept.
 	//
 	// It is not read off the filesystem like the rest, so fingerprintOf leaves
 	// it empty and the caller sets it — which is also what makes a fingerprint
@@ -83,53 +57,13 @@ type fingerprint struct {
 
 	// Deps is every dependency the test binary instruments besides this
 	// package, by import path: the packages of every main module it links (see
-	// dependencyDirs). Their lines are recorded per test, as the functions it
-	// executed there, so a dependency is fingerprinted like the package rather
-	// than hashed into Inputs — which is what lets a changed function body in
-	// one dirty only the tests that executed it.
-	Deps map[string]depPrint `json:"deps,omitempty"`
+	// dependencyDirs). Their lines are recorded per test, as the entities it
+	// executed there, so a dependency is printed like the package rather than
+	// hashed into Inputs — which is what lets a change in one dirty only the
+	// tests it can reach. A dependency's test files are not part of its print:
+	// they are never linked into this package's test binary.
+	Deps map[string]pkgPrint `json:"deps,omitempty"`
 }
-
-// The kinds of declaration whose effect reaches past the lines it occupies.
-const (
-	// kindInit is an init function. It runs before every test in the binary, so
-	// any change to one dirties the whole package rather than a line range.
-	kindInit = "init"
-	// kindMethod is a method. Changing its body reaches only its own lines, but
-	// adding or removing one changes which interfaces the receiver satisfies,
-	// which can redirect a type switch in code that did not itself change.
-	kindMethod = "method"
-)
-
-// declPrint is one declaration: what it said, and where it was.
-type declPrint struct {
-	Hash string `json:"hash"`
-	// Sig is the declaration without its body: doc comment, receiver, name,
-	// type parameters and signature. A dependency's function whose body alone
-	// changed reaches only the tests that executed it; one whose signature
-	// changed can rebind a call site that did not change — a handler passed as
-	// a value and reflected over — so the two are told apart. The package's
-	// own declarations carry it too, unread for now.
-	Sig string `json:"sig,omitempty"`
-	// File is the name the coverage profile uses, not the name on disk, so that
-	// a span can be compared against a profile without translating either.
-	File string `json:"file"`
-	// Test is the name `go test` runs this declaration under, when it is a test
-	// rather than package code. Coverage does not instrument test files, so a
-	// test's own lines appear in no profile and a change to one is attributed
-	// by name instead of by span.
-	Test string `json:"test,omitempty"`
-	Kind string `json:"kind,omitempty"`
-
-	Start int `json:"start"`
-	End   int `json:"end"`
-}
-
-// testFuncPrefixes are the declarations `go test` runs on their own, and so the
-// only ones in a test file whose change can be attributed to a single mapping.
-// They match listPattern, which decides what goes into the map in the first
-// place.
-var testFuncPrefixes = []string{"Test", "Fuzz", "Example"}
 
 // goFile is a package file as the fingerprint reads it: its bytes, and its
 // syntax when it has any.
@@ -140,79 +74,31 @@ type goFile struct {
 	data []byte
 }
 
-// candidate is a declaration that could be attributed, held until the whole
-// package has been read: whether it can be depends on what else the package
-// declares.
-type candidate struct {
-	fn   *ast.FuncDecl
-	key  string
-	decl declPrint
-	file int
-}
-
 // fingerprintOf reads a package's directory and records its shape.
 //
 // The whole directory is read rather than the file list `go list` reports, so
-// that nothing a change could hide in is left out of the shell: a C file, an
-// embedded asset, a file excluded by a build tag. Anything unreadable is a
-// failure to fingerprint, and anything unparseable is folded into the shell
-// whole — both cost a re-map of the package and neither can give a wrong
-// answer.
+// that nothing a change could hide in is left out: a C file, an embedded
+// asset, a file excluded by a build tag. Anything unreadable is a failure to
+// fingerprint, and anything unparseable is folded into Whole — both cost a
+// re-map of the package and neither can give a wrong answer.
 func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 	files, ok := readPackageFiles(pkg.dir)
 	if !ok {
 		return fingerprint{}, false
 	}
-
-	return c.fingerprintFiles(pkg, files)
-}
-
-// fingerprintFiles is fingerprintOf over files already read, so that a reader
-// that needs the files for something else as well reads them once.
-func (c *Coverage) fingerprintFiles(pkg *testPackage, files []goFile) (fingerprint, bool) {
-	// Both of these are package-wide, not per file. A test another declaration
-	// calls does not run only on its own, wherever the caller is; and a key two
-	// declarations share cannot tell them apart, wherever the other one is.
-	referenced := map[string]bool{}
-	for i := range files {
-		if files[i].ast != nil {
-			collectReferencedNames(files[i].ast, referenced)
-		}
-	}
-	candidates, keyCount := c.candidatesOf(pkg, files, referenced)
-
-	fp := fingerprint{Decls: map[string]declPrint{}, Others: map[string][]declPrint{}}
-	cuts := make([][]candidate, len(files))
-	attributed := map[*ast.FuncDecl]bool{}
-	for _, cand := range candidates {
-		if keyCount[cand.key] != 1 {
-			continue
-		}
-		fp.Decls[cand.key] = cand.decl
-		cuts[cand.file] = append(cuts[cand.file], cand)
-		attributed[cand.fn] = true
-	}
-
-	shell := make([]string, 0, len(files)+1)
-	for i := range files {
-		shell = append(shell, files[i].name+"\x00"+hashOf(shellOf(&files[i], cuts[i])))
-		c.recordOthers(pkg, &files[i], attributed, fp.Others)
-	}
-	data, ok := hashDataSubtrees(pkg.dir)
+	below, ok := hashDataSubtrees(pkg.dir)
 	if !ok {
 		return fingerprint{}, false
 	}
-	shell = append(shell, "\x00subtrees\x00"+data)
-	fp.Shell = hashOf([]byte(strings.Join(shell, "\x00")))
 
-	return fp, true
+	return fingerprint{pkgPrint: c.printPackage(pkg.importPath, files, true, below)}, true
 }
 
 // hashDataSubtrees hashes what a package's directory holds below its top level
 // and does not compile: testdata, and the trees an //go:embed pattern reaches
 // into.
 //
-// They belong in the shell because a test can behave differently on new input
+// They belong in Whole because a test can behave differently on new input
 // without a line of the package changing, which would leave a kept mapping
 // describing a path the test no longer takes. The build ID does see embedded
 // files, so on its own that case ends in a whole re-map — but a run that has
@@ -272,32 +158,9 @@ func holdsGoFiles(dir string) (bool, bool) {
 	return false, true
 }
 
-// recordOthers notes where the declarations that stayed in the shell sit, in
-// source order, for the files a coverage profile can name.
-//
-// Test files are left out: coverage does not instrument them, so no profile
-// holds a line of one and nothing would ever look these up.
-func (c *Coverage) recordOthers(pkg *testPackage, f *goFile, attributed map[*ast.FuncDecl]bool,
-	into map[string][]declPrint,
-) {
-	if f.ast == nil || strings.HasSuffix(f.name, "_test.go") {
-		return
-	}
-	profileName := c.profileFileName(pkg.importPath, f.name)
-	for _, decl := range f.ast.Decls {
-		if fn, isFunc := decl.(*ast.FuncDecl); isFunc && attributed[fn] {
-			continue
-		}
-		start := f.fset.Position(decl.Pos())
-		end := f.fset.Position(decl.End())
-		into[profileName] = append(into[profileName],
-			declPrint{File: profileName, Start: start.Line, End: end.Line})
-	}
-}
-
 // readPackageFiles reads every regular file of a package directory, parsing the
 // Go ones. A file that does not parse keeps a nil syntax tree, which is what
-// puts the whole of it into the shell.
+// puts the whole of it into Whole.
 func readPackageFiles(dir string) ([]goFile, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -330,126 +193,6 @@ func readPackageFiles(dir string) ([]goFile, bool) {
 	return files, true
 }
 
-// candidatesOf describes every declaration whose change could be attributed,
-// and counts how many declarations claim each key. A key two declarations share
-// belongs to neither: Go allows several init functions in one file, and a test
-// name can repeat across a package and its external test package.
-func (c *Coverage) candidatesOf(pkg *testPackage, files []goFile,
-	referenced map[string]bool,
-) ([]candidate, map[string]int) {
-	var candidates []candidate
-	keyCount := map[string]int{}
-
-	for i := range files {
-		f := &files[i]
-		if f.ast == nil {
-			continue
-		}
-		profileName := c.profileFileName(pkg.importPath, f.name)
-		isTestFile := strings.HasSuffix(f.name, "_test.go")
-		for _, decl := range f.ast.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				continue
-			}
-			described, key, ok := printOf(f, fn, profileName, isTestFile, referenced)
-			if !ok {
-				continue
-			}
-			candidates = append(candidates, candidate{fn: fn, key: key, decl: described, file: i})
-			keyCount[key]++
-		}
-	}
-
-	return candidates, keyCount
-}
-
-// printOf describes one declaration, reporting whether its change can be
-// attributed at all.
-//
-// In package code it always can: the profile records which tests executed its
-// lines. In a test file only a declaration `go test` runs on its own can be — a
-// test-file helper is executed by tests the profile does not record, because
-// coverage does not instrument test files — so everything else in a test file
-// stays in the shell.
-func printOf(f *goFile, fn *ast.FuncDecl, profileName string, isTestFile bool,
-	referenced map[string]bool,
-) (declPrint, string, bool) {
-	start, end := declSpan(f.fset, fn)
-	header := end.Offset
-	if fn.Body != nil {
-		header = f.fset.Position(fn.Body.Lbrace).Offset
-	}
-	described := declPrint{
-		Hash:  hashOf(f.data[start.Offset:end.Offset]),
-		Sig:   hashOf(f.data[start.Offset:header]),
-		File:  profileName,
-		Start: start.Line,
-		End:   end.Line,
-	}
-	switch {
-	case fn.Recv != nil:
-		described.Kind = kindMethod
-	case fn.Name.Name == "init":
-		described.Kind = kindInit
-	}
-
-	if !isTestFile {
-		return described, profileName + ":" + declKey(fn), true
-	}
-	if fn.Recv != nil || !isTestFuncName(fn.Name.Name) || referenced[fn.Name.Name] {
-		return declPrint{}, "", false
-	}
-	described.Test = fn.Name.Name
-
-	// Keyed by test name alone, so that moving a test between test files does
-	// not read as one test removed and another added.
-	return described, "test:" + fn.Name.Name, true
-}
-
-// shellOf is what is left of a file once its attributable declarations are cut
-// out.
-//
-// They are removed rather than blanked, and whitespace-only remainders are
-// dropped, so that adding, removing or moving a function leaves the shell
-// exactly where it was. That is what makes "a new free function changes
-// nothing" true of the fingerprint as well as of the program.
-func shellOf(f *goFile, cuts []candidate) []byte {
-	if len(cuts) == 0 {
-		return f.data
-	}
-	sort.Slice(cuts, func(i, j int) bool { return cuts[i].fn.Pos() < cuts[j].fn.Pos() })
-
-	var kept []string
-	cut := 0
-	for _, cand := range cuts {
-		start, end := declSpan(f.fset, cand.fn)
-		if gap := strings.TrimSpace(string(f.data[cut:start.Offset])); gap != "" {
-			kept = append(kept, gap)
-		}
-		cut = end.Offset
-	}
-	if gap := strings.TrimSpace(string(f.data[cut:])); gap != "" {
-		kept = append(kept, gap)
-	}
-
-	return []byte(strings.Join(kept, "\x00"))
-}
-
-// declSpan is the whole of a declaration as written, including its doc comment.
-//
-// The comment is inside the span because a directive lives there: //go:noinline
-// and //go:linkname change what the code does, and telling those from prose is
-// not worth the risk of getting it wrong.
-func declSpan(fset *token.FileSet, fn *ast.FuncDecl) (token.Position, token.Position) {
-	pos := fn.Pos()
-	if fn.Doc != nil {
-		pos = fn.Doc.Pos()
-	}
-
-	return fset.Position(pos), fset.Position(fn.End())
-}
-
 // declKey names a declaration within its file: methods of different types share
 // a name, and the receiver is what tells them apart.
 func declKey(fn *ast.FuncDecl) string {
@@ -476,25 +219,6 @@ func isTestFuncName(name string) bool {
 	}
 
 	return false
-}
-
-// collectReferencedNames records every identifier the file uses other than a
-// declaration's own name, so that a test something else names is not mistaken
-// for one that only ever runs on its own.
-func collectReferencedNames(file *ast.File, into map[string]bool) {
-	for _, decl := range file.Decls {
-		var own *ast.Ident
-		if fn, ok := decl.(*ast.FuncDecl); ok {
-			own = fn.Name
-		}
-		ast.Inspect(decl, func(n ast.Node) bool {
-			if id, isID := n.(*ast.Ident); isID && id != own {
-				into[id.Name] = true
-			}
-
-			return true
-		})
-	}
 }
 
 func hashOf(data []byte) string {

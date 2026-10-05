@@ -123,6 +123,32 @@ func Size(v []int) int {
 `
 )
 
+// The test files declare the tests the helper process lists and runs. Nothing
+// reads their bodies — the profiles are canned — but a mapping is only kept
+// for a test whose declaration says what it is.
+const (
+	vmTestSource = `package vm
+
+import "testing"
+
+func TestSizeAscending(t *testing.T) {
+	_ = Clamp(1, 0, 2)
+}
+`
+	rootTestSource = `package root
+
+import "testing"
+
+func TestRangeDescending(t *testing.T) {
+	_ = Descend(1)
+}
+
+func TestRangeAscending(t *testing.T) {
+	_ = Ascend(1)
+}
+`
+)
+
 // The calc package is the fixture for invalidating a map per test rather than
 // per package. Its profiles name only its own files, which is the shape a run
 // without --cross-package produces — the test binary is built with -coverpkg
@@ -192,6 +218,8 @@ func fixtureRoot(t *testing.T) string {
 	writeFixture(t, filepath.Join(root, "calc", "calc.go"), calcSource)
 	writeFixture(t, filepath.Join(root, "calc", "double_test.go"), doubleTestSource)
 	writeFixture(t, filepath.Join(root, "calc", "triple_test.go"), tripleTestSource)
+	writeFixture(t, filepath.Join(root, "vm", "vm_test.go"), vmTestSource)
+	writeFixture(t, filepath.Join(root, "root", "root_test.go"), rootTestSource)
 
 	return root
 }
@@ -593,17 +621,23 @@ func envAsGo(args []string) {
 //
 // The package itself is listed twice, as go does: once as it is and once as
 // recompiled for its own test binary, under the bracketed name go gives that.
+// Each line ends with the package's name, which is what an unnamed import of
+// it binds.
 func listDepsAsGo(root, pkg string) {
 	const vm = "example.com/vm"
 	main := os.Getenv(notMainEnv) != vm
 	if pkg != vm {
-		fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\t%t\n", vm, pkg, filepath.Join(root, "vm"), main)
-		fmt.Fprintf(os.Stdout, "%s\t%s\t%t\n", vm, filepath.Join(root, "vm"), main)
+		fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\t%t\tvm\n", vm, pkg, filepath.Join(root, "vm"), main)
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%t\tvm\n", vm, filepath.Join(root, "vm"), main)
 	}
-	fmt.Fprintf(os.Stdout, "%s\t%s\ttrue\n", pkg, filepath.Join(root, dirOf(pkg)))
-	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\ttrue\n", pkg, pkg, filepath.Join(root, dirOf(pkg)))
+	name := path.Base(dirOf(pkg))
+	fmt.Fprintf(os.Stdout, "%s\t%s\ttrue\t%s\n", pkg, filepath.Join(root, dirOf(pkg)), name)
+	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\ttrue\t%s\n", pkg, pkg, filepath.Join(root, dirOf(pkg)), name)
 	// A standard-library package belongs to no module at all.
-	fmt.Fprintf(os.Stdout, "testing\t/nonexistent/goroot/src/testing\t\n")
+	fmt.Fprintf(os.Stdout, "testing\t/nonexistent/goroot/src/testing\t\ttesting\n")
+	for _, std := range []string{"embed", "errors", "fmt", "regexp"} {
+		fmt.Fprintf(os.Stdout, "%s\t/nonexistent/goroot/src/%s\t\t%s\n", std, std, std)
+	}
 	// go writes build diagnostics to the same stream, and a synthesised test
 	// package can report no directory at all.
 	fmt.Fprintln(os.Stdout, "")

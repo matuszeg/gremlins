@@ -224,10 +224,11 @@ func TestMapCacheRemapsOnlyThePackageWhoseBuildIDChanged(t *testing.T) {
 	h := newCacheHarness(t)
 
 	h.build("TestTestMapHelperProcess", "")
-	// A change vm's own mapping cannot narrow across, so that what is re-mapped
-	// is decided by the build IDs alone. The packages built on vm keep theirs
-	// here, standing for packages the change did not reach.
-	h.edit("vm/vm.go", vmSource+"\nconst limit = 3\n")
+	// A change vm's own mapping cannot narrow across — an init runs for every
+	// test — so that what is re-mapped is decided by the build IDs alone. The
+	// packages built on vm keep theirs here, standing for packages the change
+	// did not reach.
+	h.edit("vm/vm.go", vmSource+"\nfunc init() {}\n")
 	h.build("TestTestMapHelperProcess", "example.com/vm=changed-by-an-edit")
 
 	want := []string{"TestSizeAscending"}

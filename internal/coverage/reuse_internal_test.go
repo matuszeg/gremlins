@@ -17,360 +17,84 @@
 package coverage
 
 import (
+	"sort"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
-// oneTest is a package with a single mapping covering lines 4 to 6 of a.go,
-// which is the body of the declaration keyed "a.go:F".
-func oneTest(decls map[string]declPrint, shell string) cachedPackage {
-	return cachedPackage{
-		Fingerprint: fingerprint{Shell: shell, Inputs: inputsHash, Decls: decls},
-		Tests: map[string]Profile{
-			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
-		},
-	}
-}
-
 // inputsHash stands for everything the test binary is built from besides the
-// package: unchanged in every case that narrows, because a change there is one
-// no profile of this package could have recorded.
+// package and its instrumented dependencies: unchanged in every case that
+// narrows, because a change there is one no record of this package could
+// have seen.
 const inputsHash = "inputs"
 
-func decl(file string, start, end int, hash, kind string) declPrint {
-	return declPrint{Hash: hash, File: file, Start: start, End: end, Kind: kind}
+func idents(names ...string) map[string]bool {
+	out := map[string]bool{}
+	for _, n := range names {
+		out[n] = true
+	}
+
+	return out
 }
 
-// Everything here re-maps the whole package. The direction matters: a mapping
-// wrongly kept means a test that could kill a mutant is never run, so the
-// mutant reports LIVED and the gate goes red on something nobody can reproduce.
-func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
-	t.Parallel()
-
-	base := map[string]declPrint{
-		"a.go:F": decl("a.go", 3, 7, "f", ""),
-		"a.go:G": decl("a.go", 9, 11, "g", ""),
-	}
-
-	testCases := map[string]struct {
-		cached cachedPackage
-		now    fingerprint
-	}{
-		// An entry from before the fingerprint existed, or one whose package
-		// could not be read, says nothing about what changed.
-		"no fingerprint at all": {
-			cached: oneTest(base, ""),
-			now:    fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
-		},
-		// A const, a package-level var, a type, a struct tag, an import, a test
-		// helper, a non-Go file: none of them is a line any profile holds.
-		"the shell moved": {
-			cached: oneTest(base, "shell"),
-			now:    fingerprint{Shell: "other", Inputs: inputsHash, Decls: base},
-		},
-		// init runs before every test in the binary.
-		"an init changed": {
-			cached: oneTest(map[string]declPrint{
-				"a.go:F":    base["a.go:F"],
-				"a.go:init": decl("a.go", 13, 15, "i", kindInit),
-			}, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F":    base["a.go:F"],
-				"a.go:init": decl("a.go", 13, 15, "i2", kindInit),
-			}},
-		},
-		"an init was added": {
-			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F":    base["a.go:F"],
-				"a.go:G":    base["a.go:G"],
-				"a.go:init": decl("a.go", 13, 15, "i", kindInit),
-			}},
-		},
-		// Adding or removing a method changes which interfaces its receiver
-		// satisfies, which can redirect a type switch that did not change.
-		"a method was removed": {
-			cached: oneTest(map[string]declPrint{
-				"a.go:F":     base["a.go:F"],
-				"a.go:T.Str": decl("a.go", 13, 15, "m", kindMethod),
-			}, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{"a.go:F": base["a.go:F"]}},
-		},
-		"a method was added": {
-			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F":     base["a.go:F"],
-				"a.go:G":     base["a.go:G"],
-				"a.go:T.Str": decl("a.go", 13, 15, "m", kindMethod),
-			}},
-		},
-		// A new package-level function named like a predeclared identifier
-		// rebinds every existing use of that identifier without a line of the
-		// use changing: `min(x, 10)` calls the new function from then on.
-		"an added function shadows a predeclared identifier": {
-			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F":   base["a.go:F"],
-				"a.go:G":   base["a.go:G"],
-				"a.go:min": decl("a.go", 13, 15, "m", ""),
-			}},
-		},
-		// A dependency moved, alone or alongside a change here. Its lines are
-		// in no profile of this package, so which mappings it reached cannot be
-		// worked out — and the build ID, which folds the two together, cannot
-		// tell one from the other.
-		"the dependencies moved too": {
-			cached: oneTest(base, "shell"),
-			now: fingerprint{Shell: "shell", Inputs: "other-inputs", Decls: map[string]declPrint{
-				"a.go:F": decl("a.go", 3, 7, "f2", ""),
-				"a.go:G": base["a.go:G"],
-			}},
-		},
-		"nothing recorded what it was built from": {
-			cached: cachedPackage{
-				Fingerprint: fingerprint{Shell: "shell", Decls: base},
-				Tests:       map[string]Profile{"TestF": {"a.go": {{StartLine: 4, EndLine: 6}}}},
-			},
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F": decl("a.go", 3, 7, "f2", ""),
-				"a.go:G": base["a.go:G"],
-			}},
-		},
-		// Positions are paired by order, which only means anything while the
-		// sequence is the same one.
-		"the shell declarations no longer line up": {
-			cached: cachedPackage{
-				Fingerprint: fingerprint{
-					Shell:  "shell",
-					Inputs: inputsHash,
-					Decls:  base,
-					Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 1, End: 1}}},
-				},
-				Tests: map[string]Profile{"TestF": {"a.go": {{StartLine: 4, EndLine: 6}}}},
-			},
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Others: map[string][]declPrint{}, Decls: map[string]declPrint{
-				"a.go:F": decl("a.go", 3, 7, "f2", ""),
-				"a.go:G": base["a.go:G"],
-			}},
-		},
-		// The profile and the fingerprint disagree about the package: the
-		// mapping covers a file no declaration accounts for, so where its blocks
-		// have moved to cannot be worked out.
-		"a kept block belongs to no declaration": {
-			cached: cachedPackage{
-				Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: base},
-				Tests: map[string]Profile{
-					"TestF": {"elsewhere.go": {{StartLine: 4, EndLine: 6}}},
-				},
-			},
-			now: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-				"a.go:F": decl("a.go", 3, 7, "f2", ""),
-				"a.go:G": base["a.go:G"],
-			}},
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			if kept, ok := reusable(tc.cached, tc.now); ok {
-				t.Errorf("want the whole package re-mapped, got %d mappings kept", len(kept))
-			}
-		})
+// fn is a function of a.go over the given lines. Its header mentions its own
+// name; its text that and whatever else it names.
+func fn(name string, start, end int, hash string, mentions ...string) declPrint {
+	return declPrint{
+		Hash: hash, Sig: name + "-sig", Names: []string{name}, File: "a.go", Start: start, End: end,
+		header: idents(name), text: idents(append(mentions, name)...),
 	}
 }
 
-func TestReusableKeepsWhatTheChangeCouldNotReach(t *testing.T) {
-	t.Parallel()
+// spec is a type, var or const entity of a.go, whose header is all of it.
+func spec(kind, name string, line int, hash string, mentions ...string) declPrint {
+	m := idents(append(mentions, name)...)
 
-	// F changed and grew by two lines; G did not change and moved with it.
-	was := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F": decl("a.go", 3, 7, "f", ""),
-		"a.go:G": decl("a.go", 9, 11, "g", ""),
-	}}
-	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F": decl("a.go", 3, 9, "f2", ""),
-		"a.go:G": decl("a.go", 11, 13, "g", ""),
-	}}
-	cached := cachedPackage{
-		Fingerprint: was,
-		Tests: map[string]Profile{
-			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
-			"TestG": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 2}}},
-		},
-	}
-
-	kept, ok := reusable(cached, now)
-	if !ok {
-		t.Fatal("want the untouched mapping kept, got a whole-package re-map")
-	}
-
-	want := map[string]Profile{
-		"TestG": {"a.go": {{StartLine: 12, StartCol: 1, EndLine: 12, EndCol: 2}}},
-	}
-	if diff := cmp.Diff(want, kept); diff != "" {
-		t.Errorf("kept the wrong mappings, or in the wrong place (-want +got):\n%s", diff)
-	}
+	return declPrint{Hash: hash, Kind: kind, Names: []string{name}, File: "a.go", Start: line, End: line, header: m, text: m}
 }
 
-// A package-level var holding a function literal is instrumented like any other
-// code, and it is in the shell — so without its position a mapping that reached
-// it could never be kept.
-func TestReusableMovesTheDeclarationsTheShellHolds(t *testing.T) {
-	t.Parallel()
+// testFn is a test, or a helper when test is empty, of a_test.go. A test
+// file's entity is followed through all of it.
+func testFn(name, test, hash string, mentions ...string) declPrint {
+	m := idents(append(mentions, name)...)
 
-	was := fingerprint{
-		Shell:  "shell",
-		Inputs: inputsHash,
-		Decls:  map[string]declPrint{"a.go:F": decl("a.go", 3, 7, "f", "")},
-		Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 9, End: 12}}},
-	}
-	now := fingerprint{
-		Shell:  "shell",
-		Inputs: inputsHash,
-		Decls:  map[string]declPrint{"a.go:F": decl("a.go", 3, 9, "f2", "")},
-		Others: map[string][]declPrint{"a.go": {{File: "a.go", Start: 11, End: 14}}},
-	}
-	cached := cachedPackage{
-		Fingerprint: was,
-		Tests: map[string]Profile{
-			"TestVar": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 9}}},
-		},
-	}
-
-	kept, ok := reusable(cached, now)
-	if !ok {
-		t.Fatal("want the mapping kept, got a whole-package re-map")
-	}
-	want := map[string]Profile{
-		"TestVar": {"a.go": {{StartLine: 12, StartCol: 1, EndLine: 12, EndCol: 9}}},
-	}
-	if diff := cmp.Diff(want, kept); diff != "" {
-		t.Errorf("the shell declaration was not moved with the rest (-want +got):\n%s", diff)
-	}
+	return declPrint{Hash: hash, Names: []string{name}, File: "a_test.go", Test: test, header: m, text: m}
 }
 
-// A test's own lines are in no profile — coverage does not instrument test
-// files — so a changed test is named rather than located.
-func TestReusableDropsAChangedTestByName(t *testing.T) {
-	t.Parallel()
-
-	was := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F":     decl("a.go", 3, 7, "f", ""),
-		"test:TestF": {Hash: "t", File: "a_test.go", Test: "TestF", Start: 5, End: 9},
-	}}
-	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F":     decl("a.go", 3, 7, "f", ""),
-		"test:TestF": {Hash: "t2", File: "a_test.go", Test: "TestF", Start: 5, End: 9},
-	}}
-
-	kept, ok := reusable(oneTest(was.Decls, "shell"), now)
-	if !ok {
-		t.Fatal("want a narrowed re-map, got a whole-package one")
-	}
-	if _, still := kept["TestF"]; still {
-		t.Error("want the changed test dropped from what is kept")
-	}
-}
-
-// An unchanged fingerprint under a moved build ID used to mean a dependency had
-// changed, because nothing else could move it. Inputs now records every
-// dependency, the toolchain and the build environment, so with those equal too
-// what is left is the checkout path the binary embeds — and every mapping is
-// still the answer.
-func TestReusableKeepsEverythingWhenOnlyTheBuildIDMoved(t *testing.T) {
-	t.Parallel()
-
-	decls := map[string]declPrint{
-		"a.go:F": decl("a.go", 3, 7, "f", ""),
-		"a.go:G": decl("a.go", 9, 11, "g", ""),
-	}
-	cached := cachedPackage{
-		Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: decls},
-		Tests: map[string]Profile{
-			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
-			"TestG": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 2}}},
-		},
+// pkg is a package as the cases below map it:
+//
+//   - F over lines 3-7 of a.go, naming the constant limit in its body;
+//   - G over lines 9-11, naming nothing;
+//   - limit, a constant on line 13;
+//   - TestF, which executed F and, in the dependency example.com/dep, Clamp;
+//   - TestG, which executed G and nothing in the dependency.
+//
+// The dependency declares Clamp, Size and an exported type Box. Every call
+// returns fresh maps, so a case can change what it likes.
+func pkg() (fingerprint, cachedPackage) {
+	printed := func() fingerprint {
+		return fingerprint{
+			pkgPrint: pkgPrint{Whole: "whole", Decls: map[string]declPrint{
+				"a.go:F":           fn("F", 3, 7, "f", "limit"),
+				"a.go:G":           fn("G", 9, 11, "g"),
+				"a.go:const limit": spec(kindConst, "limit", 13, "limit"),
+				"a_test.go:TestF":  testFn("TestF", "TestF", "tf", "F"),
+				"a_test.go:TestG":  testFn("TestG", "TestG", "tg", "G"),
+				"a_test.go:helper": testFn("helper", "", "h"),
+			}},
+			Inputs: inputsHash,
+			Deps: map[string]pkgPrint{"example.com/dep": {Whole: "dep-whole", Decls: map[string]declPrint{
+				"dep/dep.go:Clamp":     {Hash: "clamp", Sig: "clamp-sig", Names: []string{"Clamp"}, header: idents("Clamp"), text: idents("Clamp")},
+				"dep/dep.go:Size":      {Hash: "size", Sig: "size-sig", Names: []string{"Size"}, header: idents("Size"), text: idents("Size", "count")},
+				"dep/dep.go:type Box":  {Hash: "box", Kind: kindType, Names: []string{"Box"}, header: idents("Box"), text: idents("Box")},
+				"dep/dep.go:var count": {Hash: "count", Kind: kindVar, Names: []string{"count"}, header: idents("count"), text: idents("count")},
+			}}},
+		}
 	}
 
-	kept, ok := reusable(cached, fingerprint{Shell: "shell", Inputs: inputsHash, Decls: decls})
-	if !ok {
-		t.Fatal("want every mapping kept, got a whole-package re-map")
-	}
-	if diff := cmp.Diff(cached.Tests, kept); diff != "" {
-		t.Errorf("want every mapping kept where it was (-want +got):\n%s", diff)
-	}
-}
-
-// The shell drops whitespace between declarations, so blank lines added above a
-// function move it without moving the shell or any declaration's hash. Nothing
-// changed in that case either, but the lines did, and a mapping kept at its old
-// numbers would answer about the wrong ones.
-func TestReusableMovesEverythingWhenOnlyWhitespaceMoved(t *testing.T) {
-	t.Parallel()
-
-	cached := cachedPackage{
-		Fingerprint: fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-			"a.go:F": decl("a.go", 3, 7, "f", ""),
-		}},
-		Tests: map[string]Profile{
-			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
-		},
-	}
-	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F": decl("a.go", 5, 9, "f", ""),
-	}}
-
-	kept, ok := reusable(cached, now)
-	if !ok {
-		t.Fatal("want the mapping kept, got a whole-package re-map")
-	}
-	want := map[string]Profile{
-		"TestF": {"a.go": {{StartLine: 6, StartCol: 1, EndLine: 8, EndCol: 2}}},
-	}
-	if diff := cmp.Diff(want, kept); diff != "" {
-		t.Errorf("the mapping was not moved with its code (-want +got):\n%s", diff)
-	}
-}
-
-// Only a predeclared name is rebound silently. Any other new name either
-// conflicts with something already declared, which does not compile, or is
-// reached only through a call site that is a change of its own.
-func TestReusableKeepsMappingsAcrossAnAddedOrdinaryFunction(t *testing.T) {
-	t.Parallel()
-
-	base := map[string]declPrint{"a.go:F": decl("a.go", 3, 7, "f", "")}
-	now := fingerprint{Shell: "shell", Inputs: inputsHash, Decls: map[string]declPrint{
-		"a.go:F":       base["a.go:F"],
-		"a.go:Minimum": decl("a.go", 9, 11, "m", ""),
-	}}
-
-	kept, ok := reusable(oneTest(base, "shell"), now)
-	if !ok {
-		t.Fatal("want the mapping kept, got a whole-package re-map")
-	}
-	if _, still := kept["TestF"]; !still {
-		t.Error("want TestF kept")
-	}
-}
-
-// withDeps is oneTest built on a package with one in-scope dependency,
-// example.com/dep, whose function Clamp TestF executed and whose function Size
-// it did not. A second test, TestG, executed nothing in the dependency.
-func withDeps(dep depPrint) cachedPackage {
-	base := map[string]declPrint{
-		"a.go:F": decl("a.go", 3, 7, "f", ""),
-		"a.go:G": decl("a.go", 9, 11, "g", ""),
-	}
-
-	return cachedPackage{
-		Fingerprint: fingerprint{
-			Shell: "shell", Inputs: inputsHash, Decls: base,
-			Deps: map[string]depPrint{"example.com/dep": dep},
-		},
+	return printed(), cachedPackage{
+		Fingerprint: printed(),
 		Tests: map[string]Profile{
 			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
 			"TestG": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 2}}},
@@ -379,48 +103,188 @@ func withDeps(dep depPrint) cachedPackage {
 	}
 }
 
-// depBase is the dependency as withDeps maps it.
-func depBase() depPrint {
-	return depPrint{Shell: "dep-shell", Decls: map[string]depDecl{
-		"dep/dep.go:Clamp": {Hash: "clamp", Sig: "clamp-sig"},
-		"dep/dep.go:Size":  {Hash: "size", Sig: "size-sig"},
-	}}
+func keptNames(kept map[string]Profile) []string {
+	var names []string
+	for name := range kept {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	return names
 }
 
-// now is the package of withDeps again, unchanged except for its dependency.
-func nowWithDep(dep depPrint) fingerprint {
-	cached := withDeps(dep)
-
-	return cached.Fingerprint
-}
-
-// A dependency's lines are recorded per test as the functions it executed, so a
-// changed body there is attributable exactly as one here is: a test that never
-// executed the function cannot behave differently for its body changing.
-func TestReusableNarrowsAcrossADependencyBodyChange(t *testing.T) {
+// Each change here is attributable, and the mappings it could not have
+// reached are kept: by body to the tests that executed it, by name to whatever
+// names it.
+func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string]struct {
-		change func(d *depPrint)
+		change func(now *fingerprint, cached *cachedPackage)
 		kept   []string
 	}{
-		"a body a test executed": {
-			change: func(d *depPrint) { d.Decls["dep/dep.go:Clamp"] = depDecl{Hash: "clamp2", Sig: "clamp-sig"} },
-			kept:   []string{"TestG"},
-		},
-		"a body no test executed": {
-			change: func(d *depPrint) { d.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig"} },
+		"nothing": {
+			change: func(*fingerprint, *cachedPackage) {},
 			kept:   []string{"TestF", "TestG"},
 		},
-		// Reaching a removed function took a call, and that call is a change of
-		// its own to a body some test executed.
-		"a function no test executed was removed": {
-			change: func(d *depPrint) { delete(d.Decls, "dep/dep.go:Size") },
-			kept:   []string{"TestF", "TestG"},
+		"a body only one test executed": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				now.Decls["a.go:F"] = fn("F", 3, 7, "f2", "limit")
+			},
+			kept: []string{"TestG"},
 		},
-		"an ordinary function was added": {
-			change: func(d *depPrint) { d.Decls["dep/dep.go:Extra"] = depDecl{Hash: "x", Sig: "x-sig"} },
-			kept:   []string{"TestF", "TestG"},
+		// G names F without executing it — it passes F as a value — so F's
+		// body cannot reach TestG, and its signature can.
+		"a body of a function another passes as a value": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "F")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "F")
+				now.Decls["a.go:F"] = fn("F", 3, 7, "f2", "limit")
+			},
+			kept: []string{"TestG"},
+		},
+		"a signature of a function another passes as a value": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "F")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "F")
+				f := fn("F", 3, 7, "f2", "limit")
+				f.Sig = "f2-sig"
+				now.Decls["a.go:F"] = f
+			},
+			kept: []string{},
+		},
+		"a constant only one function names": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				now.Decls["a.go:const limit"] = spec(kindConst, "limit", 13, "limit2")
+			},
+			kept: []string{"TestG"},
+		},
+		// U's header names T, and G's signature names U: a changed T reaches
+		// G through two headers, though G's text never names T.
+		"a type reached through headers": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				g := fn("G", 9, 11, "g", "U")
+				g.header["U"] = true
+				for _, p := range []*fingerprint{now, &cached.Fingerprint} {
+					p.Decls["a.go:G"] = g
+					p.Decls["a.go:type U"] = spec(kindType, "U", 15, "u", "T")
+					p.Decls["a.go:type T"] = spec(kindType, "T", 16, "t")
+				}
+				now.Decls["a.go:type T"] = spec(kindType, "T", 16, "t2")
+			},
+			kept: []string{"TestF"},
+		},
+		// A new name can rebind an existing mention of it: a predeclared one.
+		"an added name": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "min")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "min")
+				now.Decls["a.go:min"] = fn("min", 20, 22, "min")
+			},
+			kept: []string{"TestF"},
+		},
+		"a removed name": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:min"] = fn("min", 20, 22, "min")
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "min")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "min")
+			},
+			kept: []string{"TestF"},
+		},
+		// A method changes the interfaces its receiver satisfies, so it is a
+		// change to the receiver's name too.
+		"an added method": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:F"] = fn("F", 3, 7, "f", "limit", "T")
+				now.Decls["a.go:F"] = fn("F", 3, 7, "f", "limit", "T")
+				now.Decls["a.go:T.String"] = declPrint{Hash: "s", Sig: "s", Kind: kindMethod, Names: []string{"String", "T"},
+					File: "a.go", Start: 20, End: 22, header: idents("String"), text: idents("String")}
+			},
+			kept: []string{"TestG"},
+		},
+		"a changed test": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				now.Decls["a_test.go:TestF"] = testFn("TestF", "TestF", "tf2", "F")
+			},
+			kept: []string{"TestG"},
+		},
+		// A test file is not instrumented, so a helper's body is followed by
+		// name, from the test that names it.
+		"a helper's body": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a_test.go:TestG"] = testFn("TestG", "TestG", "tg", "G", "helper")
+				now.Decls["a_test.go:TestG"] = testFn("TestG", "TestG", "tg", "G", "helper")
+				now.Decls["a_test.go:helper"] = testFn("helper", "", "h2")
+			},
+			kept: []string{"TestF"},
+		},
+		// Every mention of st is text that did not change, calling into
+		// another package now.
+		"an import bound to another path": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Imports = map[string]map[string]string{"a.go": {"st": "m/pg"}}
+				now.Imports = map[string]map[string]string{"a.go": {"st": "m/mem"}}
+				cached.Fingerprint.Decls["a.go:F"] = fn("F", 3, 7, "f", "st")
+				now.Decls["a.go:F"] = fn("F", 3, 7, "f", "st")
+			},
+			kept: []string{"TestG"},
+		},
+		// An unnamed import whose package name is unknown binds a name nobody
+		// can say, so the whole file is rebound.
+		"an unnamed import of an unknown package": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Imports = map[string]map[string]string{"a.go": {"?m/x": "m/x"}}
+				now.Imports = map[string]map[string]string{"a.go": {"?m/y": "m/y"}}
+			},
+			kept: []string{},
+		},
+		"a dependency body one test executed": {
+			change: func(now *fingerprint, _ *cachedPackage) {
+				d := now.Deps["example.com/dep"].Decls["dep/dep.go:Clamp"]
+				d.Hash = "clamp2"
+				now.Deps["example.com/dep"].Decls["dep/dep.go:Clamp"] = d
+			},
+			kept: []string{"TestG"},
+		},
+		// Box is exported, so its change crosses into the package.
+		"a dependency type the package names": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "Box")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "Box")
+				d := now.Deps["example.com/dep"].Decls["dep/dep.go:type Box"]
+				d.Hash = "box2"
+				now.Deps["example.com/dep"].Decls["dep/dep.go:type Box"] = d
+			},
+			kept: []string{"TestF"},
+		},
+		// count is not, so it reaches only the dependency's own entities —
+		// Size, which nobody executed — and not G's local of that name.
+		"a dependency's unexported name": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Fingerprint.Decls["a.go:G"] = fn("G", 9, 11, "g", "count")
+				now.Decls["a.go:G"] = fn("G", 9, 11, "g", "count")
+				d := now.Deps["example.com/dep"].Decls["dep/dep.go:var count"]
+				d.Hash = "count2"
+				now.Deps["example.com/dep"].Decls["dep/dep.go:var count"] = d
+			},
+			kept: []string{"TestF", "TestG"},
+		},
+		// TestG executed the dependency somewhere no entity could be named.
+		"a change anywhere in a dependency recorded whole": {
+			change: func(now *fingerprint, cached *cachedPackage) {
+				cached.Deps["TestG"] = []string{depWhole("example.com/dep")}
+				d := now.Deps["example.com/dep"].Decls["dep/dep.go:Size"]
+				d.Hash = "size2"
+				now.Deps["example.com/dep"].Decls["dep/dep.go:Size"] = d
+			},
+			kept: []string{"TestF"},
+		},
+		// No declaration says what it is, so nothing says what reaches it.
+		"a mapping no test declaration accounts for": {
+			change: func(_ *fingerprint, cached *cachedPackage) {
+				cached.Tests["TestGone"] = Profile{"a.go": {{StartLine: 10, EndLine: 10}}}
+			},
+			kept: []string{"TestF", "TestG"},
 		},
 	}
 
@@ -428,66 +292,123 @@ func TestReusableNarrowsAcrossADependencyBodyChange(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			dep := depBase()
-			tc.change(&dep)
-			kept, ok := reusable(withDeps(depBase()), nowWithDep(dep))
+			now, cached := pkg()
+			tc.change(&now, &cached)
+			kept, ok := reusable(cached, now)
 			if !ok {
-				t.Fatal("want the change narrowed, got a whole-package re-map")
+				t.Fatal("want a narrowed re-map, got a whole-package one")
 			}
-			var got []string
-			for name := range kept {
-				got = append(got, name)
+			got := keptNames(kept)
+			if got == nil {
+				got = []string{}
 			}
-			if diff := cmp.Diff(tc.kept, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+			if diff := cmp.Diff(tc.kept, got); diff != "" {
 				t.Errorf("kept the wrong mappings (-want +got):\n%s", diff)
 			}
 		})
 	}
 }
 
-// Everything about a dependency that is not one function's body is still
-// all-or-nothing: none of it is a function a test can be said to have executed
-// or not.
-func TestReusableRefusesADependencyChangeItCannotAttribute(t *testing.T) {
+// Everything here re-maps the whole package. The direction matters: a mapping
+// wrongly kept means a test that could kill a mutant is never run, so the
+// mutant reports LIVED and the gate goes red on something nobody can reproduce.
+func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 	t.Parallel()
 
-	testCases := map[string]func(d *depPrint) map[string]depPrint{
-		// A const, a type, a var, an import, a non-Go file, embedded data.
-		"its shell moved": func(d *depPrint) map[string]depPrint {
-			d.Shell = "dep-shell2"
+	initAt := func(hash string, mentions ...string) declPrint {
+		m := idents(mentions...)
 
-			return map[string]depPrint{"example.com/dep": *d}
-		},
-		// A changed signature can rebind a call site that did not change: a
-		// handler passed as a value and reflected over is called by nothing
-		// the test executed in this module.
-		"a signature changed": func(d *depPrint) map[string]depPrint {
-			d.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig2"}
+		return declPrint{Hash: hash, Kind: kindInit, File: "a.go", Start: 20, End: 22, header: m, text: m}
+	}
+	setDep := func(now *fingerprint, key string, d declPrint) {
+		now.Deps["example.com/dep"].Decls[key] = d
+	}
 
-			return map[string]depPrint{"example.com/dep": *d}
+	testCases := map[string]func(now *fingerprint, cached *cachedPackage){
+		// An entry from before the fingerprint existed, or one whose package
+		// could not be read, says nothing about what changed.
+		"no fingerprint at all": func(_ *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint = fingerprint{}
 		},
-		"an init changed": func(d *depPrint) map[string]depPrint {
-			d.Decls["dep/dep.go:init"] = depDecl{Hash: "i", Sig: "i-sig", Kind: kindInit}
-
-			return map[string]depPrint{"example.com/dep": *d}
+		"nothing recorded what it was built from": func(_ *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Inputs = ""
 		},
-		"a method was added": func(d *depPrint) map[string]depPrint {
-			d.Decls["dep/dep.go:T.String"] = depDecl{Hash: "m", Sig: "m-sig", Kind: kindMethod}
-
-			return map[string]depPrint{"example.com/dep": *d}
+		// What it is built from besides the package and its instrumented
+		// dependencies moved, and no record here holds its lines.
+		"the inputs moved": func(now *fingerprint, _ *cachedPackage) {
+			now.Inputs = "other"
 		},
-		"a function shadowing a predeclared identifier was added": func(d *depPrint) map[string]depPrint {
-			d.Decls["dep/dep.go:min"] = depDecl{Hash: "m", Sig: "m-sig"}
-
-			return map[string]depPrint{"example.com/dep": *d}
+		"a dependency was added": func(now *fingerprint, _ *cachedPackage) {
+			now.Deps["example.com/new"] = pkgPrint{Whole: "new"}
 		},
-		// What the binary links changed, and a new dependency's lines were in
-		// no mapping at all.
-		"a dependency was added": func(d *depPrint) map[string]depPrint {
-			return map[string]depPrint{"example.com/dep": *d, "example.com/other": {Shell: "o"}}
+		"a dependency was replaced": func(now *fingerprint, _ *cachedPackage) {
+			now.Deps["example.com/other"] = now.Deps["example.com/dep"]
+			delete(now.Deps, "example.com/dep")
 		},
-		"a dependency was replaced": func(d *depPrint) map[string]depPrint {
-			return map[string]depPrint{"example.com/other": *d}
+		"the package's whole print moved": func(now *fingerprint, _ *cachedPackage) {
+			now.Whole = "other"
+		},
+		"a dependency's whole print moved": func(now *fingerprint, _ *cachedPackage) {
+			now.Deps["example.com/dep"] = pkgPrint{Whole: "other", Decls: now.Deps["example.com/dep"].Decls}
+		},
+		// An init runs before every test in the binary.
+		"an init added": func(now *fingerprint, _ *cachedPackage) {
+			now.Decls["a.go:init#0"] = initAt("i")
+		},
+		"an init removed": func(_ *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i")
+		},
+		"an init changed": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i")
+			now.Decls["a.go:init#0"] = initAt("i2")
+		},
+		"an init naming a changed name": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:init#0"] = initAt("i", "limit")
+			now.Decls["a.go:init#0"] = initAt("i", "limit")
+			now.Decls["a.go:const limit"] = spec(kindConst, "limit", 13, "limit2")
+		},
+		"an init in a dependency": func(now *fingerprint, _ *cachedPackage) {
+			setDep(now, "dep/dep.go:init#0", declPrint{Hash: "i", Kind: kindInit})
+		},
+		// A var that calls something at initialisation runs it for every
+		// test, and so does TestMain.
+		"a var run at initialisation changed": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s")
+			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s2")
+		},
+		"a var run at initialisation naming a changed name": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s", "limit")
+			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s", "limit")
+			now.Decls["a.go:const limit"] = spec(kindConst, "limit", 13, "limit2")
+		},
+		"a var run at initialisation in a dependency naming a changed name": func(now *fingerprint, cached *cachedPackage) {
+			run := declPrint{Hash: "r", Kind: kindRun, Names: []string{"Start"}, header: idents("Box"), text: idents("Box")}
+			cached.Fingerprint.Deps["example.com/dep"].Decls["dep/dep.go:run Start"] = run
+			setDep(now, "dep/dep.go:run Start", run)
+			setDep(now, "dep/dep.go:type Box", declPrint{Hash: "box2", Kind: kindType, Names: []string{"Box"}})
+		},
+		"a var becoming one run at initialisation": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:var start"] = spec(kindVar, "start", 15, "s")
+			now.Decls["a.go:run start"] = spec(kindRun, "start", 15, "s2")
+		},
+		"a TestMain": func(now *fingerprint, _ *cachedPackage) {
+			now.Decls["a_test.go:TestMain#0"] = declPrint{Hash: "m", Kind: kindRun, File: "a_test.go"}
+		},
+		// Nothing to pair it by.
+		"a blank declaration changed": func(now *fingerprint, cached *cachedPackage) {
+			cached.Fingerprint.Decls["a.go:blank #0"] = spec(kindBlank, "", 15, "b")
+			now.Decls["a.go:blank #0"] = spec(kindBlank, "", 15, "b2")
+		},
+		"a linknamed declaration changed": func(now *fingerprint, _ *cachedPackage) {
+			f := fn("F", 3, 7, "f2", "limit")
+			f.Linked = true
+			now.Decls["a.go:F"] = f
+		},
+		// The profile and the print disagree about the package: the mapping
+		// covers a file no entity accounts for, so where its blocks have moved
+		// to cannot be worked out.
+		"a kept block in no entity": func(_ *fingerprint, cached *cachedPackage) {
+			cached.Tests["TestG"] = Profile{"elsewhere.go": {{StartLine: 4, EndLine: 6}}}
 		},
 	}
 
@@ -495,49 +416,67 @@ func TestReusableRefusesADependencyChangeItCannotAttribute(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			dep := depBase()
-			now := nowWithDep(depBase())
-			now.Deps = change(&dep)
-			if kept, ok := reusable(withDeps(depBase()), now); ok {
-				t.Errorf("want a whole-package re-map, kept %d mappings", len(kept))
-			}
-		})
-	}
-
-	// A removed init stops running for every test, and a removed method
-	// changes which interfaces its receiver satisfies.
-	for name, kind := range map[string]string{"an init was removed": kindInit, "a method was removed": kindMethod} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			was := depBase()
-			was.Decls["dep/dep.go:x"] = depDecl{Hash: "x", Sig: "x-sig", Kind: kind}
-			if kept, ok := reusable(withDeps(was), nowWithDep(depBase())); ok {
-				t.Errorf("want a whole-package re-map, kept %d mappings", len(kept))
+			now, cached := pkg()
+			change(&now, &cached)
+			if kept, ok := reusable(cached, now); ok {
+				t.Errorf("want the whole package re-mapped, got %v kept", keptNames(kept))
 			}
 		})
 	}
 }
 
-// A dependency whose blocks could not be told apart by function — a //line
-// directive can name any file and line — is recorded as a whole, and then any
-// function of it changing dirties the test.
-func TestReusableDirtiesATestThatExecutedADependencyAsAWhole(t *testing.T) {
+// A kept mapping has to answer about where its code is now: each block moves
+// by the distance its entity moved, which may differ from entity to entity.
+func TestReusableMovesKeptMappingsWithTheirEntities(t *testing.T) {
 	t.Parallel()
 
-	cached := withDeps(depBase())
-	cached.Deps = map[string][]string{"TestG": {depWhole("example.com/dep")}}
-	dep := depBase()
-	dep.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig"}
+	now, cached := pkg()
+	// F grew by two lines and changed; G moved down with it; a var holding a
+	// function literal, which instrumented code can live in, moved by one.
+	cached.Fingerprint.Decls["a.go:var hook"] = declPrint{Hash: "hook", Kind: kindVar, Names: []string{"hook"},
+		File: "a.go", Start: 15, End: 17, header: idents("hook"), text: idents("hook")}
+	now.Decls["a.go:var hook"] = declPrint{Hash: "hook", Kind: kindVar, Names: []string{"hook"},
+		File: "a.go", Start: 16, End: 18, header: idents("hook"), text: idents("hook")}
+	now.Decls["a.go:F"] = fn("F", 3, 9, "f2", "limit")
+	now.Decls["a.go:G"] = fn("G", 11, 13, "g")
+	cached.Tests["TestHook"] = Profile{"a.go": {{StartLine: 16, StartCol: 3, EndLine: 16, EndCol: 9}}}
+	now.Decls["a_test.go:TestHook"] = testFn("TestHook", "TestHook", "th")
+	cached.Fingerprint.Decls["a_test.go:TestHook"] = testFn("TestHook", "TestHook", "th")
 
-	kept, ok := reusable(cached, nowWithDep(dep))
+	kept, ok := reusable(cached, now)
 	if !ok {
-		t.Fatal("want the change narrowed, got a whole-package re-map")
+		t.Fatal("want a narrowed re-map, got a whole-package one")
 	}
-	if _, still := kept["TestG"]; still {
-		t.Error("want TestG re-mapped: it executed the dependency as a whole")
+	want := map[string]Profile{
+		"TestG":    {"a.go": {{StartLine: 12, StartCol: 1, EndLine: 12, EndCol: 2}}},
+		"TestHook": {"a.go": {{StartLine: 17, StartCol: 3, EndLine: 17, EndCol: 9}}},
 	}
-	if _, still := kept["TestF"]; !still {
-		t.Error("want TestF kept: it executed nothing in the dependency that changed")
+	if diff := cmp.Diff(want, kept); diff != "" {
+		t.Errorf("kept the wrong mappings, or in the wrong place (-want +got):\n%s", diff)
+	}
+}
+
+func TestReboundNamesComparesImportTablesByLocalName(t *testing.T) {
+	t.Parallel()
+
+	was := map[string]map[string]string{
+		"a.go": {"st": "m/pg", "fmt": "fmt", "gone": "m/gone"},
+		"b.go": {"?m/x": "m/x"},
+		"c.go": {"os": "os"},
+	}
+	now := map[string]map[string]string{
+		"a.go": {"st": "m/mem", "fmt": "fmt", "added": "m/added"},
+		"b.go": {"?m/y": "m/y"},
+		"c.go": {"os": "os"},
+	}
+	got := reboundNames(was, now)
+	if a := got["a.go"]; a.all || !a.names["st"] || !a.names["gone"] || !a.names["added"] || a.names["fmt"] {
+		t.Errorf("want st, gone and added rebound in a.go and fmt not, got %+v", a)
+	}
+	if !got["b.go"].all {
+		t.Errorf("want b.go rebound whole, got %+v", got["b.go"])
+	}
+	if _, found := got["c.go"]; found {
+		t.Errorf("want nothing rebound in c.go, got %+v", got["c.go"])
 	}
 }
