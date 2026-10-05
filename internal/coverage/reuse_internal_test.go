@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 // oneTest is a package with a single mapping covering lines 4 to 6 of a.go,
@@ -353,5 +354,190 @@ func TestReusableKeepsMappingsAcrossAnAddedOrdinaryFunction(t *testing.T) {
 	}
 	if _, still := kept["TestF"]; !still {
 		t.Error("want TestF kept")
+	}
+}
+
+// withDeps is oneTest built on a package with one in-scope dependency,
+// example.com/dep, whose function Clamp TestF executed and whose function Size
+// it did not. A second test, TestG, executed nothing in the dependency.
+func withDeps(dep depPrint) cachedPackage {
+	base := map[string]declPrint{
+		"a.go:F": decl("a.go", 3, 7, "f", ""),
+		"a.go:G": decl("a.go", 9, 11, "g", ""),
+	}
+
+	return cachedPackage{
+		Fingerprint: fingerprint{
+			Shell: "shell", Inputs: inputsHash, Decls: base,
+			Deps: map[string]depPrint{"example.com/dep": dep},
+		},
+		Tests: map[string]Profile{
+			"TestF": {"a.go": {{StartLine: 4, StartCol: 1, EndLine: 6, EndCol: 2}}},
+			"TestG": {"a.go": {{StartLine: 10, StartCol: 1, EndLine: 10, EndCol: 2}}},
+		},
+		Deps: map[string][]string{"TestF": {"dep/dep.go:Clamp"}},
+	}
+}
+
+// depBase is the dependency as withDeps maps it.
+func depBase() depPrint {
+	return depPrint{Shell: "dep-shell", Decls: map[string]depDecl{
+		"dep/dep.go:Clamp": {Hash: "clamp", Sig: "clamp-sig"},
+		"dep/dep.go:Size":  {Hash: "size", Sig: "size-sig"},
+	}}
+}
+
+// now is the package of withDeps again, unchanged except for its dependency.
+func nowWithDep(dep depPrint) fingerprint {
+	cached := withDeps(dep)
+
+	return cached.Fingerprint
+}
+
+// A dependency's lines are recorded per test as the functions it executed, so a
+// changed body there is attributable exactly as one here is: a test that never
+// executed the function cannot behave differently for its body changing.
+func TestReusableNarrowsAcrossADependencyBodyChange(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		change func(d *depPrint)
+		kept   []string
+	}{
+		"a body a test executed": {
+			change: func(d *depPrint) { d.Decls["dep/dep.go:Clamp"] = depDecl{Hash: "clamp2", Sig: "clamp-sig"} },
+			kept:   []string{"TestG"},
+		},
+		"a body no test executed": {
+			change: func(d *depPrint) { d.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig"} },
+			kept:   []string{"TestF", "TestG"},
+		},
+		// Reaching a removed function took a call, and that call is a change of
+		// its own to a body some test executed.
+		"a function no test executed was removed": {
+			change: func(d *depPrint) { delete(d.Decls, "dep/dep.go:Size") },
+			kept:   []string{"TestF", "TestG"},
+		},
+		"an ordinary function was added": {
+			change: func(d *depPrint) { d.Decls["dep/dep.go:Extra"] = depDecl{Hash: "x", Sig: "x-sig"} },
+			kept:   []string{"TestF", "TestG"},
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dep := depBase()
+			tc.change(&dep)
+			kept, ok := reusable(withDeps(depBase()), nowWithDep(dep))
+			if !ok {
+				t.Fatal("want the change narrowed, got a whole-package re-map")
+			}
+			var got []string
+			for name := range kept {
+				got = append(got, name)
+			}
+			if diff := cmp.Diff(tc.kept, got, cmpopts.SortSlices(func(a, b string) bool { return a < b })); diff != "" {
+				t.Errorf("kept the wrong mappings (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// Everything about a dependency that is not one function's body is still
+// all-or-nothing: none of it is a function a test can be said to have executed
+// or not.
+func TestReusableRefusesADependencyChangeItCannotAttribute(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]func(d *depPrint) map[string]depPrint{
+		// A const, a type, a var, an import, a non-Go file, embedded data.
+		"its shell moved": func(d *depPrint) map[string]depPrint {
+			d.Shell = "dep-shell2"
+
+			return map[string]depPrint{"example.com/dep": *d}
+		},
+		// A changed signature can rebind a call site that did not change: a
+		// handler passed as a value and reflected over is called by nothing
+		// the test executed in this module.
+		"a signature changed": func(d *depPrint) map[string]depPrint {
+			d.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig2"}
+
+			return map[string]depPrint{"example.com/dep": *d}
+		},
+		"an init changed": func(d *depPrint) map[string]depPrint {
+			d.Decls["dep/dep.go:init"] = depDecl{Hash: "i", Sig: "i-sig", Kind: kindInit}
+
+			return map[string]depPrint{"example.com/dep": *d}
+		},
+		"a method was added": func(d *depPrint) map[string]depPrint {
+			d.Decls["dep/dep.go:T.String"] = depDecl{Hash: "m", Sig: "m-sig", Kind: kindMethod}
+
+			return map[string]depPrint{"example.com/dep": *d}
+		},
+		"a function shadowing a predeclared identifier was added": func(d *depPrint) map[string]depPrint {
+			d.Decls["dep/dep.go:min"] = depDecl{Hash: "m", Sig: "m-sig"}
+
+			return map[string]depPrint{"example.com/dep": *d}
+		},
+		// What the binary links changed, and a new dependency's lines were in
+		// no mapping at all.
+		"a dependency was added": func(d *depPrint) map[string]depPrint {
+			return map[string]depPrint{"example.com/dep": *d, "example.com/other": {Shell: "o"}}
+		},
+		"a dependency was replaced": func(d *depPrint) map[string]depPrint {
+			return map[string]depPrint{"example.com/other": *d}
+		},
+	}
+
+	for name, change := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dep := depBase()
+			now := nowWithDep(depBase())
+			now.Deps = change(&dep)
+			if kept, ok := reusable(withDeps(depBase()), now); ok {
+				t.Errorf("want a whole-package re-map, kept %d mappings", len(kept))
+			}
+		})
+	}
+
+	// A removed init stops running for every test, and a removed method
+	// changes which interfaces its receiver satisfies.
+	for name, kind := range map[string]string{"an init was removed": kindInit, "a method was removed": kindMethod} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			was := depBase()
+			was.Decls["dep/dep.go:x"] = depDecl{Hash: "x", Sig: "x-sig", Kind: kind}
+			if kept, ok := reusable(withDeps(was), nowWithDep(depBase())); ok {
+				t.Errorf("want a whole-package re-map, kept %d mappings", len(kept))
+			}
+		})
+	}
+}
+
+// A dependency whose blocks could not be told apart by function — a //line
+// directive can name any file and line — is recorded as a whole, and then any
+// function of it changing dirties the test.
+func TestReusableDirtiesATestThatExecutedADependencyAsAWhole(t *testing.T) {
+	t.Parallel()
+
+	cached := withDeps(depBase())
+	cached.Deps = map[string][]string{"TestG": {depWhole("example.com/dep")}}
+	dep := depBase()
+	dep.Decls["dep/dep.go:Size"] = depDecl{Hash: "size2", Sig: "size-sig"}
+
+	kept, ok := reusable(cached, nowWithDep(dep))
+	if !ok {
+		t.Fatal("want the change narrowed, got a whole-package re-map")
+	}
+	if _, still := kept["TestG"]; still {
+		t.Error("want TestG re-mapped: it executed the dependency as a whole")
+	}
+	if _, still := kept["TestF"]; !still {
+		t.Error("want TestF kept: it executed nothing in the dependency that changed")
 	}
 }

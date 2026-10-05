@@ -23,12 +23,15 @@ import (
 	"go/token"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/spf13/viper"
 
+	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
@@ -69,6 +72,17 @@ const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
 // pairs separated by newlines, which is how a test changes the build
 // environment without changing a byte of source.
 const goEnvEnv = "GREMLINS_TEST_GO_ENV"
+
+// notMainEnv names a package the helper's dependency listing reports as
+// belonging to a module that is not a main module — a replace target, or a
+// vendored or module-cache dependency that somehow sits outside both — which
+// is a dependency the map builder must not instrument.
+const notMainEnv = "GREMLINS_TEST_NOT_MAIN"
+
+// extraProfileEnv carries profile lines the helper appends to every profile it
+// writes, after dropping what the binary did not instrument: a block of a name
+// no package claims, as a //line directive can produce.
+const extraProfileEnv = "GREMLINS_TEST_EXTRA_PROFILE"
 
 // The fixture has real sources as well as real directories, because the map
 // cache reads them: what a package's source looked like when its map was made
@@ -195,6 +209,12 @@ func buildMap(t *testing.T, helper string) *coverage.TestMap {
 
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	t.Cleanup(log.Reset)
+
+	// These cases are about seeing a test in one package execute a line in
+	// another, which only a --cross-package map records: without it a test's
+	// profile holds its own package's lines and nothing else.
+	viper.Set(configuration.UnleashCrossPackageKey, true)
+	t.Cleanup(func() { viper.Set(configuration.UnleashCrossPackageKey, false) })
 
 	root := fixtureRoot(t)
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
@@ -323,17 +343,20 @@ const (
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileSizeAscending = "mode: set\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
+	// TestDouble also executes the start of vm's Clamp, which its binary
+	// records only once vm is instrumented alongside calc.
 	profileDouble = "mode: set\n" +
-		"example.com/calc/calc.go:3.24,5.2 1 1\n"
+		"example.com/calc/calc.go:3.24,5.2 1 1\n" +
+		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileTriple = "mode: set\n" +
 		"example.com/calc/calc.go:7.24,9.2 1 1\n"
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
-	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "")
+	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -355,6 +378,8 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv strin
 			invocationLogEnv + "=" + logPath,
 			listOnlyEnv + "=" + listOnly,
 			goEnvEnv + "=" + goEnv,
+			notMainEnv + "=" + notMain,
+			extraProfileEnv + "=" + extraProfile,
 		}
 
 		return cmd
@@ -432,7 +457,9 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 			fmt.Fprintln(os.Stderr, "build failed")
 			os.Exit(1) // skipcq: RVV-A0003
 		}
-		writeOrDie(out, "#!/bin/false\n")
+		// The binary records what it was instrumented for, which is what
+		// decides whose lines its profiles can name.
+		writeOrDie(out, "#!/bin/false\ncoverpkg="+flagValue(os.Args, "-coverpkg")+"\n")
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -466,8 +493,38 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		fmt.Fprintln(os.Stderr, "unexpected -test.run "+run)
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
+	writeOrDie(flagValue(os.Args, "-test.coverprofile"), instrumentedOnly(cmd, profile))
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// instrumentedOnly drops the blocks of every package the binary was not
+// instrumented for, as a real coverage profile never holds them: a binary built
+// with -coverpkg for its own package names no line of a dependency.
+func instrumentedOnly(binary, profile string) string {
+	data, err := os.ReadFile(binary) //nolint:gosec // the binary this helper wrote itself
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1) // skipcq: RVV-A0003
+	}
+	_, coverPkg, _ := strings.Cut(string(data), "coverpkg=")
+	coverPkg = strings.TrimSpace(coverPkg)
+	if strings.Contains(coverPkg, "...") {
+		return profile
+	}
+	scope := map[string]bool{}
+	for _, p := range strings.Split(coverPkg, ",") {
+		scope[p] = true
+	}
+	lines := strings.Split(profile, "\n")
+	kept := []string{lines[0]}
+	for _, line := range lines[1:] {
+		file, _, _ := strings.Cut(line, ":")
+		if scope[path.Dir(file)] {
+			kept = append(kept, line)
+		}
+	}
+
+	return strings.Join(kept, "\n") + "\n" + os.Getenv(extraProfileEnv)
 }
 
 // listPackagesAsGo writes the package lines `go list -f` would, narrowed to one
@@ -537,12 +594,16 @@ func envAsGo(args []string) {
 // The package itself is listed twice, as go does: once as it is and once as
 // recompiled for its own test binary, under the bracketed name go gives that.
 func listDepsAsGo(root, pkg string) {
-	if pkg != "example.com/vm" {
-		fmt.Fprintf(os.Stdout, "example.com/vm [%s.test]\t%s\n", pkg, filepath.Join(root, "vm"))
-		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\n", filepath.Join(root, "vm"))
+	const vm = "example.com/vm"
+	main := os.Getenv(notMainEnv) != vm
+	if pkg != vm {
+		fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\t%t\n", vm, pkg, filepath.Join(root, "vm"), main)
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%t\n", vm, filepath.Join(root, "vm"), main)
 	}
-	fmt.Fprintf(os.Stdout, "%s\t%s\n", pkg, filepath.Join(root, dirOf(pkg)))
-	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\n", pkg, pkg, filepath.Join(root, dirOf(pkg)))
+	fmt.Fprintf(os.Stdout, "%s\t%s\ttrue\n", pkg, filepath.Join(root, dirOf(pkg)))
+	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\ttrue\n", pkg, pkg, filepath.Join(root, dirOf(pkg)))
+	// A standard-library package belongs to no module at all.
+	fmt.Fprintf(os.Stdout, "testing\t/nonexistent/goroot/src/testing\t\n")
 	// go writes build diagnostics to the same stream, and a synthesised test
 	// package can report no directory at all.
 	fmt.Fprintln(os.Stdout, "")
