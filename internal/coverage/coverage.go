@@ -57,9 +57,23 @@ type Coverage struct {
 	integrationMode bool
 
 	// Read once per run and shared by every package the map builder visits:
-	// what the toolchain is, and what each dependency directory hashes to.
-	env       *goEnvironment
-	dirHashes map[string]string
+	// what the toolchain is, what each dependency directory hashes to, what
+	// each package links, what each instrumented dependency looks like, and
+	// what each package is called.
+	env         *goEnvironment
+	dirHashes   map[string]string
+	depListings map[string]depListing
+	depSources  map[string]*depSource
+	// pkgNames is each listed package's name by import path, which is what
+	// an unnamed import binds.
+	pkgNames map[string]string
+	// types is what the type-checker said about each package, and
+	// typesTried every package it was asked about, whatever it said (see
+	// typeFactsOf). typeLoader replaces go/packages for the tests that
+	// stand a fake in for the go command; nil is the real one.
+	types      map[typesKey]typeFacts
+	typesTried map[typesKey]bool
+	typeLoader typeLoader
 
 	// When profilePath is set, Run parses that pre-computed profile instead
 	// of gathering coverage itself, and reports profileElapsed as the test
@@ -272,24 +286,8 @@ func (c *Coverage) parse(data io.Reader) (Profile, error) {
 	if err != nil {
 		return nil, err
 	}
-	status := make(Profile)
-	for _, p := range profiles {
-		for _, b := range p.Blocks {
-			if b.Count == 0 {
-				continue
-			}
-			block := Block{
-				StartLine: b.StartLine,
-				StartCol:  b.StartCol,
-				EndLine:   b.EndLine,
-				EndCol:    b.EndCol,
-			}
-			fn := c.removeModuleFromPath(p)
-			status[fn] = append(status[fn], block)
-		}
-	}
 
-	return status, nil
+	return c.blocksOf(profiles), nil
 }
 
 // removeModuleFromPath is the name a profile block is recorded under: the file's

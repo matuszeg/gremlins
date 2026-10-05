@@ -18,11 +18,14 @@ package coverage
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 )
@@ -288,6 +291,17 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		Tests: map[string]Profile{
 			"TestOne": {"a.go": {{StartLine: 1, StartCol: 2, EndLine: 3, EndCol: 4}}},
 		},
+		// The package's own print is embedded in the fingerprint, and has to
+		// come back as the fields it was written from.
+		Fingerprint: fingerprint{
+			pkgPrint: pkgPrint{
+				Whole:   "whole",
+				Decls:   map[string]declPrint{"a.go:F": {Hash: "h", Sig: "s", Names: []string{"F"}, File: "a.go", Start: 1, End: 3}},
+				Imports: map[string]map[string]string{"a.go": {"fmt": "fmt"}},
+			},
+			Inputs: "inputs",
+			Deps:   map[string]pkgPrint{"example.com/q": {Whole: "q", Decls: map[string]declPrint{"q/q.go:G": {Hash: "g"}}}},
+		},
 	}
 
 	t.Run("a package written into a directory round-trips", func(t *testing.T) {
@@ -302,7 +316,7 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		if !ok {
 			t.Fatal("want the package read back, got a miss")
 		}
-		if diff := cmp.Diff(entry, got); diff != "" {
+		if diff := cmp.Diff(entry, got, cmp.AllowUnexported(fingerprint{}), cmpopts.IgnoreUnexported(declPrint{})); diff != "" {
 			t.Errorf("cache round-trip mismatch (-want +got):\n%s", diff)
 		}
 	})
@@ -315,10 +329,10 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		"a file that is not json":  "{not json",
 		"a file from another version": `{"version":999,"import_path":"example.com/p",` +
 			`"build_id":"id","tests":{}}`,
-		"a file naming another package": `{"version":2,"import_path":"example.com/other",` +
+		"a file naming another package": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/other",` +
 			`"build_id":"id","tests":{}}`,
-		"a file with no tests map": `{"version":2,"import_path":"example.com/p","build_id":"id"}`,
-		"a file with no build ID": `{"version":2,"import_path":"example.com/p",` +
+		"a file with no tests map": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/p","build_id":"id"}`,
+		"a file with no build ID": `{"version":` + strconv.Itoa(cacheVersion) + `,"import_path":"example.com/p",` +
 			`"build_id":"","tests":{}}`,
 	}
 	for name, content := range unusable {
@@ -386,15 +400,27 @@ func TestCachePathIsOutsideTheModule(t *testing.T) {
 		t.Errorf("want the cache under %s, got %s", dir, path)
 	}
 
-	// Two checkouts of the same module must not share a map: the same code at
-	// two paths can still map differently, and the second would inherit it.
+	// Two checkouts of the same module share a map: that is what lets a CI
+	// runner use a map another runner made under its own work directory. Each
+	// entry still has to agree with the package's build ID, or with its
+	// fingerprint and Inputs, before anything in it is used.
 	other := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.com", Root: t.TempDir()}}
 	otherPath, err := other.cacheDirPath("key")
 	if err != nil {
 		t.Fatalf("cacheDirPath() error: %v", err)
 	}
-	if path == otherPath {
-		t.Error("two checkouts of the same module must not share a cache directory")
+	if path != otherPath {
+		t.Errorf("want two checkouts of one module to share a cache directory, got %s and %s", path, otherPath)
+	}
+
+	// Two modules never do, wherever they are.
+	another := &Coverage{cacheDir: dir, mod: gomodule.GoModule{Name: "example.org", Root: "."}}
+	anotherPath, err := another.cacheDirPath("key")
+	if err != nil {
+		t.Fatalf("cacheDirPath() error: %v", err)
+	}
+	if path == anotherPath {
+		t.Error("two modules must not share a cache directory")
 	}
 
 	// The key names a directory rather than living inside the files, so a map
@@ -422,5 +448,213 @@ func TestCacheFilePathSeparatesImportPaths(t *testing.T) {
 	// An import path holds separators, so it cannot be a file name as it is.
 	if filepath.Dir(a) != dir {
 		t.Errorf("want the file directly under %s, got %s", dir, a)
+	}
+}
+
+// The flags a test binary is compiled with decide what it is, so a change to
+// them must stop a map being reused even where nothing else would: they are
+// read from one place for the compile and for Inputs.
+func TestBuildInputsChangeWithTheCompileFlags(t *testing.T) {
+	t.Parallel()
+
+	inputsWith := func(change func(c *Coverage)) string {
+		t.Helper()
+
+		root := t.TempDir()
+		c := &Coverage{
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture"},
+			// No dependencies: the flags are the only thing that differs.
+			cmdContext: func(string, ...string) *exec.Cmd { return exec.Command("true") },
+		}
+		change(c)
+		sum, ok := c.buildInputsOf(&testPackage{importPath: "example.com/p", dir: root})
+		if !ok {
+			t.Fatal("buildInputsOf() failed")
+		}
+
+		return sum
+	}
+
+	plain := inputsWith(func(*Coverage) {})
+	if plain != inputsWith(func(*Coverage) {}) {
+		t.Fatal("want the same inputs from the same flags, wherever the module is")
+	}
+	changes := map[string]func(c *Coverage){
+		"build tags": func(c *Coverage) { c.buildTags = "integration" },
+		"the coverage scope": func(c *Coverage) {
+			c.crossPackage = true
+			c.coverPkg = "example.com/..."
+		},
+	}
+	for name, change := range changes {
+		if inputsWith(change) == plain {
+			t.Errorf("want %s to change the inputs", name)
+		}
+	}
+}
+
+// Which packages the binary links, the standard library's included, and the
+// go.mod of every main module it links a package of are part of what it is
+// built from: a newly linked package's initialisation runs in every test, and
+// a member's go and godebug lines change what its unchanged source does.
+func TestBuildInputsChangeWithWhatIsLinked(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	member := filepath.Join(root, "member", "go.mod")
+	vendored := filepath.Join(root, "vendored", "go.mod")
+	for _, path := range []string{member, vendored} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("cannot create the directory: %v", err)
+		}
+	}
+	inputsWith := func(memberMod, vendoredMod string, extra ...string) string {
+		t.Helper()
+
+		if err := os.WriteFile(member, []byte(memberMod), 0o600); err != nil {
+			t.Fatalf("cannot write the go.mod: %v", err)
+		}
+		if err := os.WriteFile(vendored, []byte(vendoredMod), 0o600); err != nil {
+			t.Fatalf("cannot write the go.mod: %v", err)
+		}
+		listing := strings.Join(append([]string{
+			"example.com/p\t" + root + "\ttrue\tp\t" + filepath.Join(root, "go.mod"),
+			"example.com/member/m\t" + filepath.Dir(member) + "\ttrue\tm\t" + member,
+			"example.org/vendored\t" + filepath.Dir(vendored) + "\tfalse\tvendored\t" + vendored,
+			"testing\t/nonexistent/goroot/src/testing\t\ttesting\t",
+			// The synthesised test main has no directory, and is linked.
+			"example.com/p.test\t\t\tmain\t",
+		}, extra...), "\n")
+		c := &Coverage{
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture", root: "/nonexistent/goroot"},
+			cmdContext: func(string, ...string) *exec.Cmd {
+				return exec.Command("printf", "%s\n", listing) //nolint:gosec // a fixed program, given the test's own listing
+			},
+			// The vendored directory is hashed whole; only its go.mod is
+			// of interest here, and it is the same file either way.
+			dirHashes: map[string]string{filepath.Dir(vendored): "vendored"},
+		}
+		sum, ok := c.buildInputsOf(&testPackage{importPath: "example.com/p", dir: root})
+		if !ok {
+			t.Fatal("buildInputsOf() failed")
+		}
+
+		return sum
+	}
+
+	plain := inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n")
+	if diff := cmp.Diff(plain, inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n\ngo 1.25\n")); diff != "" {
+		t.Errorf("want a go.mod outside every main module left to go.sum, got the inputs moved:\n%s", diff)
+	}
+	if inputsWith("module example.com/member\n\ngo 1.22\n\ngodebug panicnil=1\n", "module example.org/vendored\n") == plain {
+		t.Error("want a workspace member's go.mod to change the inputs")
+	}
+	if inputsWith("module example.com/member\n\ngo 1.22\n", "module example.org/vendored\n",
+		"crypto/md5\t/nonexistent/goroot/src/crypto/md5\t\tmd5\t") == plain {
+		t.Error("want a newly linked standard-library package to change the inputs")
+	}
+}
+
+func TestTestBuildFlags(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	own := filepath.Join(root, "p")
+	// What `go list -deps -test` says the package's test binary links: two
+	// packages of main modules (in either order), the package itself, a
+	// replace target, and the standard library.
+	listing := strings.Join([]string{
+		"example.com/z\t" + filepath.Join(root, "z") + "\ttrue",
+		"example.com/a [example.com/p.test]\t" + filepath.Join(root, "a") + "\ttrue",
+		"example.com/p\t" + own + "\ttrue",
+		"example.org/replaced\t" + filepath.Join(root, "r") + "\tfalse",
+		"testing\t/nonexistent/goroot/src/testing\t",
+	}, "\n")
+	newCov := func(cross bool) *Coverage {
+		return &Coverage{
+			buildTags: "integration", crossPackage: cross,
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture", root: "/nonexistent/goroot"},
+			cmdContext: func(string, ...string) *exec.Cmd {
+				return exec.Command("printf", "%s\n", listing) //nolint:gosec // a fixed program, given the test's own listing
+			},
+		}
+	}
+	pkg := &testPackage{importPath: "example.com/p", dir: own}
+
+	// The package's own lines are what its mapping means; its main-module
+	// dependencies are instrumented beside it so that a change in one can be
+	// narrowed across rather than re-mapping the package.
+	want := []string{"-tags", "integration", "-coverpkg", "example.com/p,example.com/a,example.com/z"}
+	if diff := cmp.Diff(want, newCov(false).testBuildFlags(pkg)); diff != "" {
+		t.Errorf("testBuildFlags() mismatch (-want +got):\n%s", diff)
+	}
+
+	// Cross-package mapping instruments the whole module already.
+	want = []string{"-tags", "integration", "-coverpkg", wholeModule}
+	if diff := cmp.Diff(want, newCov(true).testBuildFlags(pkg)); diff != "" {
+		t.Errorf("cross-package testBuildFlags() mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestTestIDNamesThePackageAndTheTest(t *testing.T) {
+	t.Parallel()
+
+	if got := (TestID{Pkg: "example.com/p", Name: "TestF"}).String(); got != "example.com/p.TestF" {
+		t.Errorf("String() = %q", got)
+	}
+}
+
+// Without a directory named for it the cache goes under the user's cache
+// directory, and a user with none still gets a run, just not a cache.
+func TestCachePathDefaultsToTheUserCacheDirectory(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", base)
+	t.Setenv("HOME", base)
+
+	c := &Coverage{mod: gomodule.GoModule{Name: "example.com", Root: "."}}
+	path, err := c.cacheDirPath("key")
+	if err != nil {
+		t.Fatalf("cacheDirPath() error: %v", err)
+	}
+	if !strings.HasPrefix(path, base) {
+		t.Errorf("want the cache under %s, got %s", base, path)
+	}
+
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+	if _, err := c.cacheDirPath("key"); err == nil {
+		t.Error("want an error when there is no user cache directory")
+	}
+}
+
+// A dependency directory that stays in Inputs is hashed once per run however
+// many packages link it, and a failure to read it is remembered as one.
+func TestHashDirIsReadOncePerRun(t *testing.T) {
+	t.Parallel()
+
+	c := &Coverage{}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+	first, ok := c.hashDir(dir)
+	if !ok {
+		t.Fatal("want the directory hashed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package b\n"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+	if again, ok := c.hashDir(dir); !ok || again != first {
+		t.Error("want the run's first reading back")
+	}
+
+	gone := filepath.Join(t.TempDir(), "gone")
+	for range 2 {
+		if _, ok := c.hashDir(gone); ok {
+			t.Error("want a failure for a directory that is not there")
+		}
 	}
 }

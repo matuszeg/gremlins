@@ -18,16 +18,20 @@ package coverage_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/spf13/viper"
 
+	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
@@ -64,6 +68,22 @@ const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
 // used to evict the rest of the module's map.
 const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
 
+// goEnvEnv overrides what the helper reports for `go env`, as "NAME=value"
+// pairs separated by newlines, which is how a test changes the build
+// environment without changing a byte of source.
+const goEnvEnv = "GREMLINS_TEST_GO_ENV"
+
+// notMainEnv names a package the helper's dependency listing reports as
+// belonging to a module that is not a main module — a replace target, or a
+// vendored or module-cache dependency that somehow sits outside both — which
+// is a dependency the map builder must not instrument.
+const notMainEnv = "GREMLINS_TEST_NOT_MAIN"
+
+// extraProfileEnv carries profile lines the helper appends to every profile it
+// writes, after dropping what the binary did not instrument: a block of a name
+// no package claims, as a //line directive can produce.
+const extraProfileEnv = "GREMLINS_TEST_EXTRA_PROFILE"
+
 // The fixture has real sources as well as real directories, because the map
 // cache reads them: what a package's source looked like when its map was made
 // is how a run decides which of its mappings a change reached. The line numbers
@@ -99,6 +119,32 @@ func Clamp(n, lo, hi int) int {
 
 func Size(v []int) int {
 	return len(v)
+}
+`
+)
+
+// The test files declare the tests the helper process lists and runs. Nothing
+// reads their bodies — the profiles are canned — but a mapping is only kept
+// for a test whose declaration says what it is.
+const (
+	vmTestSource = `package vm
+
+import "testing"
+
+func TestSizeAscending(t *testing.T) {
+	_ = Clamp(1, 0, 2)
+}
+`
+	rootTestSource = `package root
+
+import "testing"
+
+func TestRangeDescending(t *testing.T) {
+	_ = Descend(1)
+}
+
+func TestRangeAscending(t *testing.T) {
+	_ = Ascend(1)
 }
 `
 )
@@ -172,6 +218,8 @@ func fixtureRoot(t *testing.T) string {
 	writeFixture(t, filepath.Join(root, "calc", "calc.go"), calcSource)
 	writeFixture(t, filepath.Join(root, "calc", "double_test.go"), doubleTestSource)
 	writeFixture(t, filepath.Join(root, "calc", "triple_test.go"), tripleTestSource)
+	writeFixture(t, filepath.Join(root, "vm", "vm_test.go"), vmTestSource)
+	writeFixture(t, filepath.Join(root, "root", "root_test.go"), rootTestSource)
 
 	return root
 }
@@ -190,12 +238,18 @@ func buildMap(t *testing.T, helper string) *coverage.TestMap {
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	t.Cleanup(log.Reset)
 
+	// These cases are about seeing a test in one package execute a line in
+	// another, which only a --cross-package map records: without it a test's
+	// profile holds its own package's lines and nothing else.
+	viper.Set(configuration.UnleashCrossPackageKey, true)
+	t.Cleanup(func() { viper.Set(configuration.UnleashCrossPackageKey, false) })
+
 	root := fixtureRoot(t)
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
 	// Every test gets its own cache directory: the real one belongs to whoever
 	// is running the suite, and a shared one would let one test answer another.
 	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(t.TempDir()))
+		coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes())
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {
@@ -317,17 +371,20 @@ const (
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileSizeAscending = "mode: set\n" +
 		"example.com/vm/vm.go:4.29,6.15 2 1\n"
+	// TestDouble also executes the start of vm's Clamp, which its binary
+	// records only once vm is instrumented alongside calc.
 	profileDouble = "mode: set\n" +
-		"example.com/calc/calc.go:3.24,5.2 1 1\n"
+		"example.com/calc/calc.go:3.24,5.2 1 1\n" +
+		"example.com/vm/vm.go:4.29,6.15 2 1\n"
 	profileTriple = "mode: set\n" +
 		"example.com/calc/calc.go:7.24,9.2 1 1\n"
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
-	return fakeGoCommandWith(helper, pkgRoot, "", "", "")
+	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -348,6 +405,9 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func
 			buildIDsEnv + "=" + buildIDs,
 			invocationLogEnv + "=" + logPath,
 			listOnlyEnv + "=" + listOnly,
+			goEnvEnv + "=" + goEnv,
+			notMainEnv + "=" + notMain,
+			extraProfileEnv + "=" + extraProfile,
 		}
 
 		return cmd
@@ -410,9 +470,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	if cmd == "go" && hasFlag(os.Args, "env") {
-		// A toolchain root and a module cache the fixture is not inside, so
-		// nothing the fixture holds is filtered out as already pinned.
-		fmt.Fprint(os.Stdout, "/nonexistent/goroot\n/nonexistent/modcache\ngo-fixture\n")
+		envAsGo(os.Args)
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -427,7 +485,9 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 			fmt.Fprintln(os.Stderr, "build failed")
 			os.Exit(1) // skipcq: RVV-A0003
 		}
-		writeOrDie(out, "#!/bin/false\n")
+		// The binary records what it was instrumented for, which is what
+		// decides whose lines its profiles can name.
+		writeOrDie(out, "#!/bin/false\ncoverpkg="+flagValue(os.Args, "-coverpkg")+"\n")
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -461,8 +521,38 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		fmt.Fprintln(os.Stderr, "unexpected -test.run "+run)
 		os.Exit(1) // skipcq: RVV-A0003
 	}
-	writeOrDie(flagValue(os.Args, "-test.coverprofile"), profile)
+	writeOrDie(flagValue(os.Args, "-test.coverprofile"), instrumentedOnly(cmd, profile))
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// instrumentedOnly drops the blocks of every package the binary was not
+// instrumented for, as a real coverage profile never holds them: a binary built
+// with -coverpkg for its own package names no line of a dependency.
+func instrumentedOnly(binary, profile string) string {
+	data, err := os.ReadFile(binary) //nolint:gosec // the binary this helper wrote itself
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1) // skipcq: RVV-A0003
+	}
+	_, coverPkg, _ := strings.Cut(string(data), "coverpkg=")
+	coverPkg = strings.TrimSpace(coverPkg)
+	if strings.Contains(coverPkg, "...") {
+		return profile
+	}
+	scope := map[string]bool{}
+	for _, p := range strings.Split(coverPkg, ",") {
+		scope[p] = true
+	}
+	lines := strings.Split(profile, "\n")
+	kept := []string{lines[0]}
+	for _, line := range lines[1:] {
+		file, _, _ := strings.Cut(line, ":")
+		if scope[path.Dir(file)] {
+			kept = append(kept, line)
+		}
+	}
+
+	return strings.Join(kept, "\n") + "\n" + os.Getenv(extraProfileEnv)
 }
 
 // listPackagesAsGo writes the package lines `go list -f` would, narrowed to one
@@ -482,14 +572,71 @@ func listPackagesAsGo(root, only string) {
 	}
 }
 
-// listDepsAsGo writes the directories `go list -deps -test` would, which is
-// what says whether a package was changed from underneath. Everything depends
-// on vm, so an edit there is the case where a package's own fingerprint looks
-// narrowable and its mappings are stale anyway.
+// envAsGo answers `go env -json NAME...` for the names asked, the way go does:
+// one JSON object, with an empty value for a name that is unset.
+//
+// The toolchain root and the module cache are ones the fixture is not inside,
+// so nothing the fixture holds is filtered out as already pinned. Everything
+// else is a plausible default that a test can override through goEnvEnv.
+func envAsGo(args []string) {
+	values := map[string]string{
+		"GOROOT":      "/nonexistent/goroot",
+		"GOMODCACHE":  "/nonexistent/modcache",
+		"GOVERSION":   "go-fixture",
+		"GOOS":        "linux",
+		"GOARCH":      "amd64",
+		"GOAMD64":     "v1",
+		"CGO_ENABLED": "1",
+	}
+	for _, pair := range strings.Split(os.Getenv(goEnvEnv), "\n") {
+		if name, value, ok := strings.Cut(pair, "="); ok {
+			values[name] = value
+		}
+	}
+	asked := map[string]string{}
+	afterJSON := false
+	for _, a := range args {
+		switch {
+		case a == "-json":
+			afterJSON = true
+		case afterJSON:
+			asked[a] = values[a]
+		}
+	}
+	out, err := json.Marshal(asked)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1) // skipcq: RVV-A0003
+	}
+	// A coverage-instrumented helper also writes a GOCOVERDIR warning, to
+	// stderr; a real go can write warnings there too. Neither is the answer.
+	fmt.Fprintln(os.Stderr, "go: warning: something unrelated")
+	fmt.Fprintln(os.Stdout, string(out))
+}
+
+// listDepsAsGo writes the packages `go list -deps -test` would, by import path
+// and directory, which is what says whether a package was changed from
+// underneath. Everything depends on vm, so an edit there is the case where a
+// package's own fingerprint looks narrowable and its mappings are stale anyway.
+//
+// The package itself is listed twice, as go does: once as it is and once as
+// recompiled for its own test binary, under the bracketed name go gives that.
+// Each line ends with the package's name, which is what an unnamed import of
+// it binds.
 func listDepsAsGo(root, pkg string) {
-	fmt.Fprintln(os.Stdout, filepath.Join(root, dirOf(pkg)))
-	if pkg != "example.com/vm" {
-		fmt.Fprintln(os.Stdout, filepath.Join(root, "vm"))
+	const vm = "example.com/vm"
+	main := os.Getenv(notMainEnv) != vm
+	if pkg != vm {
+		fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\t%t\tvm\n", vm, pkg, filepath.Join(root, "vm"), main)
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%t\tvm\n", vm, filepath.Join(root, "vm"), main)
+	}
+	name := path.Base(dirOf(pkg))
+	fmt.Fprintf(os.Stdout, "%s\t%s\ttrue\t%s\n", pkg, filepath.Join(root, dirOf(pkg)), name)
+	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\ttrue\t%s\n", pkg, pkg, filepath.Join(root, dirOf(pkg)), name)
+	// A standard-library package belongs to no module at all.
+	fmt.Fprintf(os.Stdout, "testing\t/nonexistent/goroot/src/testing\t\ttesting\n")
+	for _, std := range []string{"embed", "errors", "fmt", "regexp"} {
+		fmt.Fprintf(os.Stdout, "%s\t/nonexistent/goroot/src/%s\t\t%s\n", std, std, std)
 	}
 	// go writes build diagnostics to the same stream, and a synthesised test
 	// package can report no directory at all.

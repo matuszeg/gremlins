@@ -30,13 +30,38 @@ import (
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
-// Version 3 records the package's source fingerprint beside its mappings, so
-// that a changed package can keep the mappings the change could not have
-// touched. Version 2 was one file per package. Version 1 was one file per
-// module, which meant a run had to write back every package it had not looked
-// at or lose them — and a scoped run, which is the recommended workflow, looks
-// at one.
-const cacheVersion = 3
+// Version 11 asks the type-checker which vars read another package at
+// initialisation, which a dot import or a var holding another's address hides
+// from the syntax.
+// Version 10 names a method by its receiver type alone.
+// Version 9 records what each print's package reaches by import, which is
+// what moves the order packages are initialised in, in place of comparing
+// each file's imports; and prints TestMain as its own kind, which does not
+// count as seeing that order.
+// Version 8 carries each print's initialisation order as the type-checker
+// derives it, and refuses to narrow from a print it could not derive it for.
+// Version 7 folds every linked package and every main module's go.mod into
+// Inputs, records which vars read another package at initialisation, names a
+// local type's aliases among its names, lets fmt.Errorf through only over
+// operands with no method of the package's, and reads a test file by its
+// entities rather than its name.
+// Version 6 prints every top-level entity of a package and its instrumented
+// dependencies on its own — functions, methods, type and var specs, const
+// groups, each file's import table — in place of one all-or-nothing shell, and
+// follows a changed name through the headers that mention it (see reusable).
+// Version 5 instruments a package's in-module dependencies alongside it: each
+// test records the dependency functions it executed, the fingerprint carries
+// each dependency's print, and Inputs no longer hashes those directories.
+// Version 4 is shared between checkouts: its directory is named from the
+// module alone, its Inputs name nothing by absolute path and fold in the build
+// environment and compile flags, and an entry whose fingerprint and Inputs both
+// agree is reused whole across a moved build ID. Version 3 records the
+// package's source fingerprint beside its mappings, so that a changed package
+// can keep the mappings the change could not have touched. Version 2 was one
+// file per package. Version 1 was one file per module, which meant a run had
+// to write back every package it had not looked at or lose them — and a
+// scoped run, which is the recommended workflow, looks at one.
+const cacheVersion = 11
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
@@ -59,14 +84,20 @@ const cacheVersion = 3
 // entry may have none — a package whose directory could not be read — in which
 // case a changed build ID re-maps the whole package, as it always did.
 //
+// Deps is, per test, the dependency entities it executed (see
+// splitCoverage). It is apart from Tests on purpose: Tests is coverage, and
+// read as coverage everywhere, while Deps is only ever asked "did this test
+// reach an entity that changed". A test that reached none has no entry.
+//
 // ImportPath is stored as well as hashed into the file name, so that a file
 // found under the wrong name is a miss rather than another package's answer.
 type cachedPackage struct {
-	Tests       map[string]Profile `json:"tests"`
-	ImportPath  string             `json:"import_path"`
-	BuildID     string             `json:"build_id"`
-	Fingerprint fingerprint        `json:"fingerprint"`
-	Version     int                `json:"version"`
+	Tests       map[string]Profile  `json:"tests"`
+	Deps        map[string][]string `json:"deps,omitempty"`
+	ImportPath  string              `json:"import_path"`
+	BuildID     string              `json:"build_id"`
+	Fingerprint fingerprint         `json:"fingerprint"`
+	Version     int                 `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than
@@ -107,8 +138,17 @@ func (c *Coverage) cacheScope() string {
 
 // cacheDirPath is where this module's per-package map files live. It is outside
 // the module, under the user's cache directory unless a caller names another,
-// so that a checkout stays clean and two checkouts of the same module do not
-// share a map.
+// so that a checkout stays clean.
+//
+// It is named from the module name alone, so that every checkout of a module
+// shares one map. A CI fleet checks a module out under a different work
+// directory on every runner, and a map named after the checkout path could only
+// ever be read back by the runner that wrote it. Sharing is safe because no
+// entry is trusted for where it was found: an entry is used whole only while
+// its package's build ID agrees, and in part only while its fingerprint and
+// Inputs do — and neither of those names a path. Two checkouts writing at once
+// cannot tear a file, because every save is a rename; at worst one overwrites
+// the other's entry, and the loser re-maps next time.
 func (c *Coverage) cacheDirPath(key string) (string, error) {
 	base := c.cacheDir
 	if base == "" {
@@ -118,12 +158,7 @@ func (c *Coverage) cacheDirPath(key string) (string, error) {
 			return "", err
 		}
 	}
-	modName, modRoot := c.mod.Name, c.mod.Root
-	root, err := filepath.Abs(modRoot)
-	if err != nil {
-		root = modRoot
-	}
-	sum := sha256.Sum256([]byte(modName + "\x00" + root))
+	sum := sha256.Sum256([]byte(c.mod.Name))
 
 	return filepath.Join(base, "gremlins", "testmap", hex.EncodeToString(sum[:]), key), nil
 }
