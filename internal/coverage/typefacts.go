@@ -53,6 +53,11 @@ type typeFacts struct {
 	// to follow, so it is named by its file and its place among the file's
 	// blanks.
 	initOrder []string
+	// reach is a hash of every package the package imports, directly or
+	// not, as its test binary links it — and then of its external test
+	// package's — which is its place in the order packages are initialised
+	// in (see importClosure).
+	reach string
 }
 
 // xtestPrefix marks a variable of the external test package, whose names can
@@ -116,28 +121,77 @@ func (c *Coverage) loadTypes(tests bool, importPaths []string) {
 // build tags the test binaries are compiled with, from the module root.
 // Dependencies outside the set are read from export data, which the build
 // cache usually holds already: the test binary was compiled first.
+//
+// The import graph is a second load that asks for nothing but names and
+// imports: asking the first for dependencies would type-check every one of
+// them from source.
 func (c *Coverage) loadTypesFromSource(tests bool, importPaths []string) map[string]typeFacts {
-	cfg := &packages.Config{
-		Mode:  packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
-		Dir:   c.absRoot(),
-		Tests: tests,
+	found, ok := c.loadVariants(packages.NeedName|packages.NeedSyntax|packages.NeedTypes|packages.NeedTypesInfo,
+		tests, importPaths)
+	if !ok {
+		return nil
 	}
+	graph, ok := c.loadVariants(packages.NeedName|packages.NeedImports|packages.NeedDeps, tests, importPaths)
+	if !ok {
+		return nil
+	}
+	out := map[string]typeFacts{}
+	for path, v := range found {
+		linked, inGraph := v.linked(tests), graph[path].linked(tests)
+		order, ok := initOrderOf(linked, "")
+		if !ok || inGraph == nil {
+			continue
+		}
+		reach := []string{strings.Join(importClosure(inGraph), "\x00")}
+		if tests && v.xtest != nil {
+			more, xok := initOrderOf(v.xtest, xtestPrefix)
+			if !xok || graph[path].xtest == nil {
+				continue
+			}
+			order = append(order, more...)
+			reach = append(reach, strings.Join(importClosure(graph[path].xtest), "\x00"))
+		}
+		out[path] = typeFacts{initOrder: order, reach: hashOf([]byte(strings.Join(reach, "\x00xtest\x00")))}
+	}
+
+	return out
+}
+
+// variants is one package directory as go/packages returns it. Under Tests, a
+// package with test files comes back twice, as itself and as recompiled for
+// its test binary, and its external tests as a third package.
+type variants struct {
+	plain, test, xtest *packages.Package
+}
+
+// linked is the variant a binary links: the recompiled one in the package's
+// own test binary, the plain one in any other. Nil on a nil receiver, which
+// is a package the load did not return.
+func (v *variants) linked(tests bool) *packages.Package {
+	if v == nil {
+		return nil
+	}
+	if tests && v.test != nil {
+		return v.test
+	}
+
+	return v.plain
+}
+
+// loadVariants loads a set of packages in one mode and sorts what comes back
+// into each one's variants. A load that fails says nothing about any of them.
+func (c *Coverage) loadVariants(mode packages.LoadMode, tests bool, importPaths []string) (map[string]*variants, bool) {
+	cfg := &packages.Config{Mode: mode, Dir: c.absRoot(), Tests: tests}
 	if c.buildTags != "" {
 		cfg.BuildFlags = []string{"-tags", c.buildTags}
 	}
 	loaded, err := packages.Load(cfg, importPaths...)
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	want := map[string]bool{}
 	for _, p := range importPaths {
 		want[p] = true
-	}
-	// Under Tests, a package with test files comes back twice, as itself
-	// and as recompiled for its test binary, and its external tests as a
-	// third package. The test binary links the recompiled one.
-	type variants struct {
-		plain, test, xtest *packages.Package
 	}
 	found := map[string]*variants{}
 	for _, p := range loaded {
@@ -160,25 +214,40 @@ func (c *Coverage) loadTypesFromSource(tests bool, importPaths []string) map[str
 			v.plain = p
 		}
 	}
-	out := map[string]typeFacts{}
-	for path, v := range found {
-		linked := v.plain
-		if tests && v.test != nil {
-			linked = v.test
-		}
-		order, ok := initOrderOf(linked, "")
-		if !ok {
-			continue
-		}
-		if tests && v.xtest != nil {
-			more, xok := initOrderOf(v.xtest, xtestPrefix)
-			if !xok {
+
+	return found, true
+}
+
+// importClosure is every package a package imports, directly or not, by
+// import path and sorted.
+//
+// The IDs are import paths, with the test binary a package was recompiled
+// for when it was. It is what decides where the package is initialised among
+// the rest of the binary. Go initialises, each time, the first package by import path whose
+// imports are all initialised, and the set already initialised always holds
+// every import of each of its members — so "every import initialised" and
+// "every package it reaches initialised" are the same condition, and the
+// order is a function of the packages linked and each one's closure alone.
+// An import added that the package already reached through another moves
+// nothing.
+func importClosure(p *packages.Package) []string {
+	seen := map[string]bool{}
+	var walk func(q *packages.Package)
+	walk = func(q *packages.Package) {
+		for _, imp := range q.Imports {
+			if seen[imp.ID] {
 				continue
 			}
-			order = append(order, more...)
+			seen[imp.ID] = true
+			walk(imp)
 		}
-		out[path] = typeFacts{initOrder: order}
 	}
+	walk(p)
+	out := make([]string, 0, len(seen))
+	for id := range seen {
+		out = append(out, id)
+	}
+	sort.Strings(out)
 
 	return out
 }

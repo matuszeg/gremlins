@@ -56,13 +56,17 @@ func TestLoadTypesFromSourceReadsTheInitialisationOrder(t *testing.T) {
 
 	got := c.loadTypesFromSource(true, []string{"example.com/m/p", "example.com/m/bad"})
 
-	want := map[string]typeFacts{"example.com/m/p": {initOrder: []string{
-		"_@a.go#0", "a", "b", "_@a.go#1", "_@b.go#0", "t1", xtestPrefix + "x",
-	}}}
+	// The package as its test binary links it imports nothing; its external
+	// tests import that recompiled package, by its variant's ID.
+	want := map[string]typeFacts{"example.com/m/p": {
+		initOrder: []string{"_@a.go#0", "a", "b", "_@a.go#1", "_@b.go#0", "t1", xtestPrefix + "x"},
+		reach:     hashOf([]byte("\x00xtest\x00example.com/m/p [example.com/m/p.test]")),
+	}}
 	if diff := cmp.Diff(want, got, cmp.AllowUnexported(typeFacts{})); diff != "" {
 		t.Errorf("unexpected facts (-want +got):\n%s", diff)
 	}
-	if plain := c.loadTypesFromSource(false, []string{"example.com/m/p"}); len(plain["example.com/m/p"].initOrder) != 5 {
+	plain := c.loadTypesFromSource(false, []string{"example.com/m/p"})
+	if p := plain["example.com/m/p"]; len(p.initOrder) != 5 || p.reach != hashOf(nil) {
 		t.Errorf("want the package as another binary links it, without its tests, got %v", plain)
 	}
 }

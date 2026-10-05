@@ -19,7 +19,6 @@ package coverage
 import (
 	"fmt"
 	"go/token"
-	"sort"
 	"strings"
 )
 
@@ -104,15 +103,20 @@ type span struct {
 // a variable, reorders it. That order is taken from the type-checker
 // (types.Info.InitOrder, see typeFacts), and two variables both prints
 // initialise trading places re-maps the package, as does a package the
-// type-checker could not read. And in what order across packages: a package
-// is initialised after everything it imports, so a file's set of imported
-// paths changing can move it, and with it what an init or a var reading
-// another package sees; when that happens and anything instrumented observes
-// the order, the package is re-mapped. The type-checker sees one package at a
-// time, so the order across them is still read off the import sets: that rule
-// and the order within a package hold different facts, and neither subsumes
-// the other — a plain var reading a package whose init is not instrumented is
-// seen by the first alone.
+// type-checker could not read. And in what order across packages: Go
+// initialises, each time, the first package by import path whose imports are
+// all done, so the order is a function of the packages linked and of the set
+// each one reaches by import, directly or not (see importClosure) — an import
+// added that the package already reached moves nothing. The linked set is in
+// Inputs; each instrumented package's reach is listed by go/packages beside
+// its type-check (pkgPrint.Reach); and a package's reach is its own imports
+// and theirs, where the imports of a package outside the main modules are in
+// its source, which is in Inputs — so when Inputs and every instrumented
+// package's reach agree, no package's reach moved. When some
+// instrumented package's reach changed and anything instrumented observes the
+// order, the package is re-mapped. That rule and the order within a package
+// hold different facts, and neither subsumes the other — a plain var reading
+// a package whose init is not instrumented is seen by the first alone.
 //
 // The rule behind all of it: a fact the compiler derives is asked of the
 // compiler. Every hole the closure has had was one — an init order worked out
@@ -136,17 +140,18 @@ type span struct {
 // Everything the closure has no name to follow, wherever in the binary's
 // in-scope packages it happens:
 //
-//   - a package, or an instrumented dependency, the type-checker could not
-//     read, before or after, and two variables trading places in the order a
-//     package initialises them;
+//   - a package, or an instrumented dependency, the type-checker or the
+//     import listing could not read, before or after, and two variables
+//     trading places in the order a package initialises them;
 //   - a change to what the binary is built from that no profile records: a
 //     dependency outside every main module, a main module's go.mod, the set of
 //     packages linked, the toolchain, the build environment, the compile flags
 //     (Inputs), or the set of instrumented dependencies itself;
-//   - a file's set of imported paths changing, in any instrumented package,
-//     while anything instrumented observes the order of initialisation: an
-//     init, a var initialised by a call or by reading another package, or
-//     TestMain;
+//   - the set of packages an instrumented package reaches by import
+//     changing, while anything instrumented observes the order of
+//     initialisation: an init, or a var initialised by a call or by reading
+//     another package — not TestMain, which runs after all of it (see
+//     closure.observer);
 //   - an init added, removed, changed, or mentioning an affected name; a var
 //     whose initialiser calls something at initialisation, on the same terms;
 //     TestMain on the same terms: each runs for every test;
@@ -181,7 +186,9 @@ type span struct {
 // runtime.Caller, a stack trace, a panic message compared against — which
 // moves when anything above it in the file does, while a moved entity whose
 // print is unchanged keeps its mappings (TestDifferentialKnownExposures holds
-// one); a binary built and run by a test; lines executed in a subprocess; and
+// one); an initialiser outside the main modules in a package that imports
+// one inside, which only a module cycle allows, seeing the order packages are
+// initialised in; a binary built and run by a test; lines executed in a subprocess; and
 // a nondeterministic path that reuse freezes as whichever way it went when the
 // mapping was made. All but the positions are shared with reusing a map by
 // build ID alone.
@@ -232,7 +239,7 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, string
 	}
 	if cl.reordered != "" {
 		if observer := cl.observer(); observer != "" {
-			return nil, cl.reordered + " imports a different set of paths, and " + observer +
+			return nil, cl.reordered + " reaches a different set of packages by import, and " + observer +
 				" observes the order packages are initialised in"
 		}
 	}
@@ -272,9 +279,10 @@ type closure struct {
 	// why is the first thing found that re-maps the whole package, and
 	// empty while nothing has.
 	why string
-	// reordered names a file whose set of imported paths changed, which can
-	// move when packages are initialised relative to each other even though
-	// every one of them is linked before and after. Empty when none did.
+	// reordered names a package whose set of packages it reaches by import
+	// changed, which can move when packages are initialised relative to each
+	// other even though every one of them is linked before and after. Empty
+	// when none did.
 	reordered string
 }
 
@@ -303,8 +311,8 @@ func (cl *closure) add(label string, was, now pkgPrint) *pkgDelta {
 
 		return d
 	}
-	if file := changedPaths(was.Imports, now.Imports); file != "" && cl.reordered == "" {
-		cl.reordered = file
+	if was.Reach != now.Reach && cl.reordered == "" {
+		cl.reordered = label
 	}
 	rebound := reboundNames(was.Imports, now.Imports)
 	keys := map[string]bool{}
@@ -385,7 +393,7 @@ func (cl *closure) close() string {
 				if name == "" {
 					continue
 				}
-				if e.Kind == kindInit || e.Kind == kindRun {
+				if e.Kind == kindInit || e.Kind == kindRun || e.Kind == kindMain {
 					return key + " runs for every test and mentions " + name + ", which changed"
 				}
 				cl.affect(d, key, e.Names)
@@ -398,9 +406,23 @@ func (cl *closure) close() string {
 }
 
 // observer names something in the binary's instrumented packages that can see
-// the order packages are initialised in — an init, a var initialised by a call
-// or by reading another package, or TestMain — or is empty when there is
-// none. Without one, an order that moved changes nothing a test executes.
+// the order packages are initialised in — an init, or a var initialised by a
+// call or by reading another package — or is empty when there is none.
+// Without one, an order that moved changes nothing a test executes.
+//
+// TestMain is not one. It runs once every package is initialised, so what it
+// can see of the order is what the initialisers left behind, the same as any
+// test; and what they leave behind depends on the order only if one of them
+// moved, has an effect or reads another package. Only a package whose reach
+// changed, and the packages that reach it, can move relative to the rest — the
+// order Go picks among the others, since Go 1.21 each time the first by
+// import path whose imports are done, is decided by those others alone — and
+// every such package is instrumented: the package itself, its external
+// tests, or a main module's package recompiled against it. So an initialiser
+// that could make the order visible is an init, a call or a read of another
+// package in an instrumented package, which this already finds. (A package
+// outside the main modules that imports one inside takes a module cycle; it
+// is among what reuse cannot see.)
 func (cl *closure) observer() string {
 	for _, d := range cl.pkgs {
 		for _, decls := range []map[string]declPrint{d.was.Decls, d.now.Decls} {
@@ -408,50 +430,6 @@ func (cl *closure) observer() string {
 				if e.Kind == kindInit || e.Kind == kindRun || e.Observes {
 					return key
 				}
-			}
-		}
-	}
-
-	return ""
-}
-
-// changedPaths names a file whose set of imported packages differs between
-// two prints, whatever names it binds them to, or is empty when every file
-// imports what it did. A package is initialised after everything it imports,
-// so those sets are its place in the order. They are compared per file rather
-// than per package because a directory's prints hold two packages, the
-// package and its external tests, and a path one gains can be one the other
-// already imports; a path moved from one file of a package to another only
-// costs a re-map.
-func changedPaths(was, now map[string]map[string]string) string {
-	paths := func(table map[string]string) map[string]bool {
-		out := map[string]bool{}
-		for _, path := range table {
-			out[path] = true
-		}
-
-		return out
-	}
-	files := map[string]bool{}
-	for f := range was {
-		files[f] = true
-	}
-	for f := range now {
-		files[f] = true
-	}
-	sorted := make([]string, 0, len(files))
-	for f := range files {
-		sorted = append(sorted, f)
-	}
-	sort.Strings(sorted)
-	for _, f := range sorted {
-		before, after := paths(was[f]), paths(now[f])
-		if len(before) != len(after) {
-			return f
-		}
-		for path := range before {
-			if !after[path] {
-				return f
 			}
 		}
 	}
@@ -564,7 +542,9 @@ func wholeOnChange(before declPrint, had bool, after declPrint, has bool) string
 		case side.d.Kind == kindInit:
 			return "it is an init, which runs for every test"
 		case side.d.Kind == kindRun:
-			return "it runs for every test (TestMain, or a var initialised by a call)"
+			return "it is a var initialised by a call, which runs for every test"
+		case side.d.Kind == kindMain:
+			return "it is TestMain, which runs for every test"
 		case side.d.Kind == kindBlank:
 			return "it has no name to pair it by"
 		case side.d.Linked:

@@ -70,6 +70,12 @@ type pkgPrint struct {
 	// narrowed from: the order is a fact no token of the source holds.
 	InitOrder []string `json:"init_order,omitempty"`
 	Typed     bool     `json:"typed,omitempty"`
+
+	// Reach is a hash of every package the package imports, directly or not,
+	// and then of every package its external tests do, as go/packages lists
+	// them alongside the type-check: where the package is initialised among
+	// the rest of the binary (see importClosure and closure.reordered).
+	Reach string `json:"reach,omitempty"`
 }
 
 // The kinds of entity. A function is the empty kind.
@@ -80,10 +86,13 @@ const (
 	kindMethod = "method"
 	// kindInit is an init function. It runs before every test in the binary.
 	kindInit = "init"
-	// kindRun is a declaration that runs for every test without any test
-	// naming it: a var whose initialiser calls something at initialisation,
-	// and TestMain.
+	// kindRun is a var whose initialiser calls something at
+	// initialisation: it runs for every test without any test naming it.
 	kindRun = "run"
+	// kindMain is TestMain. It runs for every test too, but after every
+	// package is initialised, so unlike an initialiser it does not observe
+	// the order they were initialised in (see closure.observer).
+	kindMain = "main"
 	// kindBlank is a declaration with no name to pair it by between two
 	// prints: a var or a function named _, or a key two declarations share.
 	kindBlank = "blank"
@@ -111,8 +120,9 @@ type declPrint struct {
 	Linked bool `json:"linked,omitempty"`
 	// Observes says a var's initialiser reads another package, which it does
 	// at initialisation: what it reads then depends on which packages were
-	// initialised before this one, and that order moves when an import is
-	// added or removed anywhere in the binary (see closure.reordered). A call
+	// initialised before this one, and that order moves when the set of
+	// packages one of the binary's instrumented packages reaches changes
+	// (see closure.reordered). A call
 	// that runs at initialisation is kindRun instead, which is the same thing
 	// and more. It is the order across packages, which no package's
 	// type-check sees; the order within one is pkgPrint.InitOrder.
@@ -561,7 +571,7 @@ func (ps *printSet) printFunc(st *fileState, fn *ast.FuncDecl) {
 	case name == "_":
 		d.Kind = kindBlank
 	case st.isTest && name == "TestMain":
-		d.Kind = kindRun
+		d.Kind = kindMain
 	default:
 		d.Names = []string{name}
 		if st.isTest && isTestFuncName(name) {
@@ -674,9 +684,9 @@ func (ps *printSet) add(st *fileState, key string, d declPrint) string {
 	full := st.profile + ":" + key
 	n := st.ordinals[key]
 	st.ordinals[key] = n + 1
-	if d.Kind == kindInit || d.Kind == kindBlank || d.Kind == kindRun && len(d.Names) == 0 || n > 0 {
+	if d.Kind == kindInit || d.Kind == kindBlank || d.Kind == kindMain || d.Kind == kindRun && len(d.Names) == 0 || n > 0 {
 		full = fmt.Sprintf("%s#%d", full, n)
-		if n > 0 && d.Kind != kindInit && d.Kind != kindRun {
+		if n > 0 && d.Kind != kindInit && d.Kind != kindRun && d.Kind != kindMain {
 			d.Kind = kindBlank
 		}
 	}

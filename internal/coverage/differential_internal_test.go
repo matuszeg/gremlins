@@ -511,7 +511,8 @@ func TestDifferentialBuildTags(t *testing.T) {
 }
 
 // The order packages are initialised in is decided by the import graph, which
-// no package's type-check sees, so the rules that watch the import sets stay.
+// no package's type-check sees: what each package reaches by import is listed
+// beside it, and a change to it re-maps when anything initialised can see it.
 func TestDifferentialPackageInitOrder(t *testing.T) {
 	zmod := map[string]string{
 		"go.mod":            "module example.com/m\n\ngo 1.22\n\nrequire example.com/z v0.0.0\n\nreplace example.com/z => ./zmod\n",
@@ -531,6 +532,33 @@ func TestDifferentialPackageInitOrder(t *testing.T) {
 		"an order-observing plain var whose writer is not instrumented": {
 			before:   zmod,
 			after:    map[string]string{"calc/name.go": "package calc\n\nimport \"example.com/z\"\n\nfunc name() string {\n\treturn z.Name()\n}\n"},
+			remapped: []string{"TestDouble", "TestTriple", "TestZ"},
+		},
+		// strings.NewReplacer runs at initialisation, but calc already
+		// reached vm and strings, so it is initialised where it was.
+		"a test file importing what the package already reached, beside a var run at initialisation": {
+			before: map[string]string{
+				"vm/vm.go":     "package vm\n\nfunc Clamp(n int) int {\n\treturn n\n}\n",
+				"calc/calc.go": diffCalc("\nimport \"example.com/m/vm\"\n", "return vm.Clamp(n) * 2", "return n * 3"),
+				"calc/rep.go":  "package calc\n\nimport \"strings\"\n\nvar rep = strings.NewReplacer(\"a\", \"b\")\n",
+			},
+			after: map[string]string{"calc/calc_test.go": "package calc\n\nimport (\n\t\"strings\"\n\t\"testing\"\n\n\t\"example.com/m/vm\"\n)\n\n" +
+				"func TestDouble(t *testing.T) {\n\t_ = Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = Triple(vm.Clamp(len(strings.Repeat(\"x\", 2))))\n}\n"},
+			remapped: []string{"TestTriple"},
+		},
+		// The same shape, but the test file reaches z, which calc did not,
+		// so calc is now initialised after z's init and count sees it.
+		"a test file reaching a new package, beside a var run at initialisation": {
+			before: map[string]string{
+				"reg/reg.go":   "package reg\n\nvar Names []string\n",
+				"z/z.go":       "package z\n\nimport \"example.com/m/reg\"\n\nfunc init() {\n\treg.Names = append(reg.Names, \"z\")\n}\n\nfunc Name() string {\n\treturn \"z\"\n}\n",
+				"calc/run.go":  "package calc\n\nimport \"example.com/m/reg\"\n\nvar seen = count()\n\nfunc count() int {\n\treturn len(reg.Names)\n}\n",
+				"calc/calc.go": diffCalc("", "if seen > 0 {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+				"calc/x_test.go": "package calc_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/z\"\n)\n\n" +
+					"func TestZ(t *testing.T) {\n\t_ = z.Name()\n}\n",
+			},
+			after: map[string]string{"calc/calc_test.go": "package calc\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/z\"\n)\n\n" +
+				"func TestDouble(t *testing.T) {\n\t_ = Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = Triple(len(z.Name()))\n}\n"},
 			remapped: []string{"TestDouble", "TestTriple", "TestZ"},
 		},
 		// Imports moved, but nothing instrumented can see when anything was
@@ -582,4 +610,85 @@ func TestDifferentialAWholeRemapLogsItsReason(t *testing.T) {
 	if !strings.Contains(out.String(), want) {
 		t.Errorf("want the log to say %q, got:\n%s", want, out.String())
 	}
+}
+
+// TestMain runs after every package is initialised, so it sees the order
+// only through what the initialisers left behind, which is what the
+// observers the rule counts already decide. A test file's imports moving
+// beside it re-maps what the change reaches, and an initialiser that sees
+// the order still re-maps everything.
+func TestDifferentialTestMain(t *testing.T) {
+	mainTest := "package calc\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestMain(m *testing.M) {\n\tos.Exit(m.Run())\n}\n"
+	vm := "package vm\n\nfunc Clamp(n int) int {\n\treturn n\n}\n"
+	calcVM := diffCalc("\nimport \"example.com/m/vm\"\n", "return vm.Clamp(n) * 2", "return n * 3")
+	tests := func(imports, triple string) string {
+		return "package calc\n\nimport (\n" + imports + "\t\"testing\"\n)\n\n" +
+			"func TestDouble(t *testing.T) {\n\t_ = Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t" + triple + "\n}\n"
+	}
+	// z registers itself when initialised, and is linked through the
+	// external test; calc's internal test newly importing it moves calc
+	// after z.
+	reg := map[string]string{
+		"reg/reg.go":        "package reg\n\nvar Names []string\n",
+		"z/z.go":            "package z\n\nimport \"example.com/m/reg\"\n\nfunc init() {\n\treg.Names = append(reg.Names, \"z\")\n}\n\nfunc Name() string {\n\treturn \"z\"\n}\n",
+		"calc/main_test.go": mainTest,
+		"calc/x_test.go": "package calc_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/z\"\n)\n\n" +
+			"func TestZ(t *testing.T) {\n\t_ = z.Name()\n}\n",
+	}
+	with := func(base map[string]string, more map[string]string) map[string]string {
+		out := map[string]string{}
+		for k, v := range base {
+			out[k] = v
+		}
+		for k, v := range more {
+			out[k] = v
+		}
+
+		return out
+	}
+	importZ := map[string]string{"calc/calc_test.go": tests("\t\"example.com/m/z\"\n", "_ = Triple(len(z.Name()))")}
+	runDifferential(t, map[string]diffCase{
+		"a test file importing an already linked package beside TestMain": {
+			before:   map[string]string{"vm/vm.go": vm, "calc/calc.go": calcVM, "calc/main_test.go": mainTest},
+			after:    map[string]string{"calc/calc_test.go": tests("\t\"strings\"\n", "_ = Triple(len(strings.Repeat(\"x\", 2)))")},
+			remapped: []string{"TestTriple"},
+		},
+		"a new test file importing an instrumented package beside TestMain": {
+			before: map[string]string{"vm/vm.go": vm, "calc/calc.go": calcVM, "calc/main_test.go": mainTest},
+			after: map[string]string{"calc/more_test.go": "package calc\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/vm\"\n)\n\n" +
+				"func TestMore(t *testing.T) {\n\t_ = vm.Clamp(1)\n}\n"},
+			remapped: []string{"TestMore"},
+		},
+		// calc now reaches z and is initialised after it, which nothing
+		// initialised sees: TestMain runs after both, and here z has no
+		// init (an instrumented one would count as seeing the order).
+		"a test file reaching a new package beside TestMain": {
+			before:   with(reg, map[string]string{"z/z.go": "package z\n\nfunc Name() string {\n\treturn \"z\"\n}\n"}),
+			after:    importZ,
+			remapped: []string{"TestTriple"},
+		},
+		// calc's init and z's both append to reg.Names, and Double reads
+		// which came first.
+		"an init that sees the order, beside TestMain": {
+			before: with(reg, map[string]string{
+				"calc/init.go": "package calc\n\nimport \"example.com/m/reg\"\n\nfunc init() {\n\treg.Names = append(reg.Names, \"calc\")\n}\n",
+				"calc/calc.go": diffCalc("\nimport \"example.com/m/reg\"\n", "if reg.Names[0] == \"z\" {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+			}),
+			after:    importZ,
+			remapped: []string{"TestDouble", "TestTriple", "TestZ"},
+		},
+		// The observer is a test file's plain var, read when calc is
+		// initialised: before z's init, and then after it.
+		"a test file's var that sees the order, beside TestMain": {
+			before: with(reg, map[string]string{
+				"calc/seen_test.go": "package calc\n\nimport \"example.com/m/reg\"\n\nvar seen = len(reg.Names)\n",
+				"calc/calc_test.go": "package calc\n\nimport \"testing\"\n\n" +
+					"func TestDouble(t *testing.T) {\n\t_ = Double(2 + seen)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = Triple(2)\n}\n",
+				"calc/calc.go": diffCalc("", "if n > 2 {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+			}),
+			after: map[string]string{"calc/calc_test.go": "package calc\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/z\"\n)\n\n" +
+				"func TestDouble(t *testing.T) {\n\t_ = Double(2 + seen)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = Triple(len(z.Name()))\n}\n"},
+			remapped: []string{"TestDouble", "TestTriple", "TestZ"},
+		},
+	})
 }

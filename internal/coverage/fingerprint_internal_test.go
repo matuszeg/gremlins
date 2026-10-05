@@ -313,7 +313,7 @@ func TestFingerprintDescribesEveryEntity(t *testing.T) {
 		"pkg/a_test.go:helper":  {Names: []string{"helper"}, Start: 5, End: 7},
 		"pkg/a_test.go:TestF":   {Names: []string{"TestF"}, Test: "TestF", Start: 9, End: 11},
 		// TestMain runs for every test, and is not one.
-		"pkg/a_test.go:TestMain#0": {Kind: kindRun, Start: 13, End: 15},
+		"pkg/a_test.go:TestMain#0": {Kind: kindMain, Start: 13, End: 15},
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("entities (-want +got):\n%s", diff)
