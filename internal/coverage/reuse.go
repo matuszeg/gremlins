@@ -168,13 +168,18 @@ type span struct {
 // # What it cannot see
 //
 // A test's behaviour can hang on something no print holds, and then a kept
-// mapping can be wrong. Each of these is a known exposure, shared with reusing
-// a map by build ID alone: a file read at run time from outside the package
-// directory; a file of the package's own source read at run time — a test
-// that parses its package's .go files sees a change to any of them, where the
-// closure sees only the entities that change names; a binary built and run by
-// a test; lines executed in a subprocess; and a nondeterministic path that
-// reuse freezes as whichever way it went when the mapping was made.
+// mapping can be wrong. Each of these is a known exposure: a file read at run
+// time from outside the package directory; a file of the package's own source
+// read at run time — a test that parses its package's .go files, or embeds
+// them, sees a change to any of them, where the closure sees only the
+// entities that change names; an absolute source position read at run time —
+// runtime.Caller, a stack trace, a panic message compared against — which
+// moves when anything above it in the file does, while a moved entity whose
+// print is unchanged keeps its mappings (TestDifferentialKnownExposures holds
+// one); a binary built and run by a test; lines executed in a subprocess; and
+// a nondeterministic path that reuse freezes as whichever way it went when the
+// mapping was made. All but the positions are shared with reusing a map by
+// build ID alone.
 //
 // It is deliberately not a call graph. The alternative — SSA plus
 // reachability from each test root — is a much larger build, and it is
