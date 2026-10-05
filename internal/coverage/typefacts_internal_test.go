@@ -64,6 +64,10 @@ func TestLoadTypesFromSourceReadsTheInitialisationOrder(t *testing.T) {
 	want := map[string]typeFacts{"example.com/m/p": {
 		initOrder: []string{"_@a.go#0", "a", "b", "_@a.go#1", "_@b.go#0", "t1", xtestPrefix + "x"},
 		reach:     hashOf([]byte("\x00xtest\x00example.com/m/p [example.com/m/p.test]")),
+		observers: map[string]bool{
+			observerKey("a.go", ""): true, observerKey("b.go", ""): true, observerKey("name.go", ""): true,
+			observerKey("p_test.go", ""): true, observerKey("x_test.go", ""): true,
+		},
 	}}
 	if diff := cmp.Diff(want, got, cmp.AllowUnexported(typeFacts{})); diff != "" {
 		t.Errorf("unexpected facts (-want +got):\n%s", diff)
@@ -71,6 +75,45 @@ func TestLoadTypesFromSourceReadsTheInitialisationOrder(t *testing.T) {
 	plain := c.loadTypesFromSource(false, []string{"example.com/m/p"})
 	if p := plain["example.com/m/p"]; len(p.initOrder) != 5 || p.reach != hashOf(nil) {
 		t.Errorf("want the package as another binary links it, without its tests, got %v", plain)
+	}
+}
+
+// A var observes the order across packages when its initialiser reads a
+// variable of another package, however the name is spelled, or a variable of
+// its own package that does. A constant, a field of its own value, and a
+// function literal's body read nothing at initialisation.
+func TestLoadTypesFromSourceFindsTheVarsReadingAnotherPackage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs go list")
+	}
+	root := t.TempDir()
+	for rel, content := range map[string]string{
+		"go.mod":   "module example.com/m\n\ngo 1.22\n",
+		"q/q.go":   "package q\n\nvar Names []string\n\nconst Max = 3\n\ntype Box struct{ N int }\n",
+		"p/dot.go": "package p\n\nimport . \"example.com/m/q\"\n\nvar dot = len(Names)\n\nvar ptr = &Names\n\nvar via, also = len(*ptr), 1\n",
+		"p/sel.go": "package p\n\nimport \"example.com/m/q\"\n\nvar sel = q.Names\n\nvar max = q.Max\n\nvar box q.Box\n\n" +
+			"var field = box.N\n\nvar lit = func() int { return len(q.Names) }\n\nvar local = max + field\n",
+		"p/x_test.go": "package p_test\n\nimport \"example.com/m/q\"\n\nvar x = q.Box{N: len(q.Names)}\n",
+	} {
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &Coverage{mod: gomodule.GoModule{Name: "example.com/m", Root: root}}
+
+	got := c.loadTypesFromSource(true, []string{"example.com/m/p"})["example.com/m/p"].observers
+
+	want := map[string]bool{
+		observerKey("dot.go", ""): true, observerKey("sel.go", ""): true, observerKey("x_test.go", ""): true,
+		observerKey("dot.go", "dot"): true, observerKey("dot.go", "ptr"): true, observerKey("dot.go", "via"): true,
+		observerKey("dot.go", "also"): true, observerKey("sel.go", "sel"): true, observerKey("x_test.go", "x"): true,
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("unexpected observers (-want +got):\n%s", diff)
 	}
 }
 
@@ -126,7 +169,7 @@ func TestFactsOfLeavesOutWhatTheListingMissed(t *testing.T) {
 		"m/noxtest": {plain: listed},
 	}, true)
 
-	want := map[string]typeFacts{"m/whole": {reach: hashOf([]byte("fmt\x00xtest\x00fmt"))}}
+	want := map[string]typeFacts{"m/whole": {reach: hashOf([]byte("fmt\x00xtest\x00fmt")), observers: map[string]bool{}}}
 	if diff := cmp.Diff(want, got, cmp.AllowUnexported(typeFacts{})); diff != "" {
 		t.Errorf("unexpected facts (-want +got):\n%s", diff)
 	}

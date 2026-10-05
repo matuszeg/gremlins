@@ -123,7 +123,9 @@ type declPrint struct {
 	// Linked says a //go:linkname directive binds the declaration to a symbol
 	// of another package, which is a change no name in this one carries.
 	Linked bool `json:"linked,omitempty"`
-	// Observes says a var's initialiser reads another package, which it does
+	// Observes says a var's initialiser reads another package — a variable
+	// of it, by any spelling, or a variable of this package that does, as
+	// the type-checker resolves them (see printSet.observes) — which it does
 	// at initialisation: what it reads then depends on which packages were
 	// initialised before this one, and that order moves when the set of
 	// packages one of the binary's instrumented packages reaches changes
@@ -230,6 +232,9 @@ type printSet struct {
 	// library's, and so one fmt.Errorf can format without running anything of
 	// the package.
 	stdErrors map[string]map[string]bool
+	// facts is what the type-checker says about the package, or nil when it
+	// could not say anything.
+	facts *typeFacts
 }
 
 // printPackage prints a package directory's files. withTests says whether its
@@ -238,14 +243,19 @@ type printSet struct {
 // any other package's test binary.
 //
 // below is the hash of the data below the directory (see hashDataSubtrees),
-// which is part of Whole.
-func (c *Coverage) printPackage(importPath string, files []goFile, withTests bool, below string) pkgPrint {
+// which is part of Whole. facts is the package's type facts, nil when it
+// could not be type-checked; a print without them is never narrowed from.
+func (c *Coverage) printPackage(importPath string, files []goFile, withTests bool, below string, facts *typeFacts) pkgPrint {
 	ps := &printSet{
 		c:          c,
 		importPath: importPath,
 		out:        pkgPrint{Decls: map[string]declPrint{}, Imports: map[string]map[string]string{}},
 		declared:   map[string]bool{},
 		stdErrors:  map[string]map[string]bool{},
+		facts:      facts,
+	}
+	if facts != nil {
+		ps.out.InitOrder, ps.out.Reach, ps.out.Typed = facts.initOrder, facts.reach, true
 	}
 	var kept []*goFile
 	packageNames := map[string]bool{}
@@ -645,7 +655,7 @@ func (ps *printSet) printGen(st *fileState, gd *ast.GenDecl) {
 				kind = kindBlank
 			}
 			key := ps.printSpec(st, from, to, doc, kind, names, identsOf(s))
-			if kind == kindVar && ps.readsImports(st, s) {
+			if kind == kindVar && ps.observes(st, s) {
 				d := ps.out.Decls[key]
 				d.Observes = true
 				ps.out.Decls[key] = d
@@ -801,9 +811,37 @@ func (ps *printSet) formatsNothing(st *fileState, call *ast.CallExpr) bool {
 	return true
 }
 
-// readsImports reports whether a var's initialiser reads another package's
-// state: a selector on an imported package's name anywhere outside a function
-// literal, other than the callee of an allowlisted constructor.
+// observes reports whether a var's initialiser reads another package's state
+// (see declPrint.Observes). Which variable a name resolves to is the
+// type-checker's to say — a dot import, or a variable of this package holding
+// another's address, puts no selector in the text — so it is asked
+// (typeFacts.observers). Without it the syntax is read instead (see
+// readsImports); such a print re-maps the package whenever it is compared
+// (see wholeReason), so what the fallback misses is never kept. A var in a
+// file the type-check did not read by that name is taken to observe: an
+// observer too many costs a re-map only when the order across packages moved.
+func (ps *printSet) observes(st *fileState, s *ast.ValueSpec) bool {
+	if ps.facts == nil {
+		return ps.readsImports(st, s)
+	}
+	if !ps.facts.observers[observerKey(st.f.name, "")] {
+		// The type-check read no file of this name, so it says nothing
+		// about this var: it is taken to observe.
+		return true
+	}
+	for _, n := range s.Names {
+		if ps.facts.observers[observerKey(st.f.name, n.Name)] {
+			return true
+		}
+	}
+
+	return false
+}
+
+// readsImports is observes read off the syntax: a selector on an imported
+// package's name anywhere outside a function literal, other than the callee of
+// an allowlisted constructor. It misses a read through a dot import, and one
+// through a variable of this package, which is why it is only the fallback.
 func (ps *printSet) readsImports(st *fileState, s *ast.ValueSpec) bool {
 	callees := map[ast.Expr]bool{}
 	reads := false
