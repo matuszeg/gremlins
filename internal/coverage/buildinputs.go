@@ -191,10 +191,14 @@ type depListing struct {
 	ok   bool
 }
 
-// depListFormat asks for each dependency's import path, its directory, and
-// whether its module is a main module. A package of the standard library has
-// no module and reports an empty third field.
-const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end}}"
+// depListFormat asks for each dependency's import path, its directory,
+// whether its module is a main module, and its package name. A package of the
+// standard library has no module and reports an empty third field.
+//
+// The name is what an unnamed import binds in the importing file, which a path
+// does not say: the file's import table is compared by local name (see
+// pkgPrint.Imports).
+const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end}}\t{{.Name}}"
 
 // dependencyDirs is where the source of everything this package's tests link
 // lives, minus the package's own directory and minus what the toolchain and the
@@ -247,10 +251,20 @@ func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
 
 	seen := map[string]struct{}{}
 	var deps []dependency
+	if c.pkgNames == nil {
+		c.pkgNames = map[string]string{}
+	}
 	for _, line := range strings.Split(string(out), "\n") {
 		importPath, rest, _ := strings.Cut(line, "\t")
-		dir, main, _ := strings.Cut(rest, "\t")
+		dir, rest, _ := strings.Cut(rest, "\t")
+		main, name, _ := strings.Cut(rest, "\t")
 		dir = strings.TrimSpace(dir)
+		importPath = strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
+		// Every package's name is recorded, the toolchain's and the module
+		// cache's too: a file can import any of them without a name.
+		if name = strings.TrimSpace(name); name != "" && importPath != "" {
+			c.pkgNames[importPath] = name
+		}
 		// `go list` writes build diagnostics to the same stream, and a
 		// synthesised test package can report no directory at all.
 		if dir == "" || !filepath.IsAbs(dir) {
@@ -263,13 +277,12 @@ func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
 			continue
 		}
 		seen[dir] = struct{}{}
-		importPath = strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
-		name := "import\x00" + importPath
+		label := "import\x00" + importPath
 		if under(dir, root) {
-			name = "dir\x00" + relativeTo(root, dir)
+			label = "dir\x00" + relativeTo(root, dir)
 		}
 		deps = append(deps, dependency{
-			name: name, dir: dir, importPath: importPath,
+			name: label, dir: dir, importPath: importPath,
 			instrumented: strings.TrimSpace(main) == "true",
 		})
 	}

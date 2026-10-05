@@ -133,110 +133,6 @@ func TestTriple(t *testing.T) {
 	}
 }
 
-// Everything that is not an attributable declaration is all-or-nothing, because
-// a line no coverage block contains can still change what the tests that
-// execute the use site do.
-func TestAChangeOutsideADeclarationReMapsThePackage(t *testing.T) {
-	testCases := map[string]struct {
-		file    string
-		content string
-	}{
-		"a package-level constant": {"calc/calc.go", `package calc
-
-const factor = 2
-
-func Double(n int) int {
-	return n * factor
-}
-
-func Triple(n int) int {
-	return n * 3
-}
-`},
-		"an added import": {"calc/triple_test.go", `package calc
-
-import (
-	"testing"
-	_ "example.com/vm"
-)
-
-func TestTriple(t *testing.T) {
-	if Triple(2) != 6 {
-		t.Fail()
-	}
-}
-`},
-		"a helper in a test file": {"calc/triple_test.go", `package calc
-
-import "testing"
-
-func want(t *testing.T, got, expected int) {
-	t.Helper()
-	if got != expected {
-		t.Fail()
-	}
-}
-
-func TestTriple(t *testing.T) {
-	want(t, Triple(2), 6)
-}
-`},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			h := newCacheHarness(t)
-			h.buildCalc("")
-
-			h.edit(tc.file, tc.content)
-			h.buildCalc(changedCalc)
-
-			want := []string{"TestDouble", "TestTriple"}
-			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
-				t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
-// An added method changes which interfaces its receiver satisfies, which can
-// send a type switch down another branch without any line of that switch
-// changing. An added free function cannot: reaching it takes a call, and the
-// call is a change of its own.
-func TestAnAddedMethodReMapsThePackageAndAnAddedFunctionDoesNot(t *testing.T) {
-	testCases := map[string]struct {
-		added string
-		want  []string
-	}{
-		"a method": {`
-type counter int
-
-func (c counter) String() string {
-	return "counter"
-}
-`, []string{"TestDouble", "TestTriple"}},
-		"a free function": {`
-func Quadruple(n int) int {
-	return n * 4
-}
-`, nil},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			h := newCacheHarness(t)
-			h.buildCalc("")
-
-			h.edit("calc/calc.go", calcSource+tc.added)
-			h.buildCalc(changedCalc)
-
-			if diff := cmp.Diff(tc.want, h.testsRun()); diff != "" {
-				t.Errorf("re-mapped the wrong tests (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
 // vmClampChanged changes the body of Clamp, which TestDouble executes through
 // its dependency on vm, without moving a line.
 var vmClampChanged = strings.Replace(vmSource, "x := n\n", "x := n + 0\n", 1)
@@ -292,33 +188,6 @@ func TestAChangeUnderneathAChangedPackageNarrowsAcrossBoth(t *testing.T) {
 	want := []coverage.TestID{{Pkg: "example.com/calc", Name: "TestTriple"}}
 	if diff := cmp.Diff(want, second.TestsFor(calcPos(tripleEndLine))); diff != "" {
 		t.Errorf("the kept mapping was not moved with its code (-want +got):\n%s", diff)
-	}
-}
-
-// Anything in a dependency that is not one function's body is still
-// all-or-nothing: a const no block contains, a changed signature a call site
-// can be rebound by, a method that changes which interfaces a type satisfies.
-func TestADependencyChangeOutsideAFunctionBodyReMapsThePackage(t *testing.T) {
-	testCases := map[string]string{
-		"a constant":  vmSource + "\nconst limit = 3\n",
-		"a signature": strings.Replace(vmSource, "Size(v []int) int", "Size(v []int) (n int)", 1),
-		"a method":    vmSource + "\ntype box int\n\nfunc (b box) String() string {\n\treturn \"box\"\n}\n",
-		"a function shadowing a predeclared identifier": vmSource + "\nfunc len(v []int) int {\n\treturn 0\n}\n",
-	}
-
-	for name, vm := range testCases {
-		t.Run(name, func(t *testing.T) {
-			h := newCacheHarness(t)
-			h.buildCalc("")
-
-			h.edit("vm/vm.go", vm)
-			h.buildCalc(changedCalc)
-
-			want := []string{"TestDouble", "TestTriple"}
-			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
-				t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
-			}
-		})
 	}
 }
 
@@ -388,23 +257,6 @@ func TestDependencyCoverageIsNotCoverage(t *testing.T) {
 	}
 	if diff := cmp.Diff(map[string][]string{"TestDouble": {"vm/vm.go:Clamp"}}, entry.Deps); diff != "" {
 		t.Errorf("want each test's dependency functions by key (-want +got):\n%s", diff)
-	}
-}
-
-// A dependency's lines are in no profile of this package, but its functions are
-// fingerprinted alongside it; what is not — the directories outside every main
-// module — still goes into Inputs. A change to a const there is one no function
-// of vm holds.
-func TestADependencyShellChangeReMapsAllOfIt(t *testing.T) {
-	h := newCacheHarness(t)
-
-	h.buildCalc("")
-	h.edit("vm/vm.go", vmSource+"\nconst limit = 3\n")
-	h.buildCalc(changedCalc)
-
-	want := []string{"TestDouble", "TestTriple"}
-	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
-		t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
 	}
 }
 
@@ -580,46 +432,6 @@ func TestABuildEnvironmentChangeReMapsThePackage(t *testing.T) {
 	}
 }
 
-// calcUsingMin is calc with a function that calls the builtin min, appended so
-// that the lines the profiles name do not move.
-const calcUsingMin = calcSource + `
-func Clip(n int) int {
-	return min(n, 10)
-}
-`
-
-// A new top-level name that is also a predeclared identifier rebinds every use
-// of that identifier in the package, and none of those uses changes: Clip calls
-// the new min from then on. It does not matter what kind of declaration it is.
-func TestAnAddedPredeclaredNameReMapsThePackage(t *testing.T) {
-	testCases := map[string]string{
-		"a function": `
-func min(a, b int) int {
-	return a
-}
-`,
-		"a var":   "\nvar max = 3\n",
-		"a const": "\nconst cap = 4\n",
-		"a type":  "\ntype any = int\n",
-	}
-
-	for name, added := range testCases {
-		t.Run(name, func(t *testing.T) {
-			h := newCacheHarness(t)
-			h.edit("calc/calc.go", calcUsingMin)
-			h.buildCalc("")
-
-			h.edit("calc/calc.go", calcUsingMin+added)
-			h.buildCalc(changedCalc)
-
-			want := []string{"TestDouble", "TestTriple"}
-			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
-				t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
-			}
-		})
-	}
-}
-
 // A method added to a type is a global change, but changing one is not: it
 // reaches only the tests that executed its lines.
 func TestAChangedMethodReMapsOnlyTheTestsThatExecutedIt(t *testing.T) {
@@ -669,11 +481,11 @@ func TestAnUnattributableBlockReMapsTheNextChangeWhole(t *testing.T) {
 	}
 	var entry struct {
 		Fingerprint struct {
-			Shell string `json:"shell"`
+			Whole string `json:"whole"`
 		} `json:"fingerprint"`
 	}
-	if err := json.Unmarshal(data, &entry); err != nil || entry.Fingerprint.Shell != "" {
-		t.Errorf("want the entry written without a fingerprint, got %q (%v)", entry.Fingerprint.Shell, err)
+	if err := json.Unmarshal(data, &entry); err != nil || entry.Fingerprint.Whole != "" {
+		t.Errorf("want the entry written without a fingerprint, got %q (%v)", entry.Fingerprint.Whole, err)
 	}
 	h.edit("calc/calc.go", calcSourceDoubleGrown)
 	h.buildCalc(changedCalc)

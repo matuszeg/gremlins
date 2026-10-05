@@ -362,7 +362,7 @@ func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool
 
 		return narrowing{sources: sources}
 	}
-	fp.Deps = make(map[string]depPrint, len(sources))
+	fp.Deps = make(map[string]pkgPrint, len(sources))
 	for importPath, src := range sources {
 		fp.Deps[importPath] = src.stored
 	}
@@ -476,7 +476,7 @@ func (c *Coverage) testBuildFlags(pkg *testPackage) []string {
 // the binary instruments (see dependencyDirs).
 //
 // The dependencies are there for narrowing only. What a test executes in one
-// is recorded as the functions it reached and kept out of its profile (see
+// is recorded as the entities it reached and kept out of its profile (see
 // splitCoverage), so the scope a mapping MEANS is still the package alone, and
 // cacheScope still says so.
 //
@@ -529,7 +529,7 @@ func parseTestNames(out string) []string {
 const testTimeout = 10 * time.Minute
 
 // profileForTest runs one test and records what it executed: its own
-// package's lines, and the dependency functions it reached (see
+// package's lines, and the dependency entities it reached (see
 // splitCoverage).
 func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[string]*depSource) (testCoverage, error) {
 	// The binary runs in the package directory, as `go test` runs it, so a test

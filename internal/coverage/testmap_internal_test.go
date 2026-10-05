@@ -25,6 +25,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 )
@@ -290,6 +291,17 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		Tests: map[string]Profile{
 			"TestOne": {"a.go": {{StartLine: 1, StartCol: 2, EndLine: 3, EndCol: 4}}},
 		},
+		// The package's own print is embedded in the fingerprint, and has to
+		// come back as the fields it was written from.
+		Fingerprint: fingerprint{
+			pkgPrint: pkgPrint{
+				Whole:   "whole",
+				Decls:   map[string]declPrint{"a.go:F": {Hash: "h", Sig: "s", Names: []string{"F"}, File: "a.go", Start: 1, End: 3}},
+				Imports: map[string]map[string]string{"a.go": {"fmt": "fmt"}},
+			},
+			Inputs: "inputs",
+			Deps:   map[string]pkgPrint{"example.com/q": {Whole: "q", Decls: map[string]declPrint{"q/q.go:G": {Hash: "g"}}}},
+		},
 	}
 
 	t.Run("a package written into a directory round-trips", func(t *testing.T) {
@@ -304,7 +316,7 @@ func TestLoadCachedPackageIsAMissRatherThanWrong(t *testing.T) {
 		if !ok {
 			t.Fatal("want the package read back, got a miss")
 		}
-		if diff := cmp.Diff(entry, got); diff != "" {
+		if diff := cmp.Diff(entry, got, cmp.AllowUnexported(fingerprint{}), cmpopts.IgnoreUnexported(declPrint{})); diff != "" {
 			t.Errorf("cache round-trip mismatch (-want +got):\n%s", diff)
 		}
 	})

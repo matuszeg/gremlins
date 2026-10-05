@@ -57,11 +57,15 @@ type Coverage struct {
 
 	// Read once per run and shared by every package the map builder visits:
 	// what the toolchain is, what each dependency directory hashes to, what
-	// each package links, and what each instrumented dependency looks like.
+	// each package links, what each instrumented dependency looks like, and
+	// what each package is called.
 	env         *goEnvironment
 	dirHashes   map[string]string
 	depListings map[string]depListing
 	depSources  map[string]*depSource
+	// pkgNames is each listed package's name by import path, which is what
+	// an unnamed import binds.
+	pkgNames map[string]string
 }
 
 // Option for the Coverage initialization.
