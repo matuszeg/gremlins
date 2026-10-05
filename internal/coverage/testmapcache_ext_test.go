@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -51,6 +52,12 @@ type cacheHarness struct {
 	// shape of an ordinary checkout, as against a replace target or a go.work
 	// member.
 	rootAtFixture bool
+	// notMain is a package the dependency listing reports as outside every
+	// main module, as notMainEnv carries it.
+	notMain string
+	// extraProfile is appended to every profile, as extraProfileEnv carries
+	// it.
+	extraProfile string
 }
 
 func newCacheHarness(t *testing.T) *cacheHarness {
@@ -97,7 +104,7 @@ func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestM
 		mod.Root = h.pkgRoot
 	}
 	cov := coverage.NewWithCmd(
-		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv),
+		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv, h.notMain, h.extraProfile),
 		h.t.TempDir(), mod,
 		coverage.WithTestMapCacheDir(h.cacheDir))
 
@@ -256,8 +263,8 @@ func TestMapCacheRebuildsWhenTheFileIsUnusable(t *testing.T) {
 				`"build_id":"x","tests":{}}`), 0o600)
 		},
 		"a cache file naming another package": func(path string) error {
-			return os.WriteFile(path, []byte(`{"version":2,"import_path":"example.com/elsewhere",`+
-				`"build_id":"x","tests":{}}`), 0o600)
+			return os.WriteFile(path, []byte(`{"version":`+strconv.Itoa(coverage.CacheVersion)+
+				`,"import_path":"example.com/elsewhere","build_id":"x","tests":{}}`), 0o600)
 		},
 		"no cache file at all": os.Remove,
 	}
@@ -292,7 +299,10 @@ func TestMapCacheSurvivesTheRoundTripExactly(t *testing.T) {
 	first := h.build("TestTestMapHelperProcess", "")
 	second := h.build("TestTestMapHelperProcess", "")
 
-	pos := token.Position{Filename: "vm/vm.go", Line: clampedLine, Column: 3}
+	pos := token.Position{Filename: "vm/vm.go", Line: vmOwnLine, Column: 3}
+	if len(first.TestsFor(pos)) == 0 {
+		t.Fatal("want a line some test executes, or the comparison below is of nothing")
+	}
 	if diff := cmp.Diff(first.TestsFor(pos), second.TestsFor(pos)); diff != "" {
 		t.Errorf("the cached map answers differently (-want +got):\n%s", diff)
 	}
@@ -389,4 +399,16 @@ func contains(haystack []string, needle string) bool {
 	}
 
 	return false
+}
+
+// A profile that cannot be read is a test that could not be mapped, and so a
+// package that runs its whole suite rather than one selected from half a map.
+func TestAnUnreadableProfileLeavesThePackageUnmapped(t *testing.T) {
+	h := newCacheHarness(t)
+	h.extraProfile = "not a profile line\n"
+
+	tm := h.buildCalc("")
+	if tm.Mapped("example.com/calc") {
+		t.Error("want the package unmapped when its profiles cannot be read")
+	}
 }

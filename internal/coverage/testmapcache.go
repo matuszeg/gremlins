@@ -30,6 +30,9 @@ import (
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
+// Version 5 instruments a package's in-module dependencies alongside it: each
+// test records the dependency functions it executed, the fingerprint carries
+// each dependency's print, and Inputs no longer hashes those directories.
 // Version 4 is shared between checkouts: its directory is named from the
 // module alone, its Inputs name nothing by absolute path and fold in the build
 // environment and compile flags, and an entry whose fingerprint and Inputs both
@@ -39,7 +42,7 @@ import (
 // module, which meant a run had to write back every package it had not looked
 // at or lose them — and a scoped run, which is the recommended workflow, looks
 // at one.
-const cacheVersion = 4
+const cacheVersion = 5
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
@@ -62,14 +65,20 @@ const cacheVersion = 4
 // entry may have none — a package whose directory could not be read — in which
 // case a changed build ID re-maps the whole package, as it always did.
 //
+// Deps is, per test, the dependency functions it executed (see
+// splitCoverage). It is apart from Tests on purpose: Tests is coverage, and
+// read as coverage everywhere, while Deps is only ever asked "did this test
+// reach a function that changed". A test that reached none has no entry.
+//
 // ImportPath is stored as well as hashed into the file name, so that a file
 // found under the wrong name is a miss rather than another package's answer.
 type cachedPackage struct {
-	Tests       map[string]Profile `json:"tests"`
-	ImportPath  string             `json:"import_path"`
-	BuildID     string             `json:"build_id"`
-	Fingerprint fingerprint        `json:"fingerprint"`
-	Version     int                `json:"version"`
+	Tests       map[string]Profile  `json:"tests"`
+	Deps        map[string][]string `json:"deps,omitempty"`
+	ImportPath  string              `json:"import_path"`
+	BuildID     string              `json:"build_id"`
+	Fingerprint fingerprint         `json:"fingerprint"`
+	Version     int                 `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than

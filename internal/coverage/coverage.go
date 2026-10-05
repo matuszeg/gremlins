@@ -57,9 +57,12 @@ type Coverage struct {
 	integrationMode bool
 
 	// Read once per run and shared by every package the map builder visits:
-	// what the toolchain is, and what each dependency directory hashes to.
-	env       *goEnvironment
-	dirHashes map[string]string
+	// what the toolchain is, what each dependency directory hashes to, what
+	// each package links, and what each instrumented dependency looks like.
+	env         *goEnvironment
+	dirHashes   map[string]string
+	depListings map[string]depListing
+	depSources  map[string]*depSource
 
 	// When profilePath is set, Run parses that pre-computed profile instead
 	// of gathering coverage itself, and reports profileElapsed as the test
@@ -272,24 +275,8 @@ func (c *Coverage) parse(data io.Reader) (Profile, error) {
 	if err != nil {
 		return nil, err
 	}
-	status := make(Profile)
-	for _, p := range profiles {
-		for _, b := range p.Blocks {
-			if b.Count == 0 {
-				continue
-			}
-			block := Block{
-				StartLine: b.StartLine,
-				StartCol:  b.StartCol,
-				EndLine:   b.EndLine,
-				EndCol:    b.EndCol,
-			}
-			fn := c.removeModuleFromPath(p)
-			status[fn] = append(status[fn], block)
-		}
-	}
 
-	return status, nil
+	return c.blocksOf(profiles), nil
 }
 
 // removeModuleFromPath is the name a profile block is recorded under: the file's

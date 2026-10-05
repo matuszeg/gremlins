@@ -27,6 +27,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/tools/cover"
+
 	"github.com/go-gremlins/gremlins/internal/log"
 )
 
@@ -216,7 +218,7 @@ type mapResult struct {
 // cacheDir is empty when the cache is unusable, in which case the mapping is
 // still made and simply not remembered.
 func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) mapResult {
-	binary, err := c.compileTests(pkg.importPath)
+	binary, err := c.compileTests(pkg)
 	if err != nil {
 		log.Errorf("cannot compile the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
 
@@ -256,18 +258,22 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		return mapResult{}
 	}
 
-	fp, reuse := c.reusableFrom(pkg, cached, hit)
+	n := c.reusableFrom(pkg, cached, hit)
 
-	complete, reused := true, 0
+	complete, attributable, reused := true, true, 0
 	mapped := make(map[string]Profile, len(names))
+	deps := map[string][]string{}
 	for _, name := range names {
-		if profile, keep := reuse[name]; keep {
+		if profile, keep := n.reuse[name]; keep {
 			mapped[name] = profile
+			if keys := cached.Deps[name]; len(keys) > 0 {
+				deps[name] = keys
+			}
 			reused++
 
 			continue
 		}
-		profile, err := c.profileForTest(pkg, name)
+		got, err := c.profileForTest(pkg, name, n.sources)
 		if err != nil {
 			log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n",
 				pkg.importPath, name, pkg.importPath, err)
@@ -275,7 +281,11 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 
 			continue
 		}
-		mapped[name] = profile
+		mapped[name] = got.profile
+		if len(got.deps) > 0 {
+			deps[name] = got.deps
+		}
+		attributable = attributable && got.attributable
 	}
 	// A partial package is discarded rather than kept, so that "the map has no
 	// test here" always means "no test covers this line", never "we did not
@@ -287,10 +297,21 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	for name, profile := range mapped {
 		tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
 	}
+	// A block that could not be placed means some test's record of what it
+	// executed is incomplete, and narrowing from it next time could keep a
+	// mapping the change reached. The mappings themselves are still right, so
+	// they are kept — under a fingerprint that says nothing, which costs the
+	// next run with a moved build ID a whole re-map and nothing worse.
+	fp := n.fp
+	if !attributable {
+		log.Errorf("cannot attribute everything the tests of %s executed, so its next change will re-map all of it\n",
+			pkg.importPath)
+		fp = fingerprint{}
+	}
 	if id != "" && cacheDir != "" {
 		entry := cachedPackage{
 			Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id,
-			Fingerprint: fp, Tests: mapped,
+			Fingerprint: fp, Tests: mapped, Deps: deps,
 		}
 		if err := entry.save(cacheDir); err != nil {
 			log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)
@@ -298,6 +319,15 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	}
 
 	return mapResult{tests: len(names), reused: reused, mapped: true}
+}
+
+// narrowing is what a package's mapping run starts from: the fingerprint the
+// next run will compare against, the mappings the change since left valid, and
+// the instrumented dependencies a new mapping's blocks are attributed to.
+type narrowing struct {
+	fp      fingerprint
+	reuse   map[string]Profile
+	sources map[string]*depSource
 }
 
 // reusableFrom takes the package's current fingerprint and works out which of
@@ -310,33 +340,48 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 // Narrowing is off under --cross-package: a profile then covers lines in
 // packages this fingerprint says nothing about, so "no changed line falls in
 // this profile" would be a claim about only part of it.
-func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool) (fingerprint, map[string]Profile) {
+func (c *Coverage) reusableFrom(pkg *testPackage, cached cachedPackage, hit bool) narrowing {
 	if c.crossPackage {
-		return fingerprint{}, nil
+		return narrowing{}
 	}
+	// Read first and returned however the rest goes: every new mapping needs
+	// them to keep a dependency's blocks out of its profile.
+	sources, depsOK := c.dependencySources(pkg)
 	fp, ok := c.fingerprintOf(pkg)
 	if !ok {
 		log.Errorf("cannot read the sources of %s, so its whole map will be rebuilt\n", pkg.importPath)
 
-		return fingerprint{}, nil
+		return narrowing{sources: sources}
 	}
-	// Without this a moved build ID cannot be told apart from a moved
-	// dependency, so a fingerprint that lacks it must not be narrowed from.
+	// The dependencies whose lines the binary records are fingerprinted
+	// beside the package; everything else it is built from goes into Inputs.
+	// Without both, a moved build ID cannot be told apart from a moved
+	// dependency, so a fingerprint that lacks either must not be narrowed from.
+	if !depsOK {
+		log.Errorf("cannot read the dependencies of %s, so its whole map will be rebuilt\n", pkg.importPath)
+
+		return narrowing{sources: sources}
+	}
+	fp.Deps = make(map[string]depPrint, len(sources))
+	for importPath, src := range sources {
+		fp.Deps[importPath] = src.stored
+	}
 	fp.Inputs, ok = c.buildInputsOf(pkg)
 	if !ok {
 		log.Errorf("cannot identify what %s is built from, so its whole map will be rebuilt\n", pkg.importPath)
 
-		return fingerprint{}, nil
+		return narrowing{sources: sources}
 	}
+	n := narrowing{fp: fp, sources: sources}
 	if !hit {
-		return fp, nil
+		return n
 	}
 	reuse, narrowed := reusable(cached, fp)
-	if !narrowed {
-		return fp, nil
+	if narrowed {
+		n.reuse = reuse
 	}
 
-	return fp, reuse
+	return n
 }
 
 const wholeModule = "./..."
@@ -397,13 +442,14 @@ func parsePackageList(out string) []testPackage {
 	return pkgs
 }
 
-// compileTests builds the package's test binary once, instrumented for coverage
-// over the whole module. Every test of the package then runs against this one
-// binary.
-func (c *Coverage) compileTests(importPath string) (string, error) {
-	binary := filepath.Join(c.workDir, strings.NewReplacer("/", "_", ".", "_").Replace(importPath)+".test")
-	args := append([]string{"test", "-c", "-o", binary}, c.testBuildFlags(importPath)...)
-	args = append(args, importPath)
+// compileTests builds the package's test binary once, instrumented for
+// coverage over the package and its in-module dependencies, or over the whole
+// module under --cross-package. Every test of the package then runs against
+// this one binary.
+func (c *Coverage) compileTests(pkg *testPackage) (string, error) {
+	binary := filepath.Join(c.workDir, strings.NewReplacer("/", "_", ".", "_").Replace(pkg.importPath)+".test")
+	args := append([]string{"test", "-c", "-o", binary}, c.testBuildFlags(pkg)...)
+	args = append(args, pkg.importPath)
 
 	if out, err := c.cmdContext("go", args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%w\n%s", err, out)
@@ -416,13 +462,37 @@ func (c *Coverage) compileTests(importPath string) (string, error) {
 // mapping, besides where to write it. They decide what the binary is, so they
 // are folded into the package's Inputs too, and both read them from here so
 // that the two cannot drift apart.
-func (c *Coverage) testBuildFlags(importPath string) []string {
+func (c *Coverage) testBuildFlags(pkg *testPackage) []string {
 	var flags []string
 	if c.buildTags != "" {
 		flags = append(flags, "-tags", c.buildTags)
 	}
 
-	return append(flags, "-coverpkg", c.testMapCoverPkg(importPath))
+	return append(flags, "-coverpkg", c.mappingCoverPkg(pkg))
+}
+
+// mappingCoverPkg is the -coverpkg a package's test binary is compiled with:
+// testMapCoverPkg's scope, plus — without --cross-package — every dependency
+// the binary instruments (see dependencyDirs).
+//
+// The dependencies are there for narrowing only. What a test executes in one
+// is recorded as the functions it reached and kept out of its profile (see
+// splitCoverage), so the scope a mapping MEANS is still the package alone, and
+// cacheScope still says so.
+//
+// The list is in Inputs too, through testBuildFlags, so a dependency added to
+// or dropped from what the binary links re-maps the package. A listing that
+// fails instruments the package alone, and the fingerprint fails with it.
+func (c *Coverage) mappingCoverPkg(pkg *testPackage) string {
+	scope := c.testMapCoverPkg(pkg.importPath)
+	if c.crossPackage {
+		return scope
+	}
+	deps := c.instrumentedImports(pkg)
+	sort.Strings(deps)
+	paths := append([]string{scope}, deps...)
+
+	return strings.Join(paths, ",")
 }
 
 // listTests asks the compiled binary which tests it holds, which is the same
@@ -458,13 +528,16 @@ func parseTestNames(out string) []string {
 // returning.
 const testTimeout = 10 * time.Minute
 
-func (c *Coverage) profileForTest(pkg *testPackage, name string) (Profile, error) {
+// profileForTest runs one test and records what it executed: its own
+// package's lines, and the dependency functions it reached (see
+// splitCoverage).
+func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[string]*depSource) (testCoverage, error) {
 	// The binary runs in the package directory, as `go test` runs it, so a test
 	// reading testdata still finds it. That makes the profile path have to be
 	// absolute.
 	file, err := filepath.Abs(filepath.Join(c.workDir, "testmap.cov"))
 	if err != nil {
-		return nil, err
+		return testCoverage{}, err
 	}
 
 	cmd := c.cmdContext(pkg.binary,
@@ -474,26 +547,32 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string) (Profile, error
 	cmd.Dir = pkg.dir
 
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("%w\n%s", err, out)
+		return testCoverage{}, fmt.Errorf("%w\n%s", err, out)
 	}
 
 	f, err := os.Open(file) //nolint:gosec // G304: the path is Gremlins' own working directory
 	if err != nil {
-		return nil, err
+		return testCoverage{}, err
 	}
 	defer func(f *os.File) {
 		_ = f.Close()
 	}(f)
 
-	return c.parse(f)
+	profiles, err := cover.ParseProfilesFromReader(f)
+	if err != nil {
+		return testCoverage{}, err
+	}
+
+	return c.splitCoverage(pkg, profiles, sources), nil
 }
 
 // testMapCoverPkg is the coverage scope a package's tests are mapped under.
 //
 // With --cross-package it must be the whole module: the point is to see a test
 // in one package executing a line in another. Without it, a test is only ever
-// asked about its own package's code, and instrumenting the rest of the module
-// would cost time to record coverage nothing will read.
+// asked about its own package's code, and that is the scope a mapping means:
+// the in-module dependencies mappingCoverPkg adds are instrumented only to be
+// narrowed across, and never read as coverage.
 //
 // --cross-package decides this, NOT the configured --coverpkg, and the order of
 // those two checks is the whole of this function. The configured coverpkg is

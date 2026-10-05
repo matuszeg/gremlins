@@ -42,14 +42,19 @@ type span struct {
 // from each test root — is a much larger build, and it is defeated by
 // reflection exactly where a package is most likely to use it.
 //
+// The same rule reaches into the package's in-module dependencies. Their lines
+// are instrumented too, and each test records the dependency functions it
+// executed (cached.Deps); a dependency function whose body changed dirties
+// exactly the tests that executed it, by the same argument. Everything else
+// about a dependency is all-or-nothing (see changedDependencies).
+//
 // Things this cannot see, all of which return false and re-map the whole
 // package:
 //
-//   - A change outside the package. Without --cross-package a test binary is
-//     built with -coverpkg for its own package alone, so no profile covers a
-//     dependency and a change there looks clean to every test. Inputs records
-//     every dependency's source, the toolchain and the build environment, and
-//     any change to it is a re-map.
+//   - A change to what the binary is built from that no profile records: a
+//     dependency outside every main module, the toolchain, the build
+//     environment, the compile flags. Inputs records all of it, and any change
+//     to it is a re-map.
 //   - A change outside a declaration. `const timeout = 5` becoming `10` changes
 //     a line no coverage block contains, while the tests that execute the use
 //     site do change behaviour. Everything that is not an attributable
@@ -78,10 +83,14 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	if was.Shell == "" || was.Shell != now.Shell {
 		return nil, false
 	}
-	// Something the test binary is built from besides this package moved, and
-	// a dependency's lines are in no profile here, so which mappings it reached
-	// cannot be worked out.
+	// Something the test binary is built from besides this package and its
+	// instrumented dependencies moved, and its lines are in no record here,
+	// so which mappings it reached cannot be worked out.
 	if was.Inputs == "" || was.Inputs != now.Inputs {
+		return nil, false
+	}
+	dirtyDeps, ok := changedDependencies(was.Deps, now.Deps)
+	if !ok {
 		return nil, false
 	}
 
@@ -141,7 +150,7 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 
 	kept := make(map[string]Profile, len(cached.Tests))
 	for name, profile := range cached.Tests {
-		if dirtyTests[name] || touches(profile, dirtyLines) {
+		if dirtyTests[name] || touches(profile, dirtyLines) || touchesAny(cached.Deps[name], dirtyDeps) {
 			continue
 		}
 		shifted, ok := shift(profile, moved)

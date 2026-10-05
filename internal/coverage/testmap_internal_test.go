@@ -485,10 +485,42 @@ func TestBuildInputsChangeWithTheCompileFlags(t *testing.T) {
 func TestTestBuildFlags(t *testing.T) {
 	t.Parallel()
 
-	c := &Coverage{buildTags: "integration"}
-	want := []string{"-tags", "integration", "-coverpkg", "example.com/p"}
-	if diff := cmp.Diff(want, c.testBuildFlags("example.com/p")); diff != "" {
+	root := t.TempDir()
+	own := filepath.Join(root, "p")
+	// What `go list -deps -test` says the package's test binary links: two
+	// packages of main modules (in either order), the package itself, a
+	// replace target, and the standard library.
+	listing := strings.Join([]string{
+		"example.com/z\t" + filepath.Join(root, "z") + "\ttrue",
+		"example.com/a [example.com/p.test]\t" + filepath.Join(root, "a") + "\ttrue",
+		"example.com/p\t" + own + "\ttrue",
+		"example.org/replaced\t" + filepath.Join(root, "r") + "\tfalse",
+		"testing\t/nonexistent/goroot/src/testing\t",
+	}, "\n")
+	newCov := func(cross bool) *Coverage {
+		return &Coverage{
+			buildTags: "integration", crossPackage: cross,
+			mod: gomodule.GoModule{Name: "example.com", Root: root},
+			env: &goEnvironment{version: "go-fixture", root: "/nonexistent/goroot"},
+			cmdContext: func(string, ...string) *exec.Cmd {
+				return exec.Command("printf", "%s\n", listing) //nolint:gosec // a fixed program, given the test's own listing
+			},
+		}
+	}
+	pkg := &testPackage{importPath: "example.com/p", dir: own}
+
+	// The package's own lines are what its mapping means; its main-module
+	// dependencies are instrumented beside it so that a change in one can be
+	// narrowed across rather than re-mapping the package.
+	want := []string{"-tags", "integration", "-coverpkg", "example.com/p,example.com/a,example.com/z"}
+	if diff := cmp.Diff(want, newCov(false).testBuildFlags(pkg)); diff != "" {
 		t.Errorf("testBuildFlags() mismatch (-want +got):\n%s", diff)
+	}
+
+	// Cross-package mapping instruments the whole module already.
+	want = []string{"-tags", "integration", "-coverpkg", wholeModule}
+	if diff := cmp.Diff(want, newCov(true).testBuildFlags(pkg)); diff != "" {
+		t.Errorf("cross-package testBuildFlags() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -520,5 +552,34 @@ func TestCachePathDefaultsToTheUserCacheDirectory(t *testing.T) {
 	t.Setenv("HOME", "")
 	if _, err := c.cacheDirPath("key"); err == nil {
 		t.Error("want an error when there is no user cache directory")
+	}
+}
+
+// A dependency directory that stays in Inputs is hashed once per run however
+// many packages link it, and a failure to read it is remembered as one.
+func TestHashDirIsReadOncePerRun(t *testing.T) {
+	t.Parallel()
+
+	c := &Coverage{}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+	first, ok := c.hashDir(dir)
+	if !ok {
+		t.Fatal("want the directory hashed")
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package b\n"), 0o600); err != nil {
+		t.Fatalf("cannot write the source: %v", err)
+	}
+	if again, ok := c.hashDir(dir); !ok || again != first {
+		t.Error("want the run's first reading back")
+	}
+
+	gone := filepath.Join(t.TempDir(), "gone")
+	for range 2 {
+		if _, ok := c.hashDir(gone); ok {
+			t.Error("want a failure for a directory that is not there")
+		}
 	}
 }

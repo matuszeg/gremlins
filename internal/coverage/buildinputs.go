@@ -25,24 +25,33 @@ import (
 )
 
 // buildInputsOf hashes everything the package's test binary is built from
-// except the package itself: the source of every dependency somebody could
-// edit, the module's requirements, the toolchain, the build environment, and
-// the flags Gremlins compiles the binary with.
+// except the package itself and the dependencies it instruments: the source of
+// every other dependency somebody could edit, the module's requirements, the
+// toolchain, the build environment, and the flags Gremlins compiles the binary
+// with.
 //
 // Per-test invalidation needs this, and the build ID cannot supply it. The
 // build ID folds the package's own source together with every dependency's, so
 // a moved build ID says something changed and never says where. That
 // distinction is the whole of the difference between sound and nearly sound: a
-// changed dependency can send a test down a path it did not take before, and no
-// profile of this package records a dependency's lines, so the change looks
-// clean to every mapping the cache holds. Narrowing on the package's own
-// fingerprint while a dependency also moved would keep mappings that are stale,
-// and a stale mapping means a test that could kill a mutant is never selected —
-// the mutant reports LIVED and the gate goes red on something nobody can
-// reproduce.
+// changed dependency can send a test down a path it did not take before, and if
+// no profile records that dependency's lines the change looks clean to every
+// mapping the cache holds. Narrowing on the package's own fingerprint while
+// such a dependency also moved would keep mappings that are stale, and a stale
+// mapping means a test that could kill a mutant is never selected — the mutant
+// reports LIVED and the gate goes red on something nobody can reproduce.
 //
 // So a run narrows only while this is unchanged, and re-maps the whole package
 // the moment it is not.
+//
+// An instrumented dependency is the exception, and the only one: its lines ARE
+// recorded, per test, as the functions each test executed there, and it is
+// fingerprinted beside the package (see fingerprint.Deps), so what changed in
+// it can be attributed just as a change in the package can. Leaving it out of
+// here is sound only because every directory it leaves out is one of those —
+// both read the same listing and the same instrumented flag, and a dependency
+// that cannot be fingerprinted fails the whole fingerprint rather than falling
+// through the gap between the two.
 //
 // It has to be complete as well as cheap, because it is also what lets an
 // unchanged package skip the build ID: with the fingerprint and this both equal,
@@ -81,7 +90,7 @@ func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 
 	parts := []string{env.version}
 	parts = append(parts, env.build...)
-	parts = append(parts, "flags\x00"+strings.Join(c.testBuildFlags(pkg.importPath), "\x00"))
+	parts = append(parts, "flags\x00"+strings.Join(c.testBuildFlags(pkg), "\x00"))
 	parts = append(parts, "work\x00"+relativeTo(root, env.work))
 	for _, f := range []struct{ name, path string }{
 		{"go.mod", filepath.Join(root, "go.mod")},
@@ -92,6 +101,9 @@ func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 		parts = append(parts, f.name+"\x00"+hashFileOrAbsent(f.path))
 	}
 	for _, dep := range deps {
+		if dep.instrumented {
+			continue
+		}
 		sum, dirOK := c.hashDir(dep.dir)
 		if !dirOK {
 			return "", false
@@ -161,9 +173,28 @@ func relativeTo(root, path string) string {
 // dependency is one package directory a test binary is built from, and the
 // name it goes into Inputs under.
 type dependency struct {
-	name string
-	dir  string
+	name       string
+	dir        string
+	importPath string
+	// instrumented says the test binary records this dependency's lines: it
+	// belongs to a main module — the module being mapped, or a member of the
+	// workspace it is in. Everything else is a replace target or a vendored
+	// copy, which is read into Inputs whole as before.
+	instrumented bool
 }
+
+// depListing is one package's dependency listing, kept for the run: it is
+// asked for by the compile flags, by Inputs and by the fingerprint, and the
+// three must agree.
+type depListing struct {
+	deps []dependency
+	ok   bool
+}
+
+// depListFormat asks for each dependency's import path, its directory, and
+// whether its module is a main module. A package of the standard library has
+// no module and reports an empty third field.
+const depListFormat = "{{.ImportPath}}\t{{.Dir}}\t{{with .Module}}{{.Main}}{{end}}"
 
 // dependencyDirs is where the source of everything this package's tests link
 // lives, minus the package's own directory and minus what the toolchain and the
@@ -180,8 +211,26 @@ type dependency struct {
 // the same one. The result is ordered by name rather than by directory, for the
 // same reason: two checkouts can order the same directories differently once
 // some of them are outside the root.
+//
+// A dependency is instrumented when Go says its module is a main module, which
+// is exactly the module itself and, in a workspace, its members. That is a
+// narrower test than "inside the module root": a nested module under the root,
+// required through a replace, is not a main module and stays in Inputs.
 func (c *Coverage) dependencyDirs(pkg *testPackage) ([]dependency, bool) {
-	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", "{{.ImportPath}}\t{{.Dir}}", pkg.importPath).CombinedOutput()
+	if listing, done := c.depListings[pkg.importPath]; done {
+		return listing.deps, listing.ok
+	}
+	deps, ok := c.listDependencies(pkg)
+	if c.depListings == nil {
+		c.depListings = map[string]depListing{}
+	}
+	c.depListings[pkg.importPath] = depListing{deps: deps, ok: ok}
+
+	return deps, ok
+}
+
+func (c *Coverage) listDependencies(pkg *testPackage) ([]dependency, bool) {
+	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", depListFormat, pkg.importPath).CombinedOutput()
 	if err != nil {
 		return nil, false
 	}
@@ -199,7 +248,8 @@ func (c *Coverage) dependencyDirs(pkg *testPackage) ([]dependency, bool) {
 	seen := map[string]struct{}{}
 	var deps []dependency
 	for _, line := range strings.Split(string(out), "\n") {
-		importPath, dir, _ := strings.Cut(line, "\t")
+		importPath, rest, _ := strings.Cut(line, "\t")
+		dir, main, _ := strings.Cut(rest, "\t")
 		dir = strings.TrimSpace(dir)
 		// `go list` writes build diagnostics to the same stream, and a
 		// synthesised test package can report no directory at all.
@@ -213,11 +263,15 @@ func (c *Coverage) dependencyDirs(pkg *testPackage) ([]dependency, bool) {
 			continue
 		}
 		seen[dir] = struct{}{}
-		name := "import\x00" + strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
+		importPath = strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
+		name := "import\x00" + importPath
 		if under(dir, root) {
 			name = "dir\x00" + relativeTo(root, dir)
 		}
-		deps = append(deps, dependency{name: name, dir: dir})
+		deps = append(deps, dependency{
+			name: name, dir: dir, importPath: importPath,
+			instrumented: strings.TrimSpace(main) == "true",
+		})
 	}
 	sort.Slice(deps, func(i, j int) bool { return deps[i].name < deps[j].name })
 

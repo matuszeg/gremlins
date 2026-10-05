@@ -70,16 +70,24 @@ type fingerprint struct {
 	// declarations around them have pushed them to.
 	Others map[string][]declPrint `json:"others,omitempty"`
 
-	// Inputs is everything the test binary is built from except this package:
-	// see buildInputsOf, which fills it in. Without it a moved build ID could
+	// Inputs is everything the test binary is built from except this package
+	// and the dependencies in Deps: see buildInputsOf, which fills it in. Without it a moved build ID could
 	// never be told apart from a moved dependency, and narrowing would keep
 	// stale mappings. With it, a moved build ID under an unchanged fingerprint
-	// and unchanged Inputs is a moved checkout, and the whole map is kept.
+	// (Deps included) and unchanged Inputs is a moved checkout, and the whole map is kept.
 	//
 	// It is not read off the filesystem like the rest, so fingerprintOf leaves
 	// it empty and the caller sets it — which is also what makes a fingerprint
 	// with no inputs unusable rather than optimistic.
 	Inputs string `json:"inputs"`
+
+	// Deps is every dependency the test binary instruments besides this
+	// package, by import path: the packages of every main module it links (see
+	// dependencyDirs). Their lines are recorded per test, as the functions it
+	// executed there, so a dependency is fingerprinted like the package rather
+	// than hashed into Inputs — which is what lets a changed function body in
+	// one dirty only the tests that executed it.
+	Deps map[string]depPrint `json:"deps,omitempty"`
 }
 
 // The kinds of declaration whose effect reaches past the lines it occupies.
@@ -96,6 +104,13 @@ const (
 // declPrint is one declaration: what it said, and where it was.
 type declPrint struct {
 	Hash string `json:"hash"`
+	// Sig is the declaration without its body: doc comment, receiver, name,
+	// type parameters and signature. A dependency's function whose body alone
+	// changed reaches only the tests that executed it; one whose signature
+	// changed can rebind a call site that did not change — a handler passed as
+	// a value and reflected over — so the two are told apart. The package's
+	// own declarations carry it too, unread for now.
+	Sig string `json:"sig,omitempty"`
 	// File is the name the coverage profile uses, not the name on disk, so that
 	// a span can be compared against a profile without translating either.
 	File string `json:"file"`
@@ -149,6 +164,12 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 		return fingerprint{}, false
 	}
 
+	return c.fingerprintFiles(pkg, files)
+}
+
+// fingerprintFiles is fingerprintOf over files already read, so that a reader
+// that needs the files for something else as well reads them once.
+func (c *Coverage) fingerprintFiles(pkg *testPackage, files []goFile) (fingerprint, bool) {
 	// Both of these are package-wide, not per file. A test another declaration
 	// calls does not run only on its own, wherever the caller is; and a key two
 	// declarations share cannot tell them apart, wherever the other one is.
@@ -355,8 +376,13 @@ func printOf(f *goFile, fn *ast.FuncDecl, profileName string, isTestFile bool,
 	referenced map[string]bool,
 ) (declPrint, string, bool) {
 	start, end := declSpan(f.fset, fn)
+	header := end.Offset
+	if fn.Body != nil {
+		header = f.fset.Position(fn.Body.Lbrace).Offset
+	}
 	described := declPrint{
 		Hash:  hashOf(f.data[start.Offset:end.Offset]),
+		Sig:   hashOf(f.data[start.Offset:header]),
 		File:  profileName,
 		Start: start.Line,
 		End:   end.Line,

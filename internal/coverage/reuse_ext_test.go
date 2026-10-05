@@ -17,9 +17,11 @@
 package coverage_test
 
 import (
+	"encoding/json"
 	"go/token"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -235,45 +237,169 @@ func Quadruple(n int) int {
 	}
 }
 
-// The hole the build ID cannot close on its own. One hash covers the package's
-// source and every dependency's, so a run that finds a change here has no way
-// to know whether that is all of it — and a dependency's lines are in no
-// profile of this package, so a change there looks clean to every mapping.
-func TestAChangeUnderneathAChangedPackageReMapsAllOfIt(t *testing.T) {
-	h := newCacheHarness(t)
+// vmClampChanged changes the body of Clamp, which TestDouble executes through
+// its dependency on vm, without moving a line.
+var vmClampChanged = strings.Replace(vmSource, "x := n\n", "x := n + 0\n", 1)
 
-	h.buildCalc("")
+// vmSizeChanged changes the body of Size, which no test of calc executes.
+var vmSizeChanged = strings.Replace(vmSource, "return len(v)\n", "return len(v) + 0\n", 1)
 
-	// The same edit to calc that re-maps two tests on its own, made while a
-	// package calc is built on top of has changed as well.
-	h.edit("calc/calc.go", calcSourceDoubleGrown)
-	h.edit("vm/vm.go", vmSource+`
-func Extra(v []int) int {
-	return len(v) + 1
-}
-`)
-	h.buildCalc(changedCalc)
+// A dependency's lines are recorded too, as the functions each test executed
+// there, so a changed body in a dependency is attributed exactly as one in the
+// package is: only the tests that executed it can behave differently.
+func TestADependencyBodyChangeReMapsOnlyTheTestsThatExecutedIt(t *testing.T) {
+	testCases := map[string]struct {
+		vm   string
+		want []string
+	}{
+		"a function one test executed": {vmClampChanged, []string{"TestDouble"}},
+		"a function no test executed":  {vmSizeChanged, nil},
+		// Reaching it would take a call, and the call is a change of its own.
+		"an added function": {vmSource + "\nfunc Extra(v []int) int {\n\treturn len(v) + 1\n}\n", nil},
+	}
 
-	// calc's own change is attributable and would narrow on its own; what
-	// changed beneath it is in no profile of calc, so none of it can be kept.
-	want := []string{"TestDouble", "TestTriple"}
-	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
-		t.Errorf("want the dependent package re-mapped whole (-want +got):\n%s", diff)
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			h := newCacheHarness(t)
+			h.buildCalc("")
+
+			h.edit("vm/vm.go", tc.vm)
+			tm := h.buildCalc(changedCalc)
+
+			if diff := cmp.Diff(tc.want, h.testsRun()); diff != "" {
+				t.Errorf("re-mapped the wrong tests (-want +got):\n%s", diff)
+			}
+			if tm.Len() != 2 {
+				t.Errorf("want the map still complete, got %d tests", tm.Len())
+			}
+		})
 	}
 }
 
-// A dependency's lines are in no profile of this package, so a change there
-// alone looks clean to every mapping. What the binary is built from besides the
-// package says it is not.
-func TestAChangeOutsideThePackageReMapsAllOfIt(t *testing.T) {
+// A change in the package and one beneath it at once narrow independently:
+// each dirties the tests that executed it, and nothing else.
+func TestAChangeUnderneathAChangedPackageNarrowsAcrossBoth(t *testing.T) {
 	h := newCacheHarness(t)
 
 	h.buildCalc("")
-	h.edit("vm/vm.go", vmSource+`
-func Extra(v []int) int {
-	return len(v) + 1
+	h.edit("calc/calc.go", calcSourceDoubleGrown)
+	h.edit("vm/vm.go", vmSizeChanged)
+	second := h.buildCalc(changedCalc)
+
+	if diff := cmp.Diff([]string{"TestDouble"}, h.testsRun()); diff != "" {
+		t.Errorf("want only the test that executed a change re-mapped (-want +got):\n%s", diff)
+	}
+	want := []coverage.TestID{{Pkg: "example.com/calc", Name: "TestTriple"}}
+	if diff := cmp.Diff(want, second.TestsFor(calcPos(tripleEndLine))); diff != "" {
+		t.Errorf("the kept mapping was not moved with its code (-want +got):\n%s", diff)
+	}
 }
-`)
+
+// Anything in a dependency that is not one function's body is still
+// all-or-nothing: a const no block contains, a changed signature a call site
+// can be rebound by, a method that changes which interfaces a type satisfies.
+func TestADependencyChangeOutsideAFunctionBodyReMapsThePackage(t *testing.T) {
+	testCases := map[string]string{
+		"a constant":  vmSource + "\nconst limit = 3\n",
+		"a signature": strings.Replace(vmSource, "Size(v []int) int", "Size(v []int) (n int)", 1),
+		"a method":    vmSource + "\ntype box int\n\nfunc (b box) String() string {\n\treturn \"box\"\n}\n",
+		"a function shadowing a predeclared identifier": vmSource + "\nfunc len(v []int) int {\n\treturn 0\n}\n",
+	}
+
+	for name, vm := range testCases {
+		t.Run(name, func(t *testing.T) {
+			h := newCacheHarness(t)
+			h.buildCalc("")
+
+			h.edit("vm/vm.go", vm)
+			h.buildCalc(changedCalc)
+
+			want := []string{"TestDouble", "TestTriple"}
+			if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+				t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// A dependency outside every main module — a replace target, say — is not
+// instrumented, so no profile says which of its functions a test executed, and
+// any change there still re-maps the package through Inputs.
+func TestAChangeToAnUninstrumentedDependencyReMapsThePackage(t *testing.T) {
+	h := newCacheHarness(t)
+	h.notMain = "example.com/vm"
+
+	h.buildCalc("")
+	h.edit("vm/vm.go", vmSizeChanged)
+	h.buildCalc(changedCalc)
+
+	want := []string{"TestDouble", "TestTriple"}
+	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+		t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
+	}
+}
+
+// What a test executed in a dependency is for narrowing alone. Merged into the
+// profile, a line of vm that only another package's tests execute would read as
+// covered — making mutants runnable that are NOT COVERED without the map, and
+// selecting tests for them that package scoping would never run.
+func TestDependencyCoverageIsNotCoverage(t *testing.T) {
+	h := newCacheHarness(t)
+
+	tm := h.build("TestTestMapHelperProcess", "")
+
+	// vm.go:7 is executed by root's TestRangeDescending, through vm, and by no
+	// test of vm itself.
+	clamped := token.Position{Filename: "vm/vm.go", Line: clampedLine, Column: 3}
+	if got := tm.TestsFor(clamped); len(got) != 0 {
+		t.Errorf("want no test for a line only another package executes, got %v", got)
+	}
+	if tm.Union().IsCovered(clamped) {
+		t.Error("want a line only another package executes left out of the union")
+	}
+
+	// vm.go:5 is executed by vm's own test, and by tests of root and calc
+	// through vm; only the first is an answer about vm.
+	own := token.Position{Filename: "vm/vm.go", Line: vmOwnLine, Column: 3}
+	want := []coverage.TestID{{Pkg: "example.com/vm", Name: "TestSizeAscending"}}
+	if diff := cmp.Diff(want, tm.TestsFor(own)); diff != "" {
+		t.Errorf("want only vm's own test (-want +got):\n%s", diff)
+	}
+
+	// The profiles on disk hold the package's own lines; a dependency is
+	// stored as the functions a test executed there, keys and not blocks.
+	data, err := os.ReadFile(h.cacheFile("example.com/calc"))
+	if err != nil {
+		t.Fatalf("cannot read the cache file: %v", err)
+	}
+	var entry struct {
+		Tests map[string]map[string]json.RawMessage `json:"tests"`
+		Deps  map[string][]string                   `json:"deps"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatalf("cannot decode the cache file: %v", err)
+	}
+	for name, profile := range entry.Tests {
+		for file := range profile {
+			if file != "calc/calc.go" {
+				t.Errorf("%s: want only calc's own files in the profile, got %s", name, file)
+			}
+		}
+	}
+	if diff := cmp.Diff(map[string][]string{"TestDouble": {"vm/vm.go:Clamp"}}, entry.Deps); diff != "" {
+		t.Errorf("want each test's dependency functions by key (-want +got):\n%s", diff)
+	}
+}
+
+// A dependency's lines are in no profile of this package, but its functions are
+// fingerprinted alongside it; what is not — the directories outside every main
+// module — still goes into Inputs. A change to a const there is one no function
+// of vm holds.
+func TestADependencyShellChangeReMapsAllOfIt(t *testing.T) {
+	h := newCacheHarness(t)
+
+	h.buildCalc("")
+	h.edit("vm/vm.go", vmSource+"\nconst limit = 3\n")
 	h.buildCalc(changedCalc)
 
 	want := []string{"TestDouble", "TestTriple"}
@@ -521,5 +647,39 @@ func (c counter) String() string {
 	// The method sits below both functions, so no test's profile reaches it.
 	if got := h.testsRun(); len(got) != 0 {
 		t.Errorf("want nothing re-mapped for a method no test executed, got %v", got)
+	}
+}
+
+// A block no package claims means some test's record of what it executed is
+// incomplete. The mappings are still right and still used, but the next change
+// cannot be narrowed from them, so it re-maps the package.
+func TestAnUnattributableBlockReMapsTheNextChangeWhole(t *testing.T) {
+	h := newCacheHarness(t)
+	h.extraProfile = "example.com/calc/../gen/parser.go:1.1,2.2 1 1\n"
+
+	first := h.buildCalc("")
+	if first.Len() != 2 {
+		t.Fatalf("want the package mapped all the same, got %d tests", first.Len())
+	}
+	// The block alone would stop its own mapping being shifted; the entry
+	// saying nothing is what stops any mapping being narrowed from it.
+	data, err := os.ReadFile(h.cacheFile("example.com/calc"))
+	if err != nil {
+		t.Fatalf("cannot read the cache file: %v", err)
+	}
+	var entry struct {
+		Fingerprint struct {
+			Shell string `json:"shell"`
+		} `json:"fingerprint"`
+	}
+	if err := json.Unmarshal(data, &entry); err != nil || entry.Fingerprint.Shell != "" {
+		t.Errorf("want the entry written without a fingerprint, got %q (%v)", entry.Fingerprint.Shell, err)
+	}
+	h.edit("calc/calc.go", calcSourceDoubleGrown)
+	h.buildCalc(changedCalc)
+
+	want := []string{"TestDouble", "TestTriple"}
+	if diff := cmp.Diff(want, h.testsRun()); diff != "" {
+		t.Errorf("want the whole package re-mapped (-want +got):\n%s", diff)
 	}
 }
