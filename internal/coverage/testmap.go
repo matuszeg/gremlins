@@ -405,7 +405,7 @@ func (c *Coverage) mapScope() string {
 const goListFormat = `{{.ImportPath}}	{{.Dir}}	{{len .TestGoFiles}}	{{len .XTestGoFiles}}`
 
 func (c *Coverage) listPackages() ([]testPackage, error) {
-	out, err := c.cmdContext("go", "list", "-f", goListFormat, c.mapScope()).CombinedOutput()
+	out, err := c.cmdContext("go", c.listArgs("-f", goListFormat, c.mapScope())...).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("impossible to list the packages of the module: %w\n%s", err, out)
 	}

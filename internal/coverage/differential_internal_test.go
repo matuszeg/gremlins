@@ -27,7 +27,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"github.com/spf13/viper"
 
+	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 )
@@ -424,6 +426,25 @@ func TestDifferentialTestFiles(t *testing.T) {
 				"calc/helper_test.go": "package calc\n\nfunc helper() int {\n\treturn 2\n}\n",
 			},
 			remapped: []string{"TestTriple"},
+		},
+	})
+}
+
+// Gremlins' own build tags decide what the test binary is built from, and so
+// what every listing and type-check behind reuse has to read.
+func TestDifferentialBuildTags(t *testing.T) {
+	viper.Set(configuration.UnleashTagsKey, "extra")
+	t.Cleanup(func() { viper.Set(configuration.UnleashTagsKey, "") })
+	vm := func(clamp string) string { return "package vm\n\nfunc Clamp(n int) int {\n\t" + clamp + "\n}\n" }
+	runDifferential(t, map[string]diffCase{
+		"a dependency linked only by a tagged file": {
+			before: map[string]string{
+				"vm/vm.go":      vm("return n"),
+				"calc/extra.go": "//go:build extra\n\npackage calc\n\nimport \"example.com/m/vm\"\n\nfunc via(n int) int {\n\treturn vm.Clamp(n)\n}\n",
+				"calc/calc.go":  diffCalc("", "if via(n) > 50 {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+			},
+			after:    map[string]string{"vm/vm.go": vm("if n > 1 {\n\t\treturn 100\n\t}\n\treturn n")},
+			remapped: []string{"TestDouble"},
 		},
 	})
 }

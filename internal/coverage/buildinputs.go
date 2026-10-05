@@ -260,7 +260,7 @@ func (c *Coverage) listingOf(pkg *testPackage) depListing {
 }
 
 func (c *Coverage) listDependencies(pkg *testPackage) depListing {
-	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", depListFormat, pkg.importPath).CombinedOutput()
+	out, err := c.cmdContext("go", c.listArgs("-deps", "-test", "-f", depListFormat, pkg.importPath)...).CombinedOutput()
 	if err != nil {
 		return depListing{}
 	}
@@ -323,6 +323,20 @@ func (c *Coverage) listDependencies(pkg *testPackage) depListing {
 	sort.Slice(deps, func(i, j int) bool { return deps[i].name < deps[j].name })
 
 	return depListing{deps: deps, linked: sortedKeys(linked), goMods: sortedKeys(goMods), ok: true}
+}
+
+// listArgs is a `go list` invocation under the build tags the test binaries
+// are compiled with. A listing without them answers about another build: a
+// dependency only a tagged file imports is missing from it, so it is neither
+// instrumented nor hashed into Inputs, and a change to it is seen by nothing.
+// Every listing behind the map goes through here for that reason.
+func (c *Coverage) listArgs(args ...string) []string {
+	out := []string{"list"}
+	if c.buildTags != "" {
+		out = append(out, "-tags", c.buildTags)
+	}
+
+	return append(out, args...)
 }
 
 func sortedKeys(set map[string]bool) []string {
