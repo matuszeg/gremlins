@@ -17,7 +17,9 @@
 package coverage
 
 import (
+	"fmt"
 	"go/token"
+	"sort"
 	"strings"
 )
 
@@ -30,7 +32,10 @@ type span struct {
 }
 
 // reusable decides which of a cached package's mappings survive the change that
-// moved its build ID, and returns them in the current line numbering.
+// moved its build ID, and returns them in the current line numbering — or,
+// when none can be kept, why not, which the caller logs: a whole-package
+// re-map is the expensive outcome, and the reason is what says whether it was
+// necessary.
 //
 // # The rule
 //
@@ -191,31 +196,45 @@ type span struct {
 // cache restored into another runner's work directory. The mappings are still
 // moved rather than kept as they are, because blank lines between
 // declarations move a function without changing its print.
-func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) {
+func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, string) {
 	was := cached.Fingerprint
 	// An entry written before the package was fingerprinted, or one whose
 	// fingerprint could not be taken, says nothing about what changed.
 	if was.Whole == "" {
-		return nil, false
+		return nil, "the cached entry has no fingerprint"
 	}
 	// Something the test binary is built from besides this package and its
 	// instrumented dependencies moved, and its lines are in no record here,
 	// so which mappings it reached cannot be worked out.
-	if was.Inputs == "" || was.Inputs != now.Inputs || len(was.Deps) != len(now.Deps) {
-		return nil, false
+	switch {
+	case was.Inputs == "":
+		return nil, "the cached entry records no build inputs"
+	case was.Inputs != now.Inputs:
+		return nil, "the build inputs changed (toolchain, environment, flags, go.mod, linked packages or a dependency outside the main modules)"
+	case len(was.Deps) != len(now.Deps):
+		return nil, "the set of instrumented dependencies changed"
 	}
 	cl := &closure{exported: map[string]bool{}}
-	own := cl.add(was.pkgPrint, now.pkgPrint)
+	own := cl.add("the package", was.pkgPrint, now.pkgPrint)
 	deps := map[string]*pkgDelta{}
 	for importPath, before := range was.Deps {
 		after, present := now.Deps[importPath]
 		if !present {
-			return nil, false
+			return nil, "the set of instrumented dependencies changed"
 		}
-		deps[importPath] = cl.add(before, after)
+		deps[importPath] = cl.add("dependency "+importPath, before, after)
 	}
-	if cl.whole || !cl.close() || cl.reordered && cl.observesInit() {
-		return nil, false
+	if cl.why != "" {
+		return nil, cl.why
+	}
+	if why := cl.close(); why != "" {
+		return nil, why
+	}
+	if cl.reordered != "" {
+		if observer := cl.observer(); observer != "" {
+			return nil, cl.reordered + " imports a different set of paths, and " + observer +
+				" observes the order packages are initialised in"
+		}
 	}
 
 	dirtyTests, tested := own.dirtyTests(cl)
@@ -233,14 +252,15 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 			touchesAny(cached.Deps[name], dirtyDeps) {
 			continue
 		}
-		shifted, ok := shift(profile, moved)
-		if !ok {
-			return nil, false
+		shifted, stray := shift(profile, moved)
+		if stray != "" {
+			return nil, "a block " + name + " executed, at " + stray +
+				", lies in no unchanged entity, so the profile and the print disagree"
 		}
 		kept[name] = shifted
 	}
 
-	return kept, true
+	return kept, ""
 }
 
 // closure is the set of affected names across every package a test binary
@@ -249,11 +269,13 @@ type closure struct {
 	pkgs []*pkgDelta
 	// exported is every affected name that another package can refer to.
 	exported map[string]bool
-	whole    bool
-	// reordered says some package's set of imported paths changed, which
-	// can move when packages are initialised relative to each other even
-	// though every one of them is linked before and after.
-	reordered bool
+	// why is the first thing found that re-maps the whole package, and
+	// empty while nothing has.
+	why string
+	// reordered names a file whose set of imported paths changed, which can
+	// move when packages are initialised relative to each other even though
+	// every one of them is linked before and after. Empty when none did.
+	reordered string
 }
 
 // pkgDelta is one package's two prints and what the change did to it.
@@ -271,17 +293,18 @@ type pkgDelta struct {
 }
 
 // add compares one package's prints, recording its changed names, and
-// returns what it found. A change that is not attributable sets whole.
-func (cl *closure) add(was, now pkgPrint) *pkgDelta {
+// returns what it found. A change that is not attributable sets why; label
+// says which package it is in.
+func (cl *closure) add(label string, was, now pkgPrint) *pkgDelta {
 	d := &pkgDelta{was: was, now: now, changed: map[string]bool{}, names: map[string]bool{}, reached: map[string]bool{}}
 	cl.pkgs = append(cl.pkgs, d)
-	if was.Whole != now.Whole || !was.Typed || !now.Typed || !sameInitOrder(was.InitOrder, now.InitOrder) {
-		cl.whole = true
+	if why := wholeReason(was, now); why != "" {
+		cl.remap(label + ": " + why)
 
 		return d
 	}
-	if !samePaths(was.Imports, now.Imports) {
-		cl.reordered = true
+	if file := changedPaths(was.Imports, now.Imports); file != "" && cl.reordered == "" {
+		cl.reordered = file
 	}
 	rebound := reboundNames(was.Imports, now.Imports)
 	keys := map[string]bool{}
@@ -306,8 +329,8 @@ func (cl *closure) add(was, now pkgPrint) *pkgDelta {
 		if !textChanged && !reboundText {
 			continue
 		}
-		if (had && wholeOnChange(before)) || (has && wholeOnChange(after)) {
-			cl.whole = true
+		if why := wholeOnChange(before, had, after, has); why != "" {
+			cl.remap(key + " changed, and " + why)
 
 			return d
 		}
@@ -324,18 +347,46 @@ func (cl *closure) add(was, now pkgPrint) *pkgDelta {
 	return d
 }
 
-// close follows headers from the changed names to a fixpoint, reporting false
+// remap records the first reason found to re-map the whole package.
+func (cl *closure) remap(why string) {
+	if cl.why == "" {
+		cl.why = why
+	}
+}
+
+// wholeReason is why two prints of one package cannot be compared entity by
+// entity at all, or empty when they can.
+func wholeReason(was, now pkgPrint) string {
+	switch {
+	case was.Whole != now.Whole:
+		return "something outside every declaration changed (a non-Go file, data below the directory, " +
+			"a build constraint, a blank or dot import, a cgo file, a top-level directive, or a file that does not parse)"
+	case !was.Typed || !now.Typed:
+		return "the type-checker could not read it"
+	}
+	if a, b, swapped := initOrderSwap(was.InitOrder, now.InitOrder); swapped {
+		return a + " and " + b + " trade places in the order the package initialises them"
+	}
+
+	return ""
+}
+
+// close follows headers from the changed names to a fixpoint, reporting why
 // when an entity that runs for every test turns out to mention one.
-func (cl *closure) close() bool {
+func (cl *closure) close() string {
 	for grew := true; grew; {
 		grew = false
 		for _, d := range cl.pkgs {
 			for key, e := range d.now.Decls {
-				if d.reached[key] || !cl.reaches(d, e.header) {
+				if d.reached[key] {
+					continue
+				}
+				name := cl.mentioned(d, e.header)
+				if name == "" {
 					continue
 				}
 				if e.Kind == kindInit || e.Kind == kindRun {
-					return false
+					return key + " runs for every test and mentions " + name + ", which changed"
 				}
 				cl.affect(d, key, e.Names)
 				grew = true
@@ -343,35 +394,36 @@ func (cl *closure) close() bool {
 		}
 	}
 
-	return true
+	return ""
 }
 
-// observesInit reports whether anything in the binary's instrumented packages
-// can see the order packages are initialised in: an init, a var initialised by
-// a call or by reading another package, or TestMain. Without any, an order
-// that moved changes nothing a test executes.
-func (cl *closure) observesInit() bool {
+// observer names something in the binary's instrumented packages that can see
+// the order packages are initialised in — an init, a var initialised by a call
+// or by reading another package, or TestMain — or is empty when there is
+// none. Without one, an order that moved changes nothing a test executes.
+func (cl *closure) observer() string {
 	for _, d := range cl.pkgs {
 		for _, decls := range []map[string]declPrint{d.was.Decls, d.now.Decls} {
-			for _, e := range decls {
+			for key, e := range decls {
 				if e.Kind == kindInit || e.Kind == kindRun || e.Observes {
-					return true
+					return key
 				}
 			}
 		}
 	}
 
-	return false
+	return ""
 }
 
-// samePaths reports whether two prints' files import the same packages, file
-// by file, whatever names they bind them to. A package is initialised after
-// everything it imports, so those sets are its place in the order. They are
-// compared per file rather than per package because a directory's prints
-// hold two packages, the package and its external tests, and a path one
-// gains can be one the other already imports; a path moved from one file of
-// a package to another only costs a re-map.
-func samePaths(was, now map[string]map[string]string) bool {
+// changedPaths names a file whose set of imported packages differs between
+// two prints, whatever names it binds them to, or is empty when every file
+// imports what it did. A package is initialised after everything it imports,
+// so those sets are its place in the order. They are compared per file rather
+// than per package because a directory's prints hold two packages, the
+// package and its external tests, and a path one gains can be one the other
+// already imports; a path moved from one file of a package to another only
+// costs a re-map.
+func changedPaths(was, now map[string]map[string]string) string {
 	paths := func(table map[string]string) map[string]bool {
 		out := map[string]bool{}
 		for _, path := range table {
@@ -387,19 +439,24 @@ func samePaths(was, now map[string]map[string]string) bool {
 	for f := range now {
 		files[f] = true
 	}
+	sorted := make([]string, 0, len(files))
 	for f := range files {
+		sorted = append(sorted, f)
+	}
+	sort.Strings(sorted)
+	for _, f := range sorted {
 		before, after := paths(was[f]), paths(now[f])
 		if len(before) != len(after) {
-			return false
+			return f
 		}
 		for path := range before {
 			if !after[path] {
-				return false
+				return f
 			}
 		}
 	}
 
-	return true
+	return ""
 }
 
 // affect records a key's names as affected.
@@ -418,13 +475,20 @@ func (cl *closure) affect(d *pkgDelta, key string, names ...[]string) {
 // reaches reports whether identifiers of package d mention an affected name:
 // one of d's own, or any package's exported one.
 func (cl *closure) reaches(d *pkgDelta, idents map[string]bool) bool {
+	return cl.mentioned(d, idents) != ""
+}
+
+// mentioned is the first, in sorted order, of the affected names a set of
+// identifiers of package d mentions, or empty when they mention none.
+func (cl *closure) mentioned(d *pkgDelta, idents map[string]bool) string {
+	first := ""
 	for id := range idents {
-		if d.names[id] || cl.exported[id] {
-			return true
+		if (d.names[id] || cl.exported[id]) && (first == "" || id < first) {
+			first = id
 		}
 	}
 
-	return false
+	return first
 }
 
 // dirtyTests is the tests whose own declaration changed or mentions an
@@ -484,11 +548,31 @@ func (d *pkgDelta) dirtyKeys(cl *closure, importPath string, into map[string]boo
 	}
 }
 
-// wholeOnChange reports whether a change to an entity re-maps the whole
-// package: it runs for every test, it has no name to pair it by, or it binds
-// a symbol of another package by //go:linkname.
-func wholeOnChange(d declPrint) bool {
-	return d.Kind == kindInit || d.Kind == kindRun || d.Kind == kindBlank || d.Linked
+// wholeOnChange says why a change to an entity, as it was (had) and is now
+// (has), re-maps the whole package — it runs for every test, it has no name to
+// pair it by, or it binds a symbol of another package by //go:linkname — or is
+// empty when it does not.
+func wholeOnChange(before declPrint, had bool, after declPrint, has bool) string {
+	for _, side := range []struct {
+		d       declPrint
+		present bool
+	}{{before, had}, {after, has}} {
+		if !side.present {
+			continue
+		}
+		switch {
+		case side.d.Kind == kindInit:
+			return "it is an init, which runs for every test"
+		case side.d.Kind == kindRun:
+			return "it runs for every test (TestMain, or a var initialised by a call)"
+		case side.d.Kind == kindBlank:
+			return "it has no name to pair it by"
+		case side.d.Linked:
+			return "it carries //go:linkname"
+		}
+	}
+
+	return ""
 }
 
 func isTestFile(file string) bool {
@@ -579,14 +663,15 @@ func touches(profile Profile, dirty map[string][]span) bool {
 //
 // A block that lands in no unchanged declaration is not guessed at: it means
 // the profile and the fingerprint disagree about the package, and the answer is
-// to re-map it.
-func shift(profile Profile, moved map[string][]span) (Profile, bool) {
+// to re-map it. Where that block was is returned, and is empty when there is
+// none.
+func shift(profile Profile, moved map[string][]span) (Profile, string) {
 	shifted := make(Profile, len(profile))
 	for file, blocks := range profile {
 		for _, block := range blocks {
 			delta, ok := deltaFor(moved[file], block)
 			if !ok {
-				return nil, false
+				return nil, fmt.Sprintf("%s:%d", file, block.StartLine)
 			}
 			block.StartLine += delta
 			block.EndLine += delta
@@ -594,7 +679,7 @@ func shift(profile Profile, moved map[string][]span) (Profile, bool) {
 		}
 	}
 
-	return shifted, true
+	return shifted, ""
 }
 
 func deltaFor(spans []span, block Block) (int, bool) {

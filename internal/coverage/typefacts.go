@@ -252,6 +252,15 @@ func blankNames(p *packages.Package) map[*types.Var]string {
 // a name that changed. What is left is two variables that were both there
 // trading places, which is what this catches.
 func sameInitOrder(was, now []string) bool {
+	_, _, swapped := initOrderSwap(was, now)
+
+	return !swapped
+}
+
+// initOrderSwap is sameInitOrder's answer with its evidence: when the two
+// orders disagree, the variables at the first place they do, as the first
+// order has it and as the second does.
+func initOrderSwap(was, now []string) (string, string, bool) {
 	in := func(list []string) map[string]bool {
 		out := make(map[string]bool, len(list))
 		for _, name := range list {
@@ -271,14 +280,19 @@ func sameInitOrder(was, now []string) bool {
 		return out
 	}
 	a, b := common(was, in(now)), common(now, in(was))
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
+	for i := 0; i < len(a) && i < len(b); i++ {
 		if a[i] != b[i] {
-			return false
+			return a[i], b[i], true
 		}
 	}
+	// One lists a shared name more often than the other, which is no order
+	// two variables can be compared by.
+	if len(a) > len(b) {
+		return a[len(b)], a[len(b)], true
+	}
+	if len(b) > len(a) {
+		return b[len(a)], b[len(a)], true
+	}
 
-	return true
+	return "", "", false
 }

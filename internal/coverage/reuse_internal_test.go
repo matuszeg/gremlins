@@ -311,9 +311,9 @@ func TestReusableKeepsWhatTheChangeCannotReach(t *testing.T) {
 
 			now, cached := pkg()
 			tc.change(&now, &cached)
-			kept, ok := reusable(cached, now)
-			if !ok {
-				t.Fatal("want a narrowed re-map, got a whole-package one")
+			kept, why := reusable(cached, now)
+			if why != "" {
+				t.Fatalf("want a narrowed re-map, got a whole-package one: %s", why)
 			}
 			got := keptNames(kept)
 			if got == nil {
@@ -478,7 +478,7 @@ func TestReusableRefusesWhatItCannotAttribute(t *testing.T) {
 
 			now, cached := pkg()
 			change(&now, &cached)
-			if kept, ok := reusable(cached, now); ok {
+			if kept, why := reusable(cached, now); why == "" {
 				t.Errorf("want the whole package re-mapped, got %v kept", keptNames(kept))
 			}
 		})
@@ -503,9 +503,9 @@ func TestReusableMovesKeptMappingsWithTheirEntities(t *testing.T) {
 	now.Decls["a_test.go:TestHook"] = testFn("TestHook", "TestHook", "th")
 	cached.Fingerprint.Decls["a_test.go:TestHook"] = testFn("TestHook", "TestHook", "th")
 
-	kept, ok := reusable(cached, now)
-	if !ok {
-		t.Fatal("want a narrowed re-map, got a whole-package one")
+	kept, why := reusable(cached, now)
+	if why != "" {
+		t.Fatalf("want a narrowed re-map, got a whole-package one: %s", why)
 	}
 	want := map[string]Profile{
 		"TestG":    {"a.go": {{StartLine: 12, StartCol: 1, EndLine: 12, EndCol: 2}}},
