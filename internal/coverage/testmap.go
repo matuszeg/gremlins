@@ -402,17 +402,27 @@ func parsePackageList(out string) []testPackage {
 // binary.
 func (c *Coverage) compileTests(importPath string) (string, error) {
 	binary := filepath.Join(c.workDir, strings.NewReplacer("/", "_", ".", "_").Replace(importPath)+".test")
-	args := []string{"test", "-c", "-o", binary}
-	if c.buildTags != "" {
-		args = append(args, "-tags", c.buildTags)
-	}
-	args = append(args, "-coverpkg", c.testMapCoverPkg(importPath), importPath)
+	args := append([]string{"test", "-c", "-o", binary}, c.testBuildFlags(importPath)...)
+	args = append(args, importPath)
 
 	if out, err := c.cmdContext("go", args...).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("%w\n%s", err, out)
 	}
 
 	return binary, nil
+}
+
+// testBuildFlags are the flags a package's test binary is compiled with for
+// mapping, besides where to write it. They decide what the binary is, so they
+// are folded into the package's Inputs too, and both read them from here so
+// that the two cannot drift apart.
+func (c *Coverage) testBuildFlags(importPath string) []string {
+	var flags []string
+	if c.buildTags != "" {
+		flags = append(flags, "-tags", c.buildTags)
+	}
+
+	return append(flags, "-coverpkg", c.testMapCoverPkg(importPath))
 }
 
 // listTests asks the compiled binary which tests it holds, which is the same

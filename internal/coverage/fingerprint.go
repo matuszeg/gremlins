@@ -73,7 +73,8 @@ type fingerprint struct {
 	// Inputs is everything the test binary is built from except this package:
 	// see buildInputsOf, which fills it in. Without it a moved build ID could
 	// never be told apart from a moved dependency, and narrowing would keep
-	// stale mappings.
+	// stale mappings. With it, a moved build ID under an unchanged fingerprint
+	// and unchanged Inputs is a moved checkout, and the whole map is kept.
 	//
 	// It is not read off the filesystem like the rest, so fingerprintOf leaves
 	// it empty and the caller sets it — which is also what makes a fingerprint

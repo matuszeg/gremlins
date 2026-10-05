@@ -16,6 +16,11 @@
 
 package coverage
 
+import (
+	"go/types"
+	"strings"
+)
+
 // span is a range of lines a declaration occupied when the map was made, and
 // how far it has moved since.
 type span struct {
@@ -37,23 +42,35 @@ type span struct {
 // from each test root — is a much larger build, and it is defeated by
 // reflection exactly where a package is most likely to use it.
 //
-// Two things this cannot see, both of which return false and re-map the whole
+// Things this cannot see, all of which return false and re-map the whole
 // package:
 //
 //   - A change outside the package. Without --cross-package a test binary is
 //     built with -coverpkg for its own package alone, so no profile covers a
-//     dependency and a change there looks clean to every test. The build ID
-//     catches it, and a package whose own fingerprint is unchanged after its
-//     build ID moved was changed from outside.
+//     dependency and a change there looks clean to every test. Inputs records
+//     every dependency's source, the toolchain and the build environment, and
+//     any change to it is a re-map.
 //   - A change outside a declaration. `const timeout = 5` becoming `10` changes
 //     a line no coverage block contains, while the tests that execute the use
 //     site do change behaviour. Everything that is not an attributable
 //     declaration is in the shell, and the shell is all-or-nothing.
+//   - A declaration whose effect is not confined to its lines: a method added
+//     or removed, an init, or a new function named like a predeclared
+//     identifier (see shadowsPredeclared).
 //
-// Both fail in the safe direction: too many tests re-mapped, never too few. A
-// mapping wrongly kept would mean a test that could kill a mutant is not run,
-// so the mutant reports LIVED — a red result nobody can reproduce, which is why
-// every case that is not clearly sound resolves to re-mapping the package.
+// All of them fail in the safe direction: too many tests re-mapped, never too
+// few. A mapping wrongly kept would mean a test that could kill a mutant is not
+// run, so the mutant reports LIVED — a red result nobody can reproduce, which
+// is why every case that is not clearly sound resolves to re-mapping the
+// package.
+//
+// When nothing at all changed — the fingerprint and Inputs both agree — every
+// mapping is kept. The build ID still moved, because Go folds the checkout path
+// into it, and the path decides nothing a test executes; that is the case of a
+// cache restored into another runner's work directory. The mappings are still
+// moved rather than kept as they are, because the shell drops the whitespace
+// between declarations, and blank lines added there move a function without
+// changing anything the fingerprint compares.
 func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) {
 	was := cached.Fingerprint
 	// An entry written before the package was fingerprinted, or one whose
@@ -61,9 +78,9 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	if was.Shell == "" || was.Shell != now.Shell {
 		return nil, false
 	}
-	// The build ID moved for a reason outside this package as well as, or
-	// instead of, one inside it — and a dependency's lines are in no profile
-	// here, so which mappings it reached cannot be worked out.
+	// Something the test binary is built from besides this package moved, and
+	// a dependency's lines are in no profile here, so which mappings it reached
+	// cannot be worked out.
 	if was.Inputs == "" || was.Inputs != now.Inputs {
 		return nil, false
 	}
@@ -71,10 +88,6 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	dirtyLines := map[string][]span{}
 	dirtyTests := map[string]bool{}
 	moved := map[string][]span{}
-	// Whether anything in the package itself changed. If nothing did and the
-	// build ID still moved, the change was in a dependency — which no profile
-	// of this package covers, so nothing here can say which tests it reached.
-	changed := false
 
 	for key, before := range was.Decls {
 		after, present := now.Decls[key]
@@ -85,7 +98,6 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 			if before.Kind != "" {
 				return nil, false
 			}
-			changed = true
 			markDirty(before, dirtyLines, dirtyTests)
 		case after.Hash != before.Hash:
 			// An init runs before every test in the binary, so its change is
@@ -93,7 +105,6 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 			if before.Kind == kindInit || after.Kind == kindInit {
 				return nil, false
 			}
-			changed = true
 			markDirty(before, dirtyLines, dirtyTests)
 		case before.Test == "":
 			moved[before.File] = append(moved[before.File],
@@ -116,19 +127,16 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	}
 
 	// An added free function cannot change an existing path: reaching it takes
-	// a call, and the call site is a change of its own. An added method or init
-	// can, without any line changing where it is read.
+	// a call, and the call site is a change of its own — unless the call site is
+	// already there, calling the predeclared function the new one shadows. An
+	// added method or init can, without any line changing where it is read.
 	for key, after := range now.Decls {
 		if _, had := was.Decls[key]; had {
 			continue
 		}
-		if after.Kind != "" {
+		if after.Kind != "" || shadowsPredeclared(key) {
 			return nil, false
 		}
-		changed = true
-	}
-	if !changed {
-		return nil, false
 	}
 
 	kept := make(map[string]Profile, len(cached.Tests))
@@ -144,6 +152,25 @@ func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, bool) 
 	}
 
 	return kept, true
+}
+
+// shadowsPredeclared reports whether a declaration's key names a function that
+// takes the name of a predeclared identifier — min, len, error, nil, and the
+// rest of the universe scope.
+//
+// Such a function rebinds every existing use of the name in the package
+// without a byte of the use changing: `min(x, 10)` calls the new function from
+// the moment it exists, and the tests that executed that line take a different
+// path although nothing they executed changed. Any other new name cannot do
+// this: it either collides with something the package or a file already
+// declares, which does not compile, or is reached only through new code.
+//
+// Only free functions are attributed declarations, so only they need asking
+// about here: a var, const or type of that name is in the shell, which moves.
+func shadowsPredeclared(key string) bool {
+	name := key[strings.LastIndex(key, ":")+1:]
+
+	return types.Universe.Lookup(name) != nil
 }
 
 // markDirty records what a changed declaration invalidates: its lines, or — for

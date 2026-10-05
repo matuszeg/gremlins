@@ -17,6 +17,7 @@
 package coverage
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +26,8 @@ import (
 
 // buildInputsOf hashes everything the package's test binary is built from
 // except the package itself: the source of every dependency somebody could
-// edit, plus the module's requirements and the toolchain.
+// edit, the module's requirements, the toolchain, the build environment, and
+// the flags Gremlins compiles the binary with.
 //
 // Per-test invalidation needs this, and the build ID cannot supply it. The
 // build ID folds the package's own source together with every dependency's, so
@@ -42,6 +44,20 @@ import (
 // So a run narrows only while this is unchanged, and re-maps the whole package
 // the moment it is not.
 //
+// It has to be complete as well as cheap, because it is also what lets an
+// unchanged package skip the build ID: with the fingerprint and this both equal,
+// a moved build ID is taken to mean nothing but a moved checkout (see
+// reusable). Anything that changes the compiled binary and is in neither would
+// then be reused across, which is why the build environment and the compile
+// flags are here although no source file holds them.
+//
+// It also has to name nothing that differs between two checkouts of the same
+// module, or no cache restored on another machine could ever be used. A
+// dependency is named by its path relative to the module root, or by its import
+// path when it lives outside the root — a replace target or a go.work member,
+// which can sit anywhere on disk. GOWORK, which is a path, is folded in the same
+// way: relative to the module root.
+//
 // Directories are read rather than build IDs asked for: a dependency's identity
 // according to Go means building it, and this has to be cheap enough to run
 // before deciding whether there is work to skip. Measured at ~330ms for a
@@ -49,40 +65,104 @@ import (
 //
 // What is left out is left out because something else in the hash pins it.
 // GOROOT is pinned by the toolchain version. The module cache is pinned by
-// go.sum, whose contents are here — and a dependency vendored or replaced into
-// a local directory is not in the module cache, so it is read like any other
-// source.
+// go.sum and go.work.sum, whose contents are here — and a dependency vendored or
+// replaced into a local directory is not in the module cache, so it is read like
+// any other source.
 func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 	env, ok := c.goEnv()
 	if !ok {
 		return "", false
 	}
-	dirs, ok := c.dependencyDirs(pkg)
+	deps, ok := c.dependencyDirs(pkg)
 	if !ok {
 		return "", false
 	}
+	root := c.absRoot()
 
 	parts := []string{env.version}
-	for _, name := range []string{"go.mod", "go.sum"} {
-		// Absent is a fact about the module, not a failure: a module with no
-		// go.sum has nothing pinned, and saying so consistently is enough.
-		data, err := os.ReadFile(filepath.Join(c.mod.Root, name)) //nolint:gosec // G304: the module root Gremlins was pointed at
-		if err != nil {
-			parts = append(parts, name+"\x00absent")
-
-			continue
-		}
-		parts = append(parts, name+"\x00"+hashOf(data))
+	parts = append(parts, env.build...)
+	parts = append(parts, "flags\x00"+strings.Join(c.testBuildFlags(pkg.importPath), "\x00"))
+	parts = append(parts, "work\x00"+relativeTo(root, env.work))
+	for _, f := range []struct{ name, path string }{
+		{"go.mod", filepath.Join(root, "go.mod")},
+		{"go.sum", filepath.Join(root, "go.sum")},
+		{"go.work", workFile(env.work, "go.work")},
+		{"go.work.sum", workFile(env.work, "go.work.sum")},
+	} {
+		parts = append(parts, f.name+"\x00"+hashFileOrAbsent(f.path))
 	}
-	for _, dir := range dirs {
-		sum, dirOK := c.hashDir(dir)
+	for _, dep := range deps {
+		sum, dirOK := c.hashDir(dep.dir)
 		if !dirOK {
 			return "", false
 		}
-		parts = append(parts, dir+"\x00"+sum)
+		parts = append(parts, dep.name+"\x00"+sum)
 	}
 
 	return hashOf([]byte(strings.Join(parts, "\x00"))), true
+}
+
+// hashFileOrAbsent hashes one file's content. Absent is a fact about the
+// module, not a failure: a module with no go.sum has nothing pinned, one built
+// without a workspace has no go.work, and saying so consistently is enough. An
+// empty path is a file there is no reason to look for.
+func hashFileOrAbsent(path string) string {
+	if path == "" {
+		return "absent"
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the module root, or the workspace go itself reports
+	if err != nil {
+		return "absent"
+	}
+
+	return hashOf(data)
+}
+
+// workFile is a file of the workspace GOWORK names: go.work is GOWORK itself,
+// and go.work.sum sits beside it. Without a workspace — GOWORK empty, or "off"
+// — there is no such file.
+func workFile(gowork, name string) string {
+	if gowork == "" || gowork == "off" {
+		return ""
+	}
+	if name == "go.work" {
+		return gowork
+	}
+
+	return filepath.Join(filepath.Dir(gowork), name)
+}
+
+// absRoot is the module root as an absolute path, which is what a dependency's
+// directory is compared against.
+func (c *Coverage) absRoot() string {
+	root, err := filepath.Abs(c.mod.Root)
+	if err != nil {
+		return c.mod.Root
+	}
+
+	return root
+}
+
+// relativeTo names a path the same way in every checkout that lays the module
+// out the same way. A path it cannot relate is returned as it is, which can
+// only ever cost a hit.
+func relativeTo(root, path string) string {
+	if !filepath.IsAbs(path) {
+		return path
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return path
+	}
+
+	return filepath.ToSlash(rel)
+}
+
+// dependency is one package directory a test binary is built from, and the
+// name it goes into Inputs under.
+type dependency struct {
+	name string
+	dir  string
 }
 
 // dependencyDirs is where the source of everything this package's tests link
@@ -92,8 +172,16 @@ func (c *Coverage) buildInputsOf(pkg *testPackage) (string, bool) {
 // The listing is of the test binary's dependencies, not the package's: a test
 // file's imports are linked too, and a change in one of them moves the build ID
 // exactly as any other dependency does.
-func (c *Coverage) dependencyDirs(pkg *testPackage) ([]string, bool) {
-	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", "{{.Dir}}", pkg.importPath).CombinedOutput()
+//
+// Each is named so that the name is the same in every checkout: by its path
+// inside the module, or by its import path when it is outside the module root.
+// Go lists a package recompiled for a test binary under its import path with
+// the binary's name in brackets; that suffix is dropped, since the directory is
+// the same one. The result is ordered by name rather than by directory, for the
+// same reason: two checkouts can order the same directories differently once
+// some of them are outside the root.
+func (c *Coverage) dependencyDirs(pkg *testPackage) ([]dependency, bool) {
+	out, err := c.cmdContext("go", "list", "-deps", "-test", "-f", "{{.ImportPath}}\t{{.Dir}}", pkg.importPath).CombinedOutput()
 	if err != nil {
 		return nil, false
 	}
@@ -106,11 +194,13 @@ func (c *Coverage) dependencyDirs(pkg *testPackage) ([]string, bool) {
 	if err != nil {
 		own = pkg.dir
 	}
+	root := c.absRoot()
 
 	seen := map[string]struct{}{}
-	var dirs []string
+	var deps []dependency
 	for _, line := range strings.Split(string(out), "\n") {
-		dir := strings.TrimSpace(line)
+		importPath, dir, _ := strings.Cut(line, "\t")
+		dir = strings.TrimSpace(dir)
 		// `go list` writes build diagnostics to the same stream, and a
 		// synthesised test package can report no directory at all.
 		if dir == "" || !filepath.IsAbs(dir) {
@@ -123,19 +213,31 @@ func (c *Coverage) dependencyDirs(pkg *testPackage) ([]string, bool) {
 			continue
 		}
 		seen[dir] = struct{}{}
-		dirs = append(dirs, dir)
+		name := "import\x00" + strings.TrimSpace(strings.SplitN(importPath, " [", 2)[0])
+		if under(dir, root) {
+			name = "dir\x00" + relativeTo(root, dir)
+		}
+		deps = append(deps, dependency{name: name, dir: dir})
 	}
-	sort.Strings(dirs)
+	sort.Slice(deps, func(i, j int) bool { return deps[i].name < deps[j].name })
 
-	return dirs, true
+	return deps, true
 }
 
-// hashDir hashes every regular file of a directory, by name and content.
+// hashDir hashes every regular file of a dependency's directory, by name and
+// content, and the data below it.
 //
 // It is the whole directory rather than the Go files a build would select,
 // because a build tag decides which of them that is and the tags can change
 // between runs. Reading one extra file is cheaper than being wrong about which
 // ones matter.
+//
+// The data below it — testdata, and the trees an //go:embed pattern reaches
+// into — is read by the same rule the package's own fingerprint uses (see
+// hashDataSubtrees), because an embedded file is compiled into the dependency
+// without a line of it changing. Leaving it out was once only a missed
+// re-map behind a moved build ID; now that an unchanged fingerprint and Inputs
+// reuse the whole map, it would be a kept mapping the change invalidated.
 //
 // Results are kept for the run: a module's packages share dependencies, and
 // hashing one twice would be the cost of mapping a second package that happens
@@ -145,6 +247,11 @@ func (c *Coverage) hashDir(dir string) (string, bool) {
 		return sum, sum != ""
 	}
 	sum, ok := hashDirectory(dir)
+	if ok {
+		var below string
+		below, ok = hashDataSubtrees(dir)
+		sum = hashOf([]byte(sum + "\x00subtrees\x00" + below))
+	}
 	if c.dirHashes == nil {
 		c.dirHashes = map[string]string{}
 	}
@@ -186,26 +293,63 @@ func hashDirectory(dir string) (string, bool) {
 // goEnvironment is the part of the Go environment that decides what a build
 // produces without appearing in any source file.
 type goEnvironment struct {
+	// build is every variable in buildEnvVars with its value, in that order.
+	build    []string
 	root     string
 	modCache string
 	version  string
+	work     string
+}
+
+// buildEnvVars are the variables that change what a test binary is compiled to
+// while every source file stays the same: the target platform and its
+// micro-architecture levels, cgo and the C toolchain and flags it compiles
+// with (a -D in CGO_CFLAGS changes what the C code does), toolchain
+// experiments, the FIPS 140 module selection, and flags applied to every go
+// command.
+//
+// GOWORK changes it too, but it is a path, so it is asked for separately and
+// folded in relative to the module root (see buildInputsOf); its value as
+// written would differ between any two checkouts that use a workspace.
+//
+// Each one has to be here because reusing a map across a change in it is
+// wrong, not merely stale. A map made for amd64 says nothing about a file only
+// an arm64 build compiles; one made without a tag GOFLAGS adds says nothing
+// about the files the tag selects. And because the build ID moves with each of
+// them, leaving one out is not a missed hit but a narrowed run that keeps
+// mappings the change invalidated.
+//
+// A variable an older toolchain does not know reads as empty, consistently, so
+// the list can be ahead of the go in use.
+var buildEnvVars = []string{
+	"GOOS", "GOARCH",
+	"GOAMD64", "GOARM", "GOARM64", "GO386", "GOMIPS", "GOMIPS64", "GOPPC64", "GORISCV64", "GOWASM",
+	"CGO_ENABLED", "CC", "CXX", "CGO_CFLAGS", "CGO_CPPFLAGS", "CGO_CXXFLAGS", "CGO_FFLAGS", "CGO_LDFLAGS",
+	"GOEXPERIMENT", "GOFIPS140", "GOFLAGS",
 }
 
 // goEnv asks the toolchain about itself, once per run.
+//
+// It asks for JSON and reads only standard output: a variable can be empty,
+// which a line-per-value answer cannot tell apart from a missing line, and go
+// writes warnings to standard error that are not part of the answer.
 func (c *Coverage) goEnv() (goEnvironment, bool) {
 	if c.env != nil {
 		return *c.env, c.env.version != ""
 	}
 	env := goEnvironment{}
-	out, err := c.cmdContext("go", "env", "GOROOT", "GOMODCACHE", "GOVERSION").CombinedOutput()
-	if err == nil {
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		if len(lines) == 3 {
-			env = goEnvironment{
-				root:     strings.TrimSpace(lines[0]),
-				modCache: strings.TrimSpace(lines[1]),
-				version:  strings.TrimSpace(lines[2]),
-			}
+	args := append([]string{"env", "-json", "GOROOT", "GOMODCACHE", "GOVERSION", "GOWORK"}, buildEnvVars...)
+	out, err := c.cmdContext("go", args...).Output()
+	var values map[string]string
+	if err == nil && json.Unmarshal(out, &values) == nil {
+		env = goEnvironment{
+			root:     values["GOROOT"],
+			modCache: values["GOMODCACHE"],
+			version:  values["GOVERSION"],
+			work:     values["GOWORK"],
+		}
+		for _, name := range buildEnvVars {
+			env.build = append(env.build, name+"="+values[name])
 		}
 	}
 	c.env = &env

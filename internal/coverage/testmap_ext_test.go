@@ -18,6 +18,7 @@ package coverage_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"os"
@@ -63,6 +64,11 @@ const invocationLogEnv = "GREMLINS_TEST_INVOCATION_LOG"
 // how a test stands a scoped run — the recommended workflow, and the one that
 // used to evict the rest of the module's map.
 const listOnlyEnv = "GREMLINS_TEST_LIST_ONLY"
+
+// goEnvEnv overrides what the helper reports for `go env`, as "NAME=value"
+// pairs separated by newlines, which is how a test changes the build
+// environment without changing a byte of source.
+const goEnvEnv = "GREMLINS_TEST_GO_ENV"
 
 // The fixture has real sources as well as real directories, because the map
 // cache reads them: what a package's source looked like when its map was made
@@ -324,10 +330,10 @@ const (
 )
 
 func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) *exec.Cmd {
-	return fakeGoCommandWith(helper, pkgRoot, "", "", "")
+	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -348,6 +354,7 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly string) func
 			buildIDsEnv + "=" + buildIDs,
 			invocationLogEnv + "=" + logPath,
 			listOnlyEnv + "=" + listOnly,
+			goEnvEnv + "=" + goEnv,
 		}
 
 		return cmd
@@ -410,9 +417,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 
 	if cmd == "go" && hasFlag(os.Args, "env") {
-		// A toolchain root and a module cache the fixture is not inside, so
-		// nothing the fixture holds is filtered out as already pinned.
-		fmt.Fprint(os.Stdout, "/nonexistent/goroot\n/nonexistent/modcache\ngo-fixture\n")
+		envAsGo(os.Args)
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
@@ -482,15 +487,62 @@ func listPackagesAsGo(root, only string) {
 	}
 }
 
-// listDepsAsGo writes the directories `go list -deps -test` would, which is
-// what says whether a package was changed from underneath. Everything depends
-// on vm, so an edit there is the case where a package's own fingerprint looks
-// narrowable and its mappings are stale anyway.
-func listDepsAsGo(root, pkg string) {
-	fmt.Fprintln(os.Stdout, filepath.Join(root, dirOf(pkg)))
-	if pkg != "example.com/vm" {
-		fmt.Fprintln(os.Stdout, filepath.Join(root, "vm"))
+// envAsGo answers `go env -json NAME...` for the names asked, the way go does:
+// one JSON object, with an empty value for a name that is unset.
+//
+// The toolchain root and the module cache are ones the fixture is not inside,
+// so nothing the fixture holds is filtered out as already pinned. Everything
+// else is a plausible default that a test can override through goEnvEnv.
+func envAsGo(args []string) {
+	values := map[string]string{
+		"GOROOT":      "/nonexistent/goroot",
+		"GOMODCACHE":  "/nonexistent/modcache",
+		"GOVERSION":   "go-fixture",
+		"GOOS":        "linux",
+		"GOARCH":      "amd64",
+		"GOAMD64":     "v1",
+		"CGO_ENABLED": "1",
 	}
+	for _, pair := range strings.Split(os.Getenv(goEnvEnv), "\n") {
+		if name, value, ok := strings.Cut(pair, "="); ok {
+			values[name] = value
+		}
+	}
+	asked := map[string]string{}
+	afterJSON := false
+	for _, a := range args {
+		switch {
+		case a == "-json":
+			afterJSON = true
+		case afterJSON:
+			asked[a] = values[a]
+		}
+	}
+	out, err := json.Marshal(asked)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1) // skipcq: RVV-A0003
+	}
+	// A coverage-instrumented helper also writes a GOCOVERDIR warning, to
+	// stderr; a real go can write warnings there too. Neither is the answer.
+	fmt.Fprintln(os.Stderr, "go: warning: something unrelated")
+	fmt.Fprintln(os.Stdout, string(out))
+}
+
+// listDepsAsGo writes the packages `go list -deps -test` would, by import path
+// and directory, which is what says whether a package was changed from
+// underneath. Everything depends on vm, so an edit there is the case where a
+// package's own fingerprint looks narrowable and its mappings are stale anyway.
+//
+// The package itself is listed twice, as go does: once as it is and once as
+// recompiled for its own test binary, under the bracketed name go gives that.
+func listDepsAsGo(root, pkg string) {
+	if pkg != "example.com/vm" {
+		fmt.Fprintf(os.Stdout, "example.com/vm [%s.test]\t%s\n", pkg, filepath.Join(root, "vm"))
+		fmt.Fprintf(os.Stdout, "example.com/vm\t%s\n", filepath.Join(root, "vm"))
+	}
+	fmt.Fprintf(os.Stdout, "%s\t%s\n", pkg, filepath.Join(root, dirOf(pkg)))
+	fmt.Fprintf(os.Stdout, "%s [%s.test]\t%s\n", pkg, pkg, filepath.Join(root, dirOf(pkg)))
 	// go writes build diagnostics to the same stream, and a synthesised test
 	// package can report no directory at all.
 	fmt.Fprintln(os.Stdout, "")
