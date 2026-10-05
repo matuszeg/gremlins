@@ -381,6 +381,14 @@ func TestDifferentialChangesNoNameCarries(t *testing.T) {
 			after:    map[string]string{"vm/hash.go": "package vm\n\nimport \"crypto/md5\"\n\nfunc Sum() int {\n\treturn md5.Size\n}\n"},
 			remapped: bothTests,
 		},
+		"a method declared through a parenthesised alias": {
+			before: map[string]string{
+				"calc/calc.go": diffCalc("\nimport \"fmt\"\n", "return n*2 + len(fmt.Sprint(box{}))", "return n * 3"),
+				"calc/box.go":  "package calc\n\ntype box struct{}\n\ntype A = (box)\n",
+			},
+			after:    map[string]string{"calc/box.go": "package calc\n\ntype box struct{}\n\ntype A = (box)\n\nfunc (A) String() string {\n\treturn \"alias\"\n}\n"},
+			remapped: []string{"TestDouble"},
+		},
 		// z registers itself when initialised, calc's init reads the
 		// registry, and z is linked before and after: only the order the two
 		// are initialised in changes, because calc now imports z.

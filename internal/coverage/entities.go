@@ -596,7 +596,9 @@ func (ps *printSet) printGen(st *fileState, gd *ast.GenDecl) {
 			// package can gain a method through an alias, so only its name is
 			// added; the other direction needs nothing of its own, here or
 			// across packages, because the alias's header names the type.
-			if base, local := s.Type.(*ast.Ident); s.Assign.IsValid() && local && ps.declared[base.Name] {
+			// `type A = (box)` is the same alias, so the type is unwrapped
+			// first.
+			if base, local := ast.Unparen(s.Type).(*ast.Ident); s.Assign.IsValid() && local && ps.declared[base.Name] {
 				d := ps.out.Decls[key]
 				d.Names = append(d.Names, base.Name)
 				ps.out.Decls[key] = d
