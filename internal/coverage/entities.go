@@ -173,14 +173,18 @@ func init() {
 }
 
 // constrainedName reports whether a file name decides when the file is
-// compiled: a test file, or one whose name ends in a GOOS or GOARCH. Adding,
+// compiled: one whose name ends in a GOOS or GOARCH, before any _test. Adding,
 // removing or renaming one changes what a build compiles, so the names are
 // part of Whole.
+//
+// A test file's name is not a constraint of that kind. It decides only that
+// the file is compiled into the test binary alone, and everything that follows
+// from that is something an entity rule already carries: its declarations are
+// keyed by its file, so a file added, removed or renamed is its entities
+// added and removed; a test file's entities are followed by name, bodies
+// included; and a package it newly links is in Inputs.
 func constrainedName(name string) bool {
-	base := strings.TrimSuffix(name, ".go")
-	if strings.HasSuffix(base, "_test") {
-		return true
-	}
+	base := strings.TrimSuffix(strings.TrimSuffix(name, ".go"), "_test")
 	parts := strings.Split(base, "_")
 	if len(parts) < 2 {
 		return false

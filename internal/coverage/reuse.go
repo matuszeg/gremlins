@@ -124,12 +124,18 @@ type span struct {
 //     TestMain on the same terms: each runs for every test;
 //   - anything in Whole: a non-Go file or data below the directory (an
 //     embedded file among them), a build constraint, a file named for a
-//     platform or as a test file, a blank or dot import, a cgo file, a
-//     directive outside every declaration, a file that does not parse;
+//     platform, a blank or dot import, a cgo file, a directive outside every
+//     declaration, a file that does not parse;
 //   - a declaration with no name to pair it by — a blank var, a key two
 //     declarations share — changing, and one carrying //go:linkname;
 //   - a kept block that falls in no unchanged entity, which means the profile
 //     and the print disagree about the package.
+//
+// A test file is not in that list. Its name decides only that it is compiled
+// into the test binary alone, and its declarations, keyed by file, carry
+// everything that follows from adding, removing or renaming one: a new test
+// is mapped because it is new, a helper is followed by name, and a package it
+// newly links is in Inputs.
 //
 // All of it fails in the safe direction: too many tests re-mapped, never too
 // few. A mapping wrongly kept would mean a test that could kill a mutant is
