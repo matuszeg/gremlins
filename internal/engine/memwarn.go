@@ -17,7 +17,6 @@
 package engine
 
 import (
-	"strings"
 	"sync"
 
 	"github.com/go-gremlins/gremlins/internal/log"
@@ -25,28 +24,11 @@ import (
 )
 
 // outOfMemoryMarkers are what a process prints when an address-space limit
-// stops it: the Go runtime when an allocation fails ("out of memory",
-// "cannot allocate memory") or when it cannot reserve its start-up address
-// space ("failed to reserve ...", "cannot reserve ..."), and the dynamic
-// loader when it cannot map a program at all ("failed to map segment").
-var outOfMemoryMarkers = []string{
-	"out of memory",
-	"cannot allocate memory",
-	"failed to reserve",
-	"cannot reserve",
-	"failed to map segment",
-}
+// stops it; memlimit owns the list, which the schema build reads too.
+var outOfMemoryMarkers = memlimit.OutOfMemoryMarkers
 
 // showsOutOfMemory reports whether s holds one of outOfMemoryMarkers.
-func showsOutOfMemory(s string) bool {
-	for _, m := range outOfMemoryMarkers {
-		if strings.Contains(s, m) {
-			return true
-		}
-	}
-
-	return false
-}
+func showsOutOfMemory(s string) bool { return memlimit.ShowsOutOfMemory(s) }
 
 // memoryLimitWarning says, once per run, that --test-memory-limit stopped a
 // process that was building or running tests before any test could judge a
