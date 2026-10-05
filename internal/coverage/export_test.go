@@ -20,3 +20,21 @@ package coverage
 // hand-write a cache file: one that is unusable for any other reason must
 // carry the current version, or it tests the version check instead.
 const CacheVersion = cacheVersion
+
+// WithStubTypes stands in for the type-checker in the tests whose go command
+// is a fake, and so whose fixtures are no module go/packages can load: every
+// package type-checks, and none has an initialiser.
+func WithStubTypes() Option {
+	return func(c *Coverage) *Coverage {
+		c.typeLoader = func(_ bool, importPaths []string) map[string]typeFacts {
+			out := make(map[string]typeFacts, len(importPaths))
+			for _, p := range importPaths {
+				out[p] = typeFacts{}
+			}
+
+			return out
+		}
+
+		return c
+	}
+}

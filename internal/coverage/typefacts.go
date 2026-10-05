@@ -1,0 +1,284 @@
+/*
+ * Copyright 2022 The Gremlins Authors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+package coverage
+
+import (
+	"fmt"
+	"go/token"
+	"go/types"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"golang.org/x/tools/go/packages"
+)
+
+// Facts the compiler derives are asked of the compiler. A print holds what the
+// source says; what the type-checker works out from it — which variable waits
+// for which, through function bodies nothing executes — is in no token of it,
+// and every hole the reuse rule has had was one of those facts read off the
+// syntax, or not read at all. So the facts that decide what runs before any
+// test are taken from go/types, over the same files, build tags and
+// environment the test binary is compiled from.
+//
+// Today that is one fact: the order a package's variables are initialised in
+// (types.Info.InitOrder). Go initialises a package's variables in declaration
+// order, except that a variable waits for every variable its initialiser
+// depends on, and that dependency is found through the bodies of the
+// functions it calls, transitively. So a function body no test executed can
+// reorder initialisation — `_ = b` added to a helper an initialiser's callee
+// only names — and so can swapping two lines that print the same. Neither is
+// a change to any name a test reaches.
+
+// typeFacts is what the type-checker says about one package directory.
+type typeFacts struct {
+	// initOrder is every package-level variable with an initialiser, in the
+	// order the package initialises them: the package as its test binary
+	// links it — its test files included — and then its external test
+	// package, whose names carry xtestPrefix. A blank variable has no name
+	// to follow, so it is named by its file and its place among the file's
+	// blanks.
+	initOrder []string
+}
+
+// xtestPrefix marks a variable of the external test package, whose names can
+// coincide with the package's own.
+const xtestPrefix = "xtest\x00"
+
+// typeLoader type-checks packages by import path: with their test files and
+// their external test package when tests is set, as they are linked into any
+// other test binary when it is not. A package it could not type-check
+// cleanly is missing from the result.
+type typeLoader func(tests bool, importPaths []string) map[string]typeFacts
+
+// typesKey is a package as it was type-checked.
+type typesKey struct {
+	importPath string
+	tests      bool
+}
+
+// typeFactsOf is a package's type facts, type-checking it on first use. A
+// package that cannot be type-checked reports false, and its print is then
+// one reuse never narrows from.
+func (c *Coverage) typeFactsOf(importPath string, tests bool) (typeFacts, bool) {
+	c.loadTypes(tests, []string{importPath})
+	facts, ok := c.types[typesKey{importPath, tests}]
+
+	return facts, ok
+}
+
+// loadTypes type-checks every package of a set that has not been already, in
+// one load: the package being mapped is asked for with its instrumented
+// dependencies, and each load is a `go list` and a build of export data, so
+// asking one at a time would cost that for every dependency.
+//
+// A package that failed is remembered as failed and not asked for again.
+func (c *Coverage) loadTypes(tests bool, importPaths []string) {
+	if c.types == nil {
+		c.types = map[typesKey]typeFacts{}
+		c.typesTried = map[typesKey]bool{}
+	}
+	var missing []string
+	for _, p := range importPaths {
+		key := typesKey{p, tests}
+		if !c.typesTried[key] {
+			c.typesTried[key] = true
+			missing = append(missing, p)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	load := c.typeLoader
+	if load == nil {
+		load = c.loadTypesFromSource
+	}
+	for p, facts := range load(tests, missing) {
+		c.types[typesKey{p, tests}] = facts
+	}
+}
+
+// loadTypesFromSource is the typeLoader of a real run: go/packages, under the
+// build tags the test binaries are compiled with, from the module root.
+// Dependencies outside the set are read from export data, which the build
+// cache usually holds already: the test binary was compiled first.
+func (c *Coverage) loadTypesFromSource(tests bool, importPaths []string) map[string]typeFacts {
+	cfg := &packages.Config{
+		Mode:  packages.NeedName | packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+		Dir:   c.absRoot(),
+		Tests: tests,
+	}
+	if c.buildTags != "" {
+		cfg.BuildFlags = []string{"-tags", c.buildTags}
+	}
+	loaded, err := packages.Load(cfg, importPaths...)
+	if err != nil {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, p := range importPaths {
+		want[p] = true
+	}
+	// Under Tests, a package with test files comes back twice, as itself
+	// and as recompiled for its test binary, and its external tests as a
+	// third package. The test binary links the recompiled one.
+	type variants struct {
+		plain, test, xtest *packages.Package
+	}
+	found := map[string]*variants{}
+	for _, p := range loaded {
+		root, isTest := strings.CutSuffix(p.ID, " ["+strings.TrimSuffix(p.PkgPath, "_test")+".test]")
+		path := strings.TrimSuffix(root, "_test")
+		if !want[path] {
+			continue
+		}
+		v := found[path]
+		if v == nil {
+			v = &variants{}
+			found[path] = v
+		}
+		switch {
+		case root != path:
+			v.xtest = p
+		case isTest:
+			v.test = p
+		default:
+			v.plain = p
+		}
+	}
+	out := map[string]typeFacts{}
+	for path, v := range found {
+		linked := v.plain
+		if tests && v.test != nil {
+			linked = v.test
+		}
+		order, ok := initOrderOf(linked, "")
+		if !ok {
+			continue
+		}
+		if tests && v.xtest != nil {
+			more, xok := initOrderOf(v.xtest, xtestPrefix)
+			if !xok {
+				continue
+			}
+			order = append(order, more...)
+		}
+		out[path] = typeFacts{initOrder: order}
+	}
+
+	return out
+}
+
+// initOrderOf names a type-checked package's initialisers in order. A package
+// with any error says nothing: an initialiser it could not resolve is a
+// dependency it did not record.
+func initOrderOf(p *packages.Package, prefix string) ([]string, bool) {
+	if p == nil || len(p.Errors) > 0 || len(p.TypeErrors) > 0 || p.TypesInfo == nil || p.Fset == nil {
+		return nil, false
+	}
+	blanks := blankNames(p)
+	var order []string
+	for _, init := range p.TypesInfo.InitOrder {
+		for _, v := range init.Lhs {
+			name := v.Name()
+			if name == "_" {
+				name = blanks[v]
+			}
+			order = append(order, prefix+name)
+		}
+	}
+
+	return order, true
+}
+
+// blankNames names every blank variable an initialiser assigns by its file
+// and its place among that file's blanks, which is what pairs it across two
+// prints as well as anything can: its position moves with every edit above it.
+func blankNames(p *packages.Package) map[*types.Var]string {
+	type blank struct {
+		v   *types.Var
+		pos token.Position
+	}
+	var all []blank
+	for _, init := range p.TypesInfo.InitOrder {
+		for _, v := range init.Lhs {
+			if v.Name() == "_" {
+				all = append(all, blank{v, p.Fset.Position(v.Pos())})
+			}
+		}
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].pos.Filename != all[j].pos.Filename {
+			return all[i].pos.Filename < all[j].pos.Filename
+		}
+
+		return all[i].pos.Offset < all[j].pos.Offset
+	})
+	out := map[*types.Var]string{}
+	seen := map[string]int{}
+	for _, b := range all {
+		file := filepath.Base(b.pos.Filename)
+		out[b.v] = fmt.Sprintf("_@%s#%d", file, seen[file])
+		seen[file]++
+	}
+
+	return out
+}
+
+// sameInitOrder reports whether every variable two prints both initialise is
+// initialised in the same order relative to the others.
+//
+// A variable only one of them has is left out of the comparison, and that is
+// sound for the same reason the rest of the closure is: one added or removed
+// is a changed name, so everything that reads it is dirty by name; one whose
+// initialiser has an effect re-maps the package as kindRun before this is
+// asked; and a plain initialiser computes a value and nothing else, so where
+// it lands moves no other variable — Go's order is declaration order, held
+// back only by dependencies, and a variable that newly depends on it mentions
+// a name that changed. What is left is two variables that were both there
+// trading places, which is what this catches.
+func sameInitOrder(was, now []string) bool {
+	in := func(list []string) map[string]bool {
+		out := make(map[string]bool, len(list))
+		for _, name := range list {
+			out[name] = true
+		}
+
+		return out
+	}
+	common := func(list []string, other map[string]bool) []string {
+		var out []string
+		for _, name := range list {
+			if other[name] {
+				out = append(out, name)
+			}
+		}
+
+		return out
+	}
+	a, b := common(was, in(now)), common(now, in(was))
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
+}

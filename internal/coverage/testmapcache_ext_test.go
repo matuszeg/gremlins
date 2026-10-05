@@ -106,7 +106,7 @@ func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestM
 	cov := coverage.NewWithCmd(
 		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv, h.notMain, h.extraProfile),
 		h.t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(h.cacheDir))
+		coverage.WithTestMapCacheDir(h.cacheDir), coverage.WithStubTypes())
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {

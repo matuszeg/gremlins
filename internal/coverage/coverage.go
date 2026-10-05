@@ -63,9 +63,18 @@ type Coverage struct {
 	dirHashes   map[string]string
 	depListings map[string]depListing
 	depSources  map[string]*depSource
+
 	// pkgNames is each listed package's name by import path, which is what
 	// an unnamed import binds.
 	pkgNames map[string]string
+
+	// types is what the type-checker said about each package, and
+	// typesTried every package it was asked about, whatever it said (see
+	// typeFactsOf). typeLoader replaces go/packages for the tests that
+	// stand a fake in for the go command; nil is the real one.
+	types      map[typesKey]typeFacts
+	typesTried map[typesKey]bool
+	typeLoader typeLoader
 }
 
 // Option for the Coverage initialization.

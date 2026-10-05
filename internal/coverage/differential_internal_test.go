@@ -197,6 +197,13 @@ func diffCalc(header, double, triple string) string {
 
 var bothTests = []string{"TestDouble", "TestTriple"}
 
+// regHead declares a registry that initialisers append to, and regDouble is a
+// Double that reads which of them ran first.
+const (
+	regHead   = "package calc\n\nvar order []string\n\nfunc reg(s string) int {\n\torder = append(order, s)\n\treturn 0\n}\n\n"
+	regDouble = "if order[0] == \"b\" {\n\t\treturn 1\n\t}\n\treturn n * 2"
+)
+
 // The changes the closure narrows: the cached run maps again only the tests a
 // change could reach, and what it keeps is what a fresh run produces.
 func TestDifferentialNarrowedChanges(t *testing.T) {
@@ -323,6 +330,9 @@ func TestDifferentialNarrowedChanges(t *testing.T) {
 // The holes an adversarial review proved against the closure, each a change
 // that reaches a test by a route no name it mentions carries.
 func TestDifferentialChangesNoNameCarries(t *testing.T) {
+	regFirst := func(h string) string {
+		return regHead + "var a = first()\n\nvar b = reg(\"b\")\n\nfunc first() int {\n\tif len(order) > 1000 {\n\t\th()\n\t}\n\treturn reg(\"a\")\n}\n\nfunc h() {\n\t" + h + "\n}\n"
+	}
 	item := "\ntype item struct{}\n\nfunc (item) String() string {\n\treturn \"item\"\n}\n"
 	hashing := diffCalc("\nimport \"crypto\"\n", "if crypto.MD5.Available() {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3")
 	runDifferential(t, map[string]diffCase{
@@ -379,6 +389,23 @@ func TestDifferentialChangesNoNameCarries(t *testing.T) {
 				"vm/vm.go": "package vm\n\nfunc Size(v []int) int {\n\treturn len(v)\n}\n",
 			},
 			after:    map[string]string{"vm/hash.go": "package vm\n\nimport \"crypto/md5\"\n\nfunc Sum() int {\n\treturn md5.Size\n}\n"},
+			remapped: bothTests,
+		},
+		// Package-level variables are initialised in declaration order,
+		// subject to their dependencies: swapping two whose initialisers have
+		// effects changes what both see, and no name of either changed.
+		"two initialisers with effects swapped": {
+			before:   map[string]string{"calc/calc.go": diffCalc("", regDouble, "return n * 3"), "calc/reg.go": regHead + "var a = reg(\"a\")\nvar b = reg(\"b\")\n"},
+			after:    map[string]string{"calc/reg.go": regHead + "var b = reg(\"b\")\nvar a = reg(\"a\")\n"},
+			remapped: bothTests,
+		},
+		// The dependency is found through a function body that never runs:
+		// h now mentions b, so a, which calls first, which mentions h, waits
+		// for b. The order moved, and the only change is to a body no test
+		// executed.
+		"an unexecuted body that adds an initialisation dependency": {
+			before:   map[string]string{"calc/calc.go": diffCalc("", regDouble, "return n * 3"), "calc/reg.go": regFirst("_ = 0")},
+			after:    map[string]string{"calc/reg.go": regFirst("_ = b")},
 			remapped: bothTests,
 		},
 		"a method declared through a parenthesised alias": {
@@ -444,6 +471,7 @@ func TestDifferentialBuildTags(t *testing.T) {
 	viper.Set(configuration.UnleashTagsKey, "extra")
 	t.Cleanup(func() { viper.Set(configuration.UnleashTagsKey, "") })
 	vm := func(clamp string) string { return "package vm\n\nfunc Clamp(n int) int {\n\t" + clamp + "\n}\n" }
+	tagged := "//go:build extra\n\npackage calc\n\n"
 	runDifferential(t, map[string]diffCase{
 		"a dependency linked only by a tagged file": {
 			before: map[string]string{
@@ -453,6 +481,53 @@ func TestDifferentialBuildTags(t *testing.T) {
 			},
 			after:    map[string]string{"vm/vm.go": vm("if n > 1 {\n\t\treturn 100\n\t}\n\treturn n")},
 			remapped: []string{"TestDouble"},
+		},
+		// The variables are compiled only under the tag, and the package
+		// type-checks without them, so a type-check without the tag would
+		// see no initialiser at all, before or after.
+		"initialisers swapped in a tagged file": {
+			before: map[string]string{
+				"calc/calc.go": diffCalc("", "if len(order) > 0 && "+strings.TrimPrefix(regDouble, "if "), "return n * 3"),
+				"calc/regs.go": regHead,
+				"calc/vars.go": tagged + "var a = reg(\"a\")\nvar b = reg(\"b\")\n",
+			},
+			after:    map[string]string{"calc/vars.go": tagged + "var b = reg(\"b\")\nvar a = reg(\"a\")\n"},
+			remapped: bothTests,
+		},
+	})
+}
+
+// The order packages are initialised in is decided by the import graph, which
+// no package's type-check sees, so the rules that watch the import sets stay.
+func TestDifferentialPackageInitOrder(t *testing.T) {
+	zmod := map[string]string{
+		"go.mod":            "module example.com/m\n\ngo 1.22\n\nrequire example.com/z v0.0.0\n\nreplace example.com/z => ./zmod\n",
+		"zmod/go.mod":       "module example.com/z\n\ngo 1.22\n",
+		"zmod/reg/reg.go":   "package reg\n\nvar Names []string\n",
+		"zmod/z.go":         "package z\n\nimport \"example.com/z/reg\"\n\nfunc init() {\n\treg.Names = append(reg.Names, \"z\")\n}\n\nfunc Name() string {\n\treturn \"z\"\n}\n",
+		"calc/init.go":      "package calc\n\nimport \"example.com/z/reg\"\n\nvar seen = len(reg.Names)\n",
+		"calc/calc.go":      diffCalc("\n// Name is for the external test.\nfunc Name() string {\n\treturn \"calc\"\n}\n", "if seen > 0 {\n\t\treturn 1\n\t}\n\treturn n * 2", "return n * 3"),
+		"calc/calc_test.go": diffRemoved,
+		"calc/x_test.go": "package calc_test\n\nimport (\n\t\"testing\"\n\n\t\"example.com/m/calc\"\n\t\"example.com/z\"\n)\n\n" +
+			"func TestDouble(t *testing.T) {\n\t_ = calc.Double(2)\n}\n\nfunc TestTriple(t *testing.T) {\n\t_ = calc.Triple(2)\n}\n\n" +
+			"func TestZ(t *testing.T) {\n\t_ = z.Name() + calc.Name()\n}\n",
+	}
+	runDifferential(t, map[string]diffCase{
+		// The writer, z's init, is in a module that is not instrumented, so
+		// only the plain var reading reg.Names says the order is observed.
+		"an order-observing plain var whose writer is not instrumented": {
+			before:   zmod,
+			after:    map[string]string{"calc/name.go": "package calc\n\nimport \"example.com/z\"\n\nfunc name() string {\n\treturn z.Name()\n}\n"},
+			remapped: []string{"TestDouble", "TestTriple", "TestZ"},
+		},
+		// Imports moved, but nothing instrumented can see when anything was
+		// initialised, so nothing is re-mapped.
+		"imports changed where nothing observes the order": {
+			before: map[string]string{
+				"vm/vm.go":     "package vm\n\nfunc Clamp(n int) int {\n\treturn n\n}\n",
+				"calc/calc.go": diffCalc("\nimport \"example.com/m/vm\"\n", "return vm.Clamp(n) * 2", "return n * 3"),
+			},
+			after: map[string]string{"calc/other.go": "package calc\n\nimport \"example.com/m/vm\"\n\nfunc other() int {\n\treturn vm.Clamp(1)\n}\n"},
 		},
 	})
 }
