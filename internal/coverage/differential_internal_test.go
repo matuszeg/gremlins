@@ -61,10 +61,16 @@ const diffRemoved = "\x00removed"
 const diffPkg = "example.com/m/calc"
 
 // diffCase is one edit, and the tests the cached run must map again after it.
+//
+// stale marks a known exposure (see "What it cannot see" in reusable): the
+// cached run is expected to keep a mapping a fresh run would not produce. It
+// is asserted rather than skipped, so that a change which closes the
+// exposure is seen.
 type diffCase struct {
 	before   map[string]string
 	after    map[string]string
 	remapped []string
+	stale    bool
 }
 
 // diffModule is one case's module on disk and the commands its runs issued.
@@ -176,6 +182,13 @@ func runDifferential(t *testing.T, cases map[string]diffCase) {
 			ran := m.ran
 			scratch := m.build(t.TempDir())
 
+			if c.stale {
+				if cmp.Equal(scratch.profiles, reused.profiles, cmpopts.EquateEmpty()) {
+					t.Errorf("a known exposure no longer keeps a stale mapping: update reusable's doc comment and this case")
+				}
+
+				return
+			}
 			if diff := cmp.Diff(scratch.profiles, reused.profiles, cmpopts.EquateEmpty()); diff != "" {
 				t.Errorf("a mapping kept from the cache differs from a fresh one (-fresh +kept):\n%s", diff)
 			}
@@ -528,6 +541,20 @@ func TestDifferentialPackageInitOrder(t *testing.T) {
 				"calc/calc.go": diffCalc("\nimport \"example.com/m/vm\"\n", "return vm.Clamp(n) * 2", "return n * 3"),
 			},
 			after: map[string]string{"calc/other.go": "package calc\n\nimport \"example.com/m/vm\"\n\nfunc other() int {\n\treturn vm.Clamp(1)\n}\n"},
+		},
+	})
+}
+
+// What reuse is known not to see, asserted so that it stays documented.
+func TestDifferentialKnownExposures(t *testing.T) {
+	caller := "_, _, line, _ := runtime.Caller(0)\n\tif line > 7 {\n\t\treturn 1\n\t}\n\treturn n * 2"
+	runDifferential(t, map[string]diffCase{
+		// The constant moves Double down two lines without changing its
+		// print, and Double branches on its own line number.
+		"an absolute line read by runtime.Caller": {
+			before: map[string]string{"calc/calc.go": diffCalc("\nimport \"runtime\"\n", caller, "return n * 3")},
+			after:  map[string]string{"calc/calc.go": diffCalc("\nimport \"runtime\"\n\nconst pad = 1\n", caller, "return n * 3")},
+			stale:  true,
 		},
 	})
 }
