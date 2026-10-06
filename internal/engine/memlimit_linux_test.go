@@ -42,16 +42,23 @@ import (
 // --schemata under three limits, and expects the limit to reach the test
 // processes and nothing else.
 //
-// Under a GiB limit the runaway loop's INCREMENT_DECREMENT mutant dies of the
-// limit and is KILLED, as it was under `ulimit -v` around the whole of
-// gremlins; so is the mutant that allocates nearly two GiB and passes. Under
-// four GiB the second LIVES, which shows the limit is what killed it; the
+// Under a three-GiB limit the runaway loop's INCREMENT_DECREMENT mutant dies
+// of the limit and is KILLED, as it was under `ulimit -v` around the whole of
+// gremlins; so is the mutant that allocates nearly four GiB and passes. Under
+// eight GiB the second LIVES, which shows the limit is what killed it; the
 // runaway one is left out of that run, so that it never runs under a limit
 // it could take seconds to reach. Under 300 MiB the go command itself cannot
 // start, every mutant is NOT VIABLE, and the run warns once that the limit
-// did it. A KILLED mutant is no reason to warn, so the GiB run does not. Both
-// paths agree on every mutant, and gremlins' own address-space limit is the
-// same after each run as before it.
+// did it. A KILLED mutant is no reason to warn, so the three-GiB run does not.
+// Both paths agree on every mutant, and gremlins' own address-space limit is
+// the same after each run as before it.
+//
+// The limited run's cap leaves the toolchain room. It was one GiB, around a
+// two-GiB mutant, and under load the go command, compiler or linker sometimes
+// needed more than that (seen at 1.5 GiB too): a build died NOT VIABLE on one
+// path, or a test binary before reaching its mutant (ERRORED) on the other,
+// and the two paths disagreed. The fixture now spans four GiB so the cap can
+// be three.
 //
 // Every fixture process runs under a limit: the runaway mutant must never run
 // without one.
@@ -77,13 +84,13 @@ func TestTestMemoryLimit(t *testing.T) {
 		wantWarnings int
 	}{
 		"limited": {
-			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "1G"},
+			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "3G"},
 			profile:     prof,
 			wantRunaway: mutator.Killed,
 			wantSpare:   mutator.Killed,
 		},
 		"generous": {
-			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "4G"},
+			settings:    map[string]any{configuration.UnleashTestMemoryLimitKey: "8G"},
 			profile:     uncovered,
 			wantRunaway: mutator.NotCovered,
 			wantSpare:   mutator.Lived,
@@ -115,7 +122,7 @@ func TestTestMemoryLimit(t *testing.T) {
 					t.Errorf("schemata=%t: runaway loop mutant is %s, want %s", withSchemata, st, tc.wantRunaway)
 				}
 				if st := spare.status(t, modRoot, got); st != tc.wantSpare {
-					t.Errorf("schemata=%t: two-GiB mutant is %s, want %s", withSchemata, st, tc.wantSpare)
+					t.Errorf("schemata=%t: four-GiB mutant is %s, want %s", withSchemata, st, tc.wantSpare)
 				}
 				byPath[i] = got
 			}
