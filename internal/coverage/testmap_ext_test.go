@@ -232,7 +232,7 @@ func writeFixture(t *testing.T, path, content string) {
 	}
 }
 
-func buildMap(t *testing.T, helper string) *coverage.TestMap {
+func buildMap(t *testing.T, helper string, opts ...coverage.Option) *coverage.TestMap {
 	t.Helper()
 
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
@@ -249,7 +249,7 @@ func buildMap(t *testing.T, helper string) *coverage.TestMap {
 	// Every test gets its own cache directory: the real one belongs to whoever
 	// is running the suite, and a shared one would let one test answer another.
 	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes())
+		append([]coverage.Option{coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes()}, opts...)...)
 
 	tm, err := cov.BuildTestMap()
 	if err != nil {
@@ -315,6 +315,30 @@ func TestBuildTestMap(t *testing.T) {
 			t.Error("expected an unknown package to report as unmapped")
 		}
 	})
+}
+
+// A --diff run has mutants only in the packages its changed files belong to,
+// so mapping the rest is work no mutant reads: on a 139-package module it was
+// most of a warm map's 5m34s. A package left out is unmapped, never "mapped
+// with no tests", so a mutant there still falls back to its package's whole
+// suite (TestSelectionFallsBackToTheWholeSuite, "when the mutated package could
+// not be mapped") rather than running nothing.
+func TestBuildTestMapMapsOnlyThePackagesInScope(t *testing.T) {
+	const scoped = "example.com/vm"
+	tm := buildMap(t, "TestTestMapHelperProcess",
+		coverage.WithMapScope(func(importPath string) bool { return importPath == scoped }))
+
+	if !tm.Mapped(scoped) {
+		t.Error("expected the package in scope to be mapped")
+	}
+	for _, pkg := range []string{"example.com", "example.com/empty"} {
+		if tm.Mapped(pkg) {
+			t.Errorf("expected %s, outside the scope, to be unmapped so it falls back to its whole suite", pkg)
+		}
+	}
+	if got, all := tm.Len(), buildMap(t, "TestTestMapHelperProcess").Len(); got == 0 || got >= all {
+		t.Errorf("want only the scoped package's tests mapped: got %d of the unscoped %d", got, all)
+	}
 }
 
 func TestBuildTestMapLeavesAPackageUnmappedWhenATestCannotBeRun(t *testing.T) {
