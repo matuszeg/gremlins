@@ -73,6 +73,7 @@ func TestPrint(t *testing.T) {
 	show("Append", Append)
 	show("Return", func() any { return Return() })
 	show("Define", Define)
+	show("DefineTyped", DefineTyped)
 	show("Unexported", Unexported)
 	show("Shadowed", Shadowed)
 	show("DoubleRound", DoubleRound)
