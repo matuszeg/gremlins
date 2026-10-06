@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -58,6 +59,9 @@ type cacheHarness struct {
 	// extraProfile is appended to every profile, as extraProfileEnv carries
 	// it.
 	extraProfile string
+	// env is added to every fake command's environment: the delays the
+	// helper sleeps for, as compileDelayEnv and its siblings carry them.
+	env []string
 }
 
 func newCacheHarness(t *testing.T) *cacheHarness {
@@ -87,6 +91,20 @@ func (h *cacheHarness) build(helper, buildIDs string) *coverage.TestMap {
 func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestMap {
 	h.t.Helper()
 
+	tm, err := h.coverage(helper, buildIDs, pkg).BuildTestMap()
+	if err != nil {
+		h.t.Fatalf("BuildTestMap() error: %v", err)
+	}
+
+	return tm
+}
+
+// coverage is the Coverage a build uses, for a test that goes on to ask it
+// for more than the map. It clears the invocation log, so what the log holds
+// afterwards is what this Coverage issued.
+func (h *cacheHarness) coverage(helper, buildIDs, pkg string) *coverage.Coverage {
+	h.t.Helper()
+
 	_ = os.Remove(h.logPath)
 	// A real run is scoped by the directory gremlins was pointed at, and that
 	// directory is what used to divide the cache. Deriving it from the package
@@ -103,17 +121,16 @@ func (h *cacheHarness) buildScoped(helper, buildIDs, pkg string) *coverage.TestM
 		h.t.Chdir(h.pkgRoot)
 		mod.Root = h.pkgRoot
 	}
-	cov := coverage.NewWithCmd(
-		fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv, h.notMain, h.extraProfile),
-		h.t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(h.cacheDir), coverage.WithStubTypes())
+	fake := fakeGoCommandWith(helper, h.pkgRoot, buildIDs, h.logPath, pkg, h.goEnv, h.notMain, h.extraProfile)
+	withEnv := func(command string, args ...string) *exec.Cmd {
+		cmd := fake(command, args...)
+		cmd.Env = append(cmd.Env, h.env...)
 
-	tm, err := cov.BuildTestMap()
-	if err != nil {
-		h.t.Fatalf("BuildTestMap() error: %v", err)
+		return cmd
 	}
 
-	return tm
+	return coverage.NewWithCmd(withEnv, h.t.TempDir(), mod,
+		coverage.WithTestMapCacheDir(h.cacheDir), coverage.WithStubTypes())
 }
 
 // testsRun returns the tests the last build actually executed, sorted.

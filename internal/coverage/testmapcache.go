@@ -24,12 +24,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // cacheVersion is the shape of a cache file. A file written by a different
 // version is discarded rather than migrated: it costs one rebuild, and the
 // alternative is reading a map whose meaning has changed.
 //
+// Version 12 records how long each test's mapping run took, which is what a
+// run that skips the coverage gather derives its timeout baseline from.
 // Version 11 asks the type-checker which vars read another package at
 // initialisation, which a dot import or a var holding another's address hides
 // from the syntax.
@@ -61,7 +64,7 @@ import (
 // file per package. Version 1 was one file per module, which meant a run had
 // to write back every package it had not looked at or lose them — and a
 // scoped run, which is the recommended workflow, looks at one.
-const cacheVersion = 11
+const cacheVersion = 12
 
 // cachedPackage is one package's mapping, and the build ID of the test binary
 // it was produced from.
@@ -89,15 +92,20 @@ const cacheVersion = 11
 // read as coverage everywhere, while Deps is only ever asked "did this test
 // reach an entity that changed". A test that reached none has no entry.
 //
+// Durations is, per test, how long its mapping run took: the whole process,
+// from start to exit, as profileForTest ran it. A reused mapping keeps the
+// duration it was recorded with. See TestMap.SuiteBaseline for what reads it.
+//
 // ImportPath is stored as well as hashed into the file name, so that a file
 // found under the wrong name is a miss rather than another package's answer.
 type cachedPackage struct {
-	Tests       map[string]Profile  `json:"tests"`
-	Deps        map[string][]string `json:"deps,omitempty"`
-	ImportPath  string              `json:"import_path"`
-	BuildID     string              `json:"build_id"`
-	Fingerprint fingerprint         `json:"fingerprint"`
-	Version     int                 `json:"version"`
+	Tests       map[string]Profile       `json:"tests"`
+	Deps        map[string][]string      `json:"deps,omitempty"`
+	Durations   map[string]time.Duration `json:"durations,omitempty"`
+	ImportPath  string                   `json:"import_path"`
+	BuildID     string                   `json:"build_id"`
+	Fingerprint fingerprint              `json:"fingerprint"`
+	Version     int                      `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than

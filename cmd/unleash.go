@@ -199,12 +199,6 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 		return report.Results{}, err
 	}
 
-	cProfile, err := c.Run()
-	if err != nil {
-		return report.Results{}, fmt.Errorf("failed to gather coverage: %w", err)
-	}
-
-	covered := cProfile.Profile
 	var opts []engine.ExecutorDealerOption
 
 	// Which packages a mutation could break is a question about imports, so it
@@ -219,22 +213,23 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	}
 
 	// Which tests within those packages execute the mutated line is a question
-	// about coverage, and that is the expensive one.
-	if testSelectionRequested() {
+	// about coverage, and that is the expensive one. With selection the map
+	// that answers it is built inside Gather, and stands in for the coverage
+	// gather wherever it can. The map scope is set first: a package outside it
+	// holds no mutant in this run, so it is neither mapped nor gathered.
+	selection := testSelectionRequested()
+	if selection {
 		if scope := mapScope(mod, fDiff, graph.Dependents); scope != nil {
 			coverage.WithMapScope(scope)(c)
 		}
-		testMap, err := c.BuildTestMap()
-		if err != nil {
-			return report.Results{}, fmt.Errorf("failed to map tests to the code they execute: %w", err)
-		}
+	}
+	cProfile, testMap, err := c.Gather(selection)
+	if err != nil {
+		return report.Results{}, err
+	}
+
+	if selection {
 		opts = append(opts, engine.WithTestSelection(testMap))
-		// The map sees a line executed only by another package's tests, which a
-		// plain coverage run attributes to nobody, leaving the mutants on it
-		// untested. Widen the profile with it rather than replacing it: a
-		// package the map could not see whole is missing from the union, and its
-		// mutants must stay runnable.
-		covered = coverage.Merge(cProfile.Profile, testMap.Union())
 	}
 
 	wdDealer := workdir.NewCachedDealer(workDir, mod.Root)
@@ -243,7 +238,7 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	jDealer := engine.NewExecutorDealer(mod, wdDealer, cProfile.Elapsed, opts...)
 
 	codeData := engine.CodeData{
-		Cov:       covered,
+		Cov:       cProfile.Profile,
 		Diff:      fDiff,
 		Exclusion: exclude,
 	}
