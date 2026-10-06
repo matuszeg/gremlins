@@ -18,12 +18,15 @@ package coverage
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -75,9 +78,10 @@ type diffCase struct {
 
 // diffModule is one case's module on disk and the commands its runs issued.
 type diffModule struct {
-	t    *testing.T
-	root string
-	ran  []string
+	t        *testing.T
+	root     string
+	ran      []string
+	compiles int
 }
 
 func (m *diffModule) write(fs map[string]string) {
@@ -105,6 +109,9 @@ func (m *diffModule) write(fs map[string]string) {
 // coverage directory an instrumented `go test` of this suite sets is dropped:
 // the binaries built here write their own profiles.
 func (m *diffModule) command(name string, args ...string) *exec.Cmd {
+	if name == "go" && len(args) > 0 && args[0] == "test" && slices.Contains(args, "-c") {
+		m.compiles++
+	}
 	for i, arg := range args {
 		if arg == "-test.run" && i+1 < len(args) {
 			m.ran = append(m.ran, strings.TrimSuffix(strings.TrimPrefix(args[i+1], "^"), "$"))
@@ -121,6 +128,11 @@ func (m *diffModule) command(name string, args ...string) *exec.Cmd {
 type diffMap struct {
 	profiles map[string]Profile
 	deps     map[string][]string
+	// baselined says the package counts toward the map's suite baseline
+	// rather than being left to the coverage gather, and compiled is the
+	// compile time it counts with.
+	baselined bool
+	compiled  time.Duration
 }
 
 // build maps the calc package against a cache directory and returns what the
@@ -129,6 +141,7 @@ func (m *diffModule) build(cacheDir string) diffMap {
 	m.t.Helper()
 
 	m.ran = nil
+	m.compiles = 0
 	m.t.Chdir(m.root)
 	c := NewWithCmd(m.command, m.t.TempDir(),
 		gomodule.GoModule{Name: "example.com/m", Root: m.root, CallingDir: "calc"},
@@ -155,6 +168,9 @@ func (m *diffModule) build(cacheDir string) diffMap {
 		m.t.Fatalf("no cache entry was written for %s", diffPkg)
 	}
 	out.deps = entry.Deps
+	_, rest := tm.SuiteBaseline()
+	out.baselined = !slices.Contains(rest, diffPkg)
+	out.compiled = tm.compiled[diffPkg]
 	sort.Strings(m.ran)
 
 	return out
@@ -770,5 +786,135 @@ func TestDifferentialMethods(t *testing.T) {
 			after:    map[string]string{"calc/box.go": box + "\nfunc (box) String() string {\n\treturn \"box\"\n}\n"},
 			remapped: []string{"TestDouble", "TestTriple"},
 		},
+	})
+}
+
+// A package whose fingerprint and build inputs equal its cache entry's is
+// served from the entry without compiling its tests: the build ID the compile
+// would yield was the only thing left to learn, and with both equal a moved one
+// means only a moved checkout (see buildInputsOf). A warm map of many packages
+// otherwise spends nearly all its time compiling binaries it then discards.
+func TestDifferentialAnUnchangedPackageIsNotCompiled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds and runs real test binaries")
+	}
+	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
+	t.Cleanup(log.Reset)
+
+	// What was served must be what a fresh map makes, byte for byte: equal
+	// fingerprints mean no line moved, so nothing may be shifted.
+	sameAsFresh := func(t *testing.T, served, fresh diffMap) {
+		t.Helper()
+		got, err := json.Marshal(served.profiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := json.Marshal(fresh.profiles)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, want) {
+			t.Errorf("served profiles differ from a fresh map:\nserved %s\nfresh  %s", got, want)
+		}
+		if diff := cmp.Diff(fresh.deps, served.deps, cmpopts.EquateEmpty()); diff != "" {
+			t.Errorf("served dependency keys differ from fresh ones (-fresh +served):\n%s", diff)
+		}
+	}
+
+	t.Run("files touched but not changed", func(t *testing.T) {
+		m := &diffModule{t: t, root: t.TempDir()}
+		m.write(diffBase)
+		cache := t.TempDir()
+		mapped := m.build(cache)
+
+		later := time.Now().Add(time.Hour)
+		for rel := range diffBase {
+			if err := os.Chtimes(filepath.Join(m.root, rel), later, later); err != nil {
+				t.Fatal(err)
+			}
+		}
+		served := m.build(cache)
+		if m.compiles != 0 || len(m.ran) != 0 {
+			t.Fatalf("an unchanged package compiled %d times and ran %v, want neither", m.compiles, m.ran)
+		}
+		if !served.baselined {
+			t.Error("a package served without compiling dropped out of the suite baseline, so the gather would run it")
+		}
+		// It reports the compile time recorded when it was mapped: the
+		// baseline the per-mutant timeout is derived from must not lose it.
+		if served.compiled <= 0 || served.compiled != mapped.compiled {
+			t.Errorf("served compile time %v, want the %v recorded when it was mapped", served.compiled, mapped.compiled)
+		}
+		sameAsFresh(t, served, m.build(t.TempDir()))
+	})
+
+	// The cache is shared by runners whose checkouts live in different
+	// directories, so a moved checkout must be served the same way.
+	t.Run("the same module in another checkout", func(t *testing.T) {
+		first := &diffModule{t: t, root: t.TempDir()}
+		first.write(diffBase)
+		cache := t.TempDir()
+		first.build(cache)
+
+		moved := &diffModule{t: t, root: t.TempDir()}
+		moved.write(diffBase)
+		served := moved.build(cache)
+		if moved.compiles != 0 || len(moved.ran) != 0 {
+			t.Fatalf("a moved checkout compiled %d times and ran %v, want neither", moved.compiles, moved.ran)
+		}
+		sameAsFresh(t, served, moved.build(t.TempDir()))
+	})
+
+	// Equal prints are not enough on their own: a print records the lines its
+	// entity occupies, so a line moved without a print changing still makes
+	// the fingerprint differ, and the package is compiled and its mappings
+	// shifted rather than served as they stand.
+	t.Run("a blank line moves code, so it is compiled", func(t *testing.T) {
+		m := &diffModule{t: t, root: t.TempDir()}
+		m.write(diffBase)
+		cache := t.TempDir()
+		m.build(cache)
+
+		m.write(map[string]string{"calc/calc.go": strings.Replace(diffBase["calc/calc.go"],
+			"func Double(n int) int {\n", "func Double(n int) int {\n\n", 1)})
+		served := m.build(cache)
+		if m.compiles != 1 {
+			t.Fatalf("a moved line compiled %d times, want 1", m.compiles)
+		}
+		sameAsFresh(t, served, m.build(t.TempDir()))
+	})
+
+	// An entry from before compile times were recorded cannot keep the package
+	// in the suite baseline, so it compiles as before rather than guess.
+	t.Run("an entry without a compile time is compiled", func(t *testing.T) {
+		m := &diffModule{t: t, root: t.TempDir()}
+		m.write(diffBase)
+		cache := t.TempDir()
+		m.build(cache)
+		c := NewWithCmd(m.command, t.TempDir(),
+			gomodule.GoModule{Name: "example.com/m", Root: m.root, CallingDir: "calc"}, WithTestMapCacheDir(cache))
+		dir, err := c.cacheDirPath(cacheKey(c.cacheScope(), c.buildTags))
+		if err != nil {
+			t.Fatal(err)
+		}
+		entry, ok := loadCachedPackage(dir, diffPkg)
+		if !ok {
+			t.Fatal("no cache entry")
+		}
+		entry.Compiled = 0
+		if err := entry.save(dir); err != nil {
+			t.Fatal(err)
+		}
+		m.build(cache)
+		if m.compiles != 1 {
+			t.Fatalf("an entry without a compile time compiled %d times, want 1", m.compiles)
+		}
+		// That compile is recorded, so the entry stops costing one: a cache
+		// written before compile times were kept is upgraded in place by the
+		// first run that compiles each package, not left to compile forever.
+		m.build(cache)
+		if m.compiles != 0 {
+			t.Fatalf("after its compile time was recorded the entry compiled %d times, want 0", m.compiles)
+		}
 	})
 }

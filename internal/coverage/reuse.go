@@ -198,7 +198,10 @@ type span struct {
 // initialised in; a binary built and run by a test; lines executed in a subprocess; and
 // a nondeterministic path that reuse freezes as whichever way it went when the
 // mapping was made. All but the positions are shared with reusing a map by
-// build ID alone.
+// build ID alone. So is a toolchain changed in place: a GOROOT edited under the
+// same GOVERSION leaves every print and Inputs equal, and a package unchanged
+// besides is served without its test binary ever being built (see
+// mapPackage), where only the build ID would have moved.
 //
 // It is deliberately not a call graph. The alternative — SSA plus
 // reachability from each test root — is a much larger build, and it is
@@ -209,7 +212,10 @@ type span struct {
 // it, and the path decides nothing a test executes; that is the case of a
 // cache restored into another runner's work directory. The mappings are still
 // moved rather than kept as they are, because blank lines between
-// declarations move a function without changing its print.
+// declarations move a function without changing its print. (A package whose
+// whole fingerprint, positions included, equals its entry's is normally served
+// before it is compiled and never gets here: the compile could only tell it
+// that the checkout moved. See unchanged for the entries that still do.)
 func reusable(cached cachedPackage, now fingerprint) (map[string]Profile, string) {
 	was := cached.Fingerprint
 	// An entry written before the package was fingerprinted, or one whose

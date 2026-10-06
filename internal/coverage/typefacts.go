@@ -154,7 +154,9 @@ func (c *Coverage) loadTypes(tests bool, importPaths []string) {
 // loadTypesFromSource is the typeLoader of a real run: go/packages, under the
 // build tags the test binaries are compiled with, from the module root.
 // Dependencies outside the set are read from export data, which the build
-// cache usually holds already: the test binary was compiled first.
+// cache usually holds already from earlier runs. The test binary is no longer
+// compiled first: the fingerprint is taken before it, so that an unchanged
+// package can skip the compile.
 //
 // The import graph is a second load that asks for nothing but names and
 // imports: asking the first for dependencies would type-check every one of

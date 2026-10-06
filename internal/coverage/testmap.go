@@ -17,6 +17,8 @@
 package coverage
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"go/token"
 	"os"
@@ -249,6 +251,48 @@ func (c *Coverage) scopePackages(pkgs []testPackage) []testPackage {
 	return scoped
 }
 
+// serveCached puts a cached package's mappings in the map as they stand. It
+// writes nothing back: the file is already the answer, and a run touches no
+// other package's, so it cannot evict one. (mapPackage records a compile time
+// an older entry lacked, in that package's own file.) compiled is the compile
+// time the package reports to the suite baseline: this run's, or, when the
+// compile was skipped, the one the entry recorded.
+func (c *Coverage) serveCached(tm *TestMap, importPath string, cached cachedPackage, compiled time.Duration) {
+	for name, profile := range cached.Tests {
+		id := TestID{Pkg: importPath, Name: name}
+		tm.profiles[id] = profile
+		if d, ok := cached.Durations[name]; ok {
+			tm.durations[id] = d
+		}
+	}
+	tm.compiled[importPath] = compiled
+}
+
+// unchanged reports whether a package can be served from its entry without
+// compiling: now is a usable fingerprint equal to the one the entry was mapped
+// under, and the entry carries everything a hit reports, a compile time and a
+// duration for every test. An entry written before compile times were kept, or
+// under a fingerprint that said nothing, is compiled as before; so is a package
+// the type-checker could not read, which reusable would re-map whole rather
+// than compare (see wholeReason).
+func unchanged(cached cachedPackage, now fingerprint) bool {
+	if cached.Compiled <= 0 || now.Whole == "" || now.Inputs == "" || !now.Typed {
+		return false
+	}
+	for name := range cached.Tests {
+		if _, ok := cached.Durations[name]; !ok {
+			return false
+		}
+	}
+	was, err := json.Marshal(cached.Fingerprint)
+	if err != nil {
+		return false
+	}
+	is, err := json.Marshal(now)
+
+	return err == nil && bytes.Equal(was, is)
+}
+
 // mapResult says what became of one package: how many tests it had, how many of
 // their mappings came from the cache, and whether the package can be selected
 // from.
@@ -258,13 +302,33 @@ type mapResult struct {
 	mapped bool
 }
 
-// mapPackage compiles a package's test binary once and runs each of its tests
-// against it, unless the cache already holds a mapping made from a binary with
-// the same build ID.
+// mapPackage maps a package's tests, from its cache entry where it can. A
+// package whose fingerprint equals its entry's is served without compiling
+// (see unchanged). Otherwise its test binary is compiled once: an entry made
+// from a binary with the same build ID is served, and any other mapping is
+// kept, shifted or remade test by test (see reusable) by running each test
+// against the binary.
 //
 // cacheDir is empty when the cache is unusable, in which case the mapping is
 // still made and simply not remembered.
 func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) mapResult {
+	var cached cachedPackage
+	hit := false
+	if cacheDir != "" {
+		cached, hit = loadCachedPackage(cacheDir, pkg.importPath)
+	}
+	// The fingerprint is taken before the compile, because an unchanged one
+	// makes the compile unnecessary: with the fingerprint and the build inputs
+	// both equal to the entry's, the build ID the compile would yield could
+	// only say that the checkout moved (see buildInputsOf), and the entry is
+	// what a compile and a fresh map would produce again, line for line.
+	n := c.reusableFrom(pkg, cached, hit)
+	if hit && unchanged(cached, n.fp) {
+		c.serveCached(tm, pkg.importPath, cached, cached.Compiled)
+
+		return mapResult{tests: len(cached.Tests), reused: len(cached.Tests), mapped: true}
+	}
+
 	compileStart := time.Now()
 	binary, err := c.compileTests(pkg)
 	compiled := time.Since(compileStart)
@@ -284,23 +348,20 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	if err != nil {
 		log.Errorf("cannot identify the test binary of %s, so its mapping will not be cached: %v\n",
 			pkg.importPath, err)
-	}
-	var cached cachedPackage
-	hit := false
-	if id != "" && cacheDir != "" {
-		cached, hit = loadCachedPackage(cacheDir, pkg.importPath)
+		// Without an identity the entry can neither be trusted nor replaced.
+		hit, n.reuse = false, nil
 	}
 	if hit && cached.BuildID == id {
-		// A hit writes nothing back. The file is already the answer, which is
-		// what makes it impossible for this run to evict another package's.
-		for name, profile := range cached.Tests {
-			id := TestID{Pkg: pkg.importPath, Name: name}
-			tm.profiles[id] = profile
-			if d, ok := cached.Durations[name]; ok {
-				tm.durations[id] = d
+		c.serveCached(tm, pkg.importPath, cached, compiled)
+		// An entry from before compile times were kept is otherwise compiled
+		// on every run: record this run's, so the next one can skip it. It is
+		// the package's own file, rewritten with what it already says.
+		if cached.Compiled <= 0 && cached.Fingerprint.Whole != "" {
+			cached.Compiled = compiled
+			if err := cached.save(cacheDir); err != nil {
+				log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)
 			}
 		}
-		tm.compiled[pkg.importPath] = compiled
 
 		return mapResult{tests: len(cached.Tests), reused: len(cached.Tests), mapped: true}
 	}
@@ -311,8 +372,6 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 
 		return mapResult{}
 	}
-
-	n := c.reusableFrom(pkg, cached, hit)
 
 	complete, attributable, reused := true, true, 0
 	mapped := make(map[string]Profile, len(names))
@@ -378,7 +437,7 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	if id != "" && cacheDir != "" {
 		entry := cachedPackage{
 			Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id,
-			Fingerprint: fp, Tests: mapped, Deps: deps, Durations: durations,
+			Fingerprint: fp, Tests: mapped, Deps: deps, Durations: durations, Compiled: compiled,
 		}
 		if err := entry.save(cacheDir); err != nil {
 			log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)
