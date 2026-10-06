@@ -22,6 +22,7 @@ package app
 
 import (
 	"math"
+	"time"
 
 	"fixture/foo"
 )
@@ -166,6 +167,18 @@ func Define() any {
 	r := 1.5 * 2
 	return r
 }
+
+// d := 200 * time.Millisecond is a backoff seed. go/types records the
+// untyped 200 with the type it converts to, time.Duration, so the operand
+// that carries the constant's type is time.Millisecond, not the literal.
+// Nothing else gives the type under :=; spelled from the literal, d is an
+// int and the call below does not compile.
+func DefineTyped() any {
+	d := 200 * time.Millisecond
+	return waitFor(d)
+}
+
+func waitFor(d time.Duration) time.Duration { return d }
 
 func Unexported() any { return foo.Box{R: 1.5 * 2}.R } // refused *: foo's ratio has no name here
 
