@@ -58,3 +58,17 @@ func TestParse(t *testing.T) {
 		}
 	}
 }
+
+// TestShowsOutOfMemory holds each marker as out-of-memory output, and output
+// with none of them as not.
+func TestShowsOutOfMemory(t *testing.T) {
+	t.Parallel()
+	for _, m := range memlimit.OutOfMemoryMarkers {
+		if !memlimit.ShowsOutOfMemory("fatal error: runtime: " + m + "\n") {
+			t.Errorf("output with %q not seen as out of memory", m)
+		}
+	}
+	if memlimit.ShowsOutOfMemory("./x.go:3:1: undefined: y\n") {
+		t.Error("a compile error seen as out of memory")
+	}
+}

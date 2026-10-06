@@ -728,6 +728,37 @@ the default allowance in place.
     indicate an issue.
 [//]: # (@formatter:on)
 
+### Schemata build timeout
+
+:material-flag: `--schemata-build-timeout` · :material-sign-direction:
+Default: `""` (derived)
+
+The bound on the one schemata build of a whole run, as a Go duration. With
+[schemata](#schemata), every package the run tests is built once, together,
+before any mutant runs; this flag bounds that build. It is separate from
+`--compile-allowance`, which bounds the compile of one mutant on the
+per-mutant path: a mutant can make the compiler hang, but the schemata build
+compiles source that only switches mutants by id, so a slow build there means
+a slow or busy machine, not a bad mutant.
+
+Left empty, the bound is derived: the compile allowance times the number of
+test packages built, and never less than 10 minutes. The run's own context
+still bounds everything, so a hung toolchain cannot outlive the run.
+
+A package whose build is cut off — by this bound, by a signal, or by
+[`--test-memory-limit`](#test-memory-limit) — is built once more, at half the
+parallelism, with a fresh bound. Only a package that does not compile, or
+whose retry fails too, sends its mutants to the per-mutant path, and the log
+line says which: `does not compile`, `timed out after a retry` or
+`was killed after a retry`.
+
+```shell
+gremlins unleash --schemata-build-timeout=30m
+```
+
+A malformed or non-positive value is reported on stderr and ignored, leaving
+the derived bound in place.
+
 ### Test memory limit
 
 :material-flag: `--test-memory-limit` · :material-sign-direction:

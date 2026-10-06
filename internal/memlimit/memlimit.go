@@ -75,3 +75,27 @@ func Parse(s string) (Limit, error) {
 
 	return Limit(n.Num().Uint64()), nil
 }
+
+// OutOfMemoryMarkers are what a process prints when an address-space limit
+// stops it: the Go runtime when an allocation fails ("out of memory",
+// "cannot allocate memory") or when it cannot reserve its start-up address
+// space ("failed to reserve ...", "cannot reserve ..."), and the dynamic
+// loader when it cannot map a program at all ("failed to map segment").
+var OutOfMemoryMarkers = []string{
+	"out of memory",
+	"cannot allocate memory",
+	"failed to reserve",
+	"cannot reserve",
+	"failed to map segment",
+}
+
+// ShowsOutOfMemory reports whether s holds one of OutOfMemoryMarkers.
+func ShowsOutOfMemory(s string) bool {
+	for _, m := range OutOfMemoryMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+
+	return false
+}

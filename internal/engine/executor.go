@@ -116,8 +116,11 @@ type MutantExecutorDealer struct {
 	buildTags         string
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
-	dryRun            bool
-	testCPU           int
+	// schemataBuildTimeout bounds the whole schema build; zero derives the
+	// bound from compileAllowance and the number of packages built.
+	schemataBuildTimeout time.Duration
+	dryRun               bool
+	testCPU              int
 	// testMemoryLimit caps the address space of every test process the
 	// dealer's executors and schema preparation start.
 	testMemoryLimit memlimit.Limit
@@ -259,11 +262,12 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 		// The floor is applied first and the ceiling second, so
 		// --timeout-max wins a contradictory pair rather than the order
 		// of the two flags deciding it.
-		testExecutionTime: cappedExecutionTime(timeout),
-		compileAllowance:  compileAllowance(),
-		execContext:       exec.CommandContext,
-		overlays:          newOverlayCache(),
-		schemaCounts:      &schemaCounts{},
+		testExecutionTime:    cappedExecutionTime(timeout),
+		compileAllowance:     compileAllowance(),
+		schemataBuildTimeout: schemataBuildTimeout(),
+		execContext:          exec.CommandContext,
+		overlays:             newOverlayCache(),
+		schemaCounts:         &schemaCounts{},
 	}
 
 	jd.testMemoryLimit = testMemoryLimit()
@@ -318,6 +322,15 @@ func compileAllowance() time.Duration {
 	if !ok {
 		return DefaultCompileAllowance
 	}
+
+	return d
+}
+
+// schemataBuildTimeout returns the bound on the whole schema build of a run,
+// configured with --schemata-build-timeout; zero, when it is unset or
+// invalid, derives the bound in schemata.BuildTimeout.
+func schemataBuildTimeout() time.Duration {
+	d, _ := positiveDuration(configuration.UnleashSchemataBuildTimeoutKey, "deriving the schemata build timeout")
 
 	return d
 }

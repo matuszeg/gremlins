@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
+	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/memlimit"
 	"github.com/go-gremlins/gremlins/internal/procgroup"
 )
@@ -75,16 +76,32 @@ type Build struct {
 // files RewritePackage returned for it, keyed by absolute path under modRoot
 // -- and compiles the test binary of every package in testPkgs in the copy
 // with `go test -c -overlay`, which lays the rewritten files over the copy's,
-// at most runtime.NumCPU() at a time, all within allowance (a path listed
+// at most runtime.NumCPU() at a time, all within timeout (a path listed
 // twice is built once). Each build's go command, and the compiler and linker
 // it starts, run with their address space capped at memLimit, zero for none;
-// the caller is not capped. A package
-// whose files cannot be written or whose binary does not build has its error
-// in the returned map and no binary; the other packages keep theirs. A
+// the caller is not capped. A package whose build was cut off -- by timeout,
+// a signal or the memory limit -- is built once more, at most half as many
+// at a time, within a fresh timeout; a package whose source does not compile
+// is not. A package whose files cannot be written or whose binary does not
+// build has its error in the returned map and no binary; the other packages
+// keep theirs. A build error's first line says whether the package does not
+// compile, timed out or was killed, and whether that was after a retry. A
 // package that builds without test files is in Build.NoTests, with neither.
 // If the module cannot be copied, every package has that error.
 func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[string]map[string][]byte,
-	testPkgs []string, allowance time.Duration, memLimit memlimit.Limit,
+	testPkgs []string, timeout time.Duration, memLimit memlimit.Limit,
+) (Build, map[string]error) {
+	return buildAll(ctx, modRoot, workDir, tags, rewritten, testPkgs, timeout, memLimit, buildTest)
+}
+
+// buildFunc compiles the test binary of pkg, in the module copy dir with the
+// overlay file laid over it, to bin, with goTmp as the go command's GOTMPDIR:
+// buildTest's signature, and the seam the tests replace it through.
+type buildFunc func(ctx context.Context, dir, goTmp, overlay, bin, tags, pkg string, memLimit memlimit.Limit) error
+
+// buildAll is BuildAll with the build of each package done by build.
+func buildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[string]map[string][]byte,
+	testPkgs []string, timeout time.Duration, memLimit memlimit.Limit, build buildFunc,
 ) (Build, map[string]error) {
 	// A path listed twice would start two `go test -c` writing one binary.
 	testPkgs = uniquePackages(testPkgs)
@@ -139,43 +156,146 @@ func BuildAll(ctx context.Context, modRoot, workDir, tags string, rewritten map[
 		return failAll(err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, allowance)
-	defer cancel()
 	names := binaryNames(testPkgs)
 	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
-	failed := maps.Clone(errs) // read below while the builds write errs
+	// round builds pkgs, at most parallel at a time, all within timeout,
+	// recording each binary in b and returning each failure.
+	round := func(pkgs []string, parallel int) map[string]error {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		failed := map[string]error{}
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, parallel)
+		for _, p := range pkgs {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				bin := filepath.Join(binDir, names[p])
+				err := build(ctx, dir, goTmp, overlay, bin, tags, p, memLimit)
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case errors.Is(err, ErrNoTestBinary):
+					b.NoTests[p] = true
+				case err != nil:
+					failed[p] = err
+				default:
+					b.Binaries[p] = bin
+				}
+			}()
+		}
+		wg.Wait()
+
+		return failed
+	}
+
+	var todo []string
 	for _, p := range testPkgs {
-		if failed[p] != nil {
+		if errs[p] == nil {
+			todo = append(todo, p)
+		}
+	}
+	// A build cut off -- at the deadline, by a signal, by the memory limit
+	// -- says nothing about the source, only about the machine: it gets one
+	// more go, at half the parallelism, with a fresh bound. A compile error
+	// would only recur. Once the run itself has ended, nothing built would
+	// be used, so nothing is retried and the error stays the run's.
+	first := round(todo, runtime.NumCPU())
+	var retry []string
+	for _, p := range slices.Sorted(maps.Keys(first)) {
+		err := first[p]
+		switch kind := classifyBuild(err); {
+		case ctx.Err() != nil:
+			errs[p] = err
+		case kind == buildDoesNotCompile:
+			errs[p] = &buildError{pkg: p, kind: kind, err: err}
+		default:
+			retry = append(retry, p)
+		}
+	}
+	if len(retry) == 0 {
+		return b, errs
+	}
+	log.Infof("schemata: rebuilding %d packages whose build was cut off\n", len(retry))
+	for p, err := range round(retry, max(1, runtime.NumCPU()/2)) {
+		if ctx.Err() != nil {
+			errs[p] = err
+
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			bin := filepath.Join(binDir, names[p])
-			err := buildTest(ctx, dir, goTmp, overlay, bin, tags, p, memLimit)
-			mu.Lock()
-			defer mu.Unlock()
-			if errors.Is(err, ErrNoTestBinary) {
-				b.NoTests[p] = true
-
-				return
-			}
-			if err != nil {
-				errs[p] = err
-
-				return
-			}
-			b.Binaries[p] = bin
-		}()
+		errs[p] = &buildError{pkg: p, kind: classifyBuild(err), retried: true, err: err}
 	}
-	wg.Wait()
 
 	return b, errs
 }
+
+// buildFailure is why a package's test binary did not build.
+type buildFailure int
+
+const (
+	// buildDoesNotCompile is a failure the source caused: retrying it
+	// would only fail again.
+	buildDoesNotCompile buildFailure = iota
+	// buildTimedOut is a build its bound cut off.
+	buildTimedOut
+	// buildKilled is a build a signal or the memory limit stopped.
+	buildKilled
+)
+
+func (k buildFailure) String() string {
+	switch k {
+	case buildTimedOut:
+		return "timed out"
+	case buildKilled:
+		return "was killed"
+	case buildDoesNotCompile:
+	}
+
+	return "does not compile"
+}
+
+// classifyBuild says why the build that returned err failed: its bound
+// ended (the context's error), or the go command or a compiler or linker it
+// started was stopped -- by a signal, which the go command reports as
+// "signal: killed" for a child, or by the memory limit, which shows in the
+// output -- or else the source does not compile.
+func classifyBuild(err error) buildFailure {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return buildTimedOut
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == -1 {
+		return buildKilled
+	}
+	if msg := err.Error(); strings.Contains(msg, "signal: killed") || memlimit.ShowsOutOfMemory(msg) {
+		return buildKilled
+	}
+
+	return buildDoesNotCompile
+}
+
+// buildError is the failure of a package's build, with why it failed on its
+// first line -- the line a netted mutant's log line carries -- and the
+// build's own error, holding its output, below.
+type buildError struct {
+	pkg     string
+	kind    buildFailure
+	retried bool
+	err     error
+}
+
+func (e *buildError) Error() string {
+	retried := ""
+	if e.retried {
+		retried = " after a retry"
+	}
+
+	return fmt.Sprintf("schemata: build %s %s%s\n%v", e.pkg, e.kind, retried, e.err)
+}
+
+func (e *buildError) Unwrap() error { return e.err }
 
 // uniquePackages returns pkgs without repeats, each at its first position.
 func uniquePackages(pkgs []string) []string {
@@ -303,3 +423,17 @@ func binaryNames(pkgs []string) map[string]string {
 
 	return names
 }
+
+// BuildTimeout is the bound on the whole schema build of pkgs packages:
+// configured when it is positive, otherwise allowance, the per-mutant
+// compile allowance, for each package, but never under minBuildTimeout.
+func BuildTimeout(configured, allowance time.Duration, pkgs int) time.Duration {
+	if configured > 0 {
+		return configured
+	}
+
+	return max(allowance*time.Duration(pkgs), minBuildTimeout)
+}
+
+// minBuildTimeout is the least bound BuildTimeout derives.
+const minBuildTimeout = 10 * time.Minute
