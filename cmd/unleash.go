@@ -23,7 +23,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -206,8 +209,9 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 
 	// Which packages a mutation could break is a question about imports, so it
 	// costs one `go list` and no test runs at all.
+	var graph *deps.Graph
 	if configuration.Get[bool](configuration.UnleashCrossPackageKey) {
-		graph, err := deps.New(exec.Command, c.ScanPath())
+		graph, err = deps.New(exec.Command, c.ScanPath())
 		if err != nil {
 			return report.Results{}, fmt.Errorf("failed to resolve the module's dependents: %w", err)
 		}
@@ -217,6 +221,9 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	// Which tests within those packages execute the mutated line is a question
 	// about coverage, and that is the expensive one.
 	if testSelectionRequested() {
+		if scope := mapScope(mod, fDiff, graph.Dependents); scope != nil {
+			coverage.WithMapScope(scope)(c)
+		}
 		testMap, err := c.BuildTestMap()
 		if err != nil {
 			return report.Results{}, fmt.Errorf("failed to map tests to the code they execute: %w", err)
@@ -245,6 +252,54 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	results := mut.Run(ctx)
 
 	return results, nil
+}
+
+// mapScope is the test map's scope for a --diff run: the packages of the
+// changed production files, which are the only ones that hold mutants, and,
+// through dependents, the packages whose tests --cross-package selects for
+// them. Files under testdata or vendor are never mutated, so they bring no
+// package in. Without a diff every package can hold a mutant: no scope. The
+// diff's paths are relative to the calling directory, as mutant positions are,
+// and a file's import path is its directory under the module, whatever its
+// package clause says.
+func mapScope(mod gomodule.GoModule, changes diff.Diff, dependents func(string) []string) []string {
+	if len(changes) == 0 {
+		return nil
+	}
+	in := map[string]bool{}
+	for file := range changes {
+		name := filepath.ToSlash(string(file))
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || underIgnoredDir(name) {
+			continue
+		}
+		pkg := mod.Name
+		if dir := filepath.ToSlash(filepath.Dir(filepath.Join(mod.CallingDir, name))); dir != "." {
+			pkg += "/" + dir
+		}
+		in[pkg] = true
+		for _, dep := range dependents(pkg) {
+			in[dep] = true
+		}
+	}
+	scope := make([]string, 0, len(in))
+	for pkg := range in {
+		scope = append(scope, pkg)
+	}
+	sort.Strings(scope)
+
+	return scope
+}
+
+// underIgnoredDir reports whether a slash-separated path runs through a
+// testdata or vendor directory, which the engine never mutates.
+func underIgnoredDir(name string) bool {
+	for _, part := range strings.Split(path.Dir(name), "/") {
+		if part == "testdata" || part == "vendor" {
+			return true
+		}
+	}
+
+	return false
 }
 
 // testSelectionRequested reports whether to build the test map.
