@@ -62,6 +62,9 @@ type cacheHarness struct {
 	// env is added to every fake command's environment: the delays the
 	// helper sleeps for, as compileDelayEnv and its siblings carry them.
 	env []string
+	// scope is the map scope a --diff run sets, as WithMapScope takes it;
+	// nil sets none.
+	scope []string
 }
 
 func newCacheHarness(t *testing.T) *cacheHarness {
@@ -129,8 +132,12 @@ func (h *cacheHarness) coverage(helper, buildIDs, pkg string) *coverage.Coverage
 		return cmd
 	}
 
-	return coverage.NewWithCmd(withEnv, h.t.TempDir(), mod,
-		coverage.WithTestMapCacheDir(h.cacheDir), coverage.WithStubTypes())
+	opts := []coverage.Option{coverage.WithTestMapCacheDir(h.cacheDir), coverage.WithStubTypes()}
+	if h.scope != nil {
+		opts = append(opts, coverage.WithMapScope(h.scope))
+	}
+
+	return coverage.NewWithCmd(withEnv, h.t.TempDir(), mod, opts...)
 }
 
 // testsRun returns the tests the last build actually executed, sorted.

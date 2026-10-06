@@ -118,13 +118,51 @@ func TestGatherGathersAnUnmappedPackageAlone(t *testing.T) {
 	}
 }
 
+// calcPkg is the fixture package the map-scope cases keep in or leave out.
+const calcPkg = "example.com/calc"
+
+// A --diff run maps only the packages that can hold its mutants. A package
+// outside that scope holds none, so it needs no coverage at all: it is not
+// gathered for being unmapped. One inside it that the map failed on is
+// gathered, alone.
+func TestGatherComposesWithTheMapScope(t *testing.T) {
+	t.Run("an out-of-scope package is not gathered", func(t *testing.T) {
+		h := newCacheHarness(t)
+		// The root package's tests cannot be mapped, but it is not in scope.
+		h.scope = []string{scoped, calcPkg}
+
+		_, tm := gather(t, h.coverage("TestTestMapHelperProcessFailingTest", "", ""), true)
+
+		if tm.Mapped("example.com") {
+			t.Fatal("an out-of-scope package should be left unmapped")
+		}
+		if got := h.gathers(); len(got) != 0 {
+			t.Errorf("want nothing gathered, got %v", got)
+		}
+	})
+
+	t.Run("an in-scope package the map failed on is gathered alone", func(t *testing.T) {
+		h := newCacheHarness(t)
+		h.scope = []string{"example.com", scoped}
+
+		_, tm := gather(t, h.coverage("TestTestMapHelperProcessFailingTest", "", ""), true)
+
+		if tm.Mapped(calcPkg) {
+			t.Fatal("an out-of-scope package should be left unmapped")
+		}
+		if diff := cmp.Diff([]string{"example.com"}, h.gathers()); diff != "" {
+			t.Errorf("want only the in-scope unmapped package gathered (-want +got):\n%s", diff)
+		}
+	})
+}
+
 // A map entry with no durations cannot give a baseline, so its package is
 // gathered rather than timed at zero.
 func TestGatherGathersAPackageWhoseDurationsAreMissing(t *testing.T) {
 	h := newCacheHarness(t)
 	h.build("TestTestMapHelperProcess", "")
 
-	path := h.cacheFile("example.com/vm")
+	path := h.cacheFile(scoped)
 	// #nosec G304 - the path comes from a directory this test created
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -148,10 +186,10 @@ func TestGatherGathersAPackageWhoseDurationsAreMissing(t *testing.T) {
 
 	_, tm := gather(t, h.coverage("TestTestMapHelperProcess", "", ""), true)
 
-	if !tm.Mapped("example.com/vm") {
+	if !tm.Mapped(scoped) {
 		t.Fatal("the entry should still be reused as a mapping")
 	}
-	if diff := cmp.Diff([]string{"example.com/vm"}, h.gathers()); diff != "" {
+	if diff := cmp.Diff([]string{scoped}, h.gathers()); diff != "" {
 		t.Errorf("want only the package without durations gathered (-want +got):\n%s", diff)
 	}
 }
@@ -162,7 +200,7 @@ func TestGatherGathersAPackageWhoseDurationsAreMissing(t *testing.T) {
 // slowly as the map's own compile and runs take.
 func TestGatherBaselineIsNeverBelowAGatherOfTheSameScope(t *testing.T) {
 	// The root package cannot be scoped to alone here: it is the module root.
-	scopes := []string{"", "example.com/vm", "example.com/calc"}
+	scopes := []string{"", scoped, calcPkg}
 	for _, scope := range scopes {
 		t.Run("scope "+scope, func(t *testing.T) {
 			h := newCacheHarness(t)
