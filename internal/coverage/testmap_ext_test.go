@@ -327,6 +327,9 @@ func TestBuildTestMap(t *testing.T) {
 	})
 }
 
+// scoped is the one fixture package the scope tests keep.
+const scoped = "example.com/vm"
+
 // A --diff run has mutants only in the packages its changed files belong to,
 // so mapping the rest is work no mutant reads: on a 139-package module it was
 // most of a warm map's 5m34s. A package left out is unmapped, never "mapped
@@ -334,9 +337,7 @@ func TestBuildTestMap(t *testing.T) {
 // suite (TestSelectionFallsBackToTheWholeSuite, "when the mutated package could
 // not be mapped") rather than running nothing.
 func TestBuildTestMapMapsOnlyThePackagesInScope(t *testing.T) {
-	const scoped = "example.com/vm"
-	tm := buildMap(t, "TestTestMapHelperProcess",
-		coverage.WithMapScope(func(importPath string) bool { return importPath == scoped }))
+	tm := buildMap(t, "TestTestMapHelperProcess", coverage.WithMapScope([]string{scoped}))
 
 	if !tm.Mapped(scoped) {
 		t.Error("expected the package in scope to be mapped")
@@ -348,6 +349,26 @@ func TestBuildTestMapMapsOnlyThePackagesInScope(t *testing.T) {
 	}
 	if got, all := tm.Len(), buildMap(t, "TestTestMapHelperProcess").Len(); got == 0 || got >= all {
 		t.Errorf("want only the scoped package's tests mapped: got %d of the unscoped %d", got, all)
+	}
+}
+
+// A scoped package the module listing does not return means the diff's paths
+// and the listing disagree on what a package is. Nothing is mapped for it
+// either way, so the run is unaffected, but it is said out loud rather than
+// matching nothing in silence.
+func TestBuildTestMapNamesAScopedPackageTheListingLacks(t *testing.T) {
+	var out bytes.Buffer
+	log.Init(&out, &out)
+	t.Cleanup(log.Reset)
+	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
+	cov := coverage.NewWithCmd(fakeGoCommand("TestTestMapHelperProcess", fixtureRoot(t)), t.TempDir(), mod,
+		coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes(),
+		coverage.WithMapScope([]string{scoped, "example.com/nowhere"}))
+	if _, err := cov.BuildTestMap(); err != nil {
+		t.Fatalf("BuildTestMap() error: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, "example.com/nowhere") || strings.Contains(got, "lacks "+scoped) {
+		t.Errorf("want the log to name only the unlisted package, got:\n%s", got)
 	}
 }
 

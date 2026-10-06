@@ -21,7 +21,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
@@ -196,8 +198,8 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	// holds no mutant in this run, so it is neither mapped nor gathered.
 	selection := testSelectionRequested()
 	if selection {
-		if inScope := mapScope(mod, fDiff, graph.Dependents); inScope != nil {
-			coverage.WithMapScope(inScope)(c)
+		if scope := mapScope(mod, fDiff, graph.Dependents); scope != nil {
+			coverage.WithMapScope(scope)(c)
 		}
 	}
 	cProfile, testMap, err := c.Gather(selection)
@@ -229,31 +231,49 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 // mapScope is the test map's scope for a --diff run: the packages of the
 // changed production files, which are the only ones that hold mutants, and,
 // through dependents, the packages whose tests --cross-package selects for
-// them. Without a diff every package can hold a mutant, so there is no scope.
-// The diff's paths are relative to the calling directory, as mutant positions
-// are, and a file's import path is its directory under the module, whatever
-// its package clause says.
-func mapScope(mod gomodule.GoModule, changes diff.Diff, dependents func(string) []string) func(importPath string) bool {
+// them. Files under testdata or vendor are never mutated, so they bring no
+// package in. Without a diff every package can hold a mutant: no scope. The
+// diff's paths are relative to the calling directory, as mutant positions are,
+// and a file's import path is its directory under the module, whatever its
+// package clause says.
+func mapScope(mod gomodule.GoModule, changes diff.Diff, dependents func(string) []string) []string {
 	if len(changes) == 0 {
 		return nil
 	}
 	in := map[string]bool{}
 	for file := range changes {
-		name := string(file)
-		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		name := filepath.ToSlash(string(file))
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || underIgnoredDir(name) {
 			continue
 		}
 		pkg := mod.Name
-		if dir := filepath.Dir(filepath.Join(mod.CallingDir, name)); dir != "." {
-			pkg += "/" + filepath.ToSlash(dir)
+		if dir := filepath.ToSlash(filepath.Dir(filepath.Join(mod.CallingDir, name))); dir != "." {
+			pkg += "/" + dir
 		}
 		in[pkg] = true
 		for _, dep := range dependents(pkg) {
 			in[dep] = true
 		}
 	}
+	scope := make([]string, 0, len(in))
+	for pkg := range in {
+		scope = append(scope, pkg)
+	}
+	sort.Strings(scope)
 
-	return func(importPath string) bool { return in[importPath] }
+	return scope
+}
+
+// underIgnoredDir reports whether a slash-separated path runs through a
+// testdata or vendor directory, which the engine never mutates.
+func underIgnoredDir(name string) bool {
+	for _, part := range strings.Split(path.Dir(name), "/") {
+		if part == "testdata" || part == "vendor" {
+			return true
+		}
+	}
+
+	return false
 }
 
 // testSelectionRequested reports whether to build the test map.
