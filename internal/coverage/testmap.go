@@ -177,15 +177,8 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		callingDir: c.mod.CallingDir,
 	}
 
-	if c.inScope != nil {
-		var scoped []testPackage
-		for _, pkg := range pkgs {
-			if c.inScope(pkg.importPath) {
-				scoped = append(scoped, pkg)
-			}
-		}
-		log.Infof("Mapping %d of %d packages: the rest hold no mutant in scope\n", len(scoped), len(pkgs))
-		pkgs = scoped
+	if c.scope != nil {
+		pkgs = c.scopePackages(pkgs)
 	}
 
 	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))
@@ -211,6 +204,34 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	log.Infof("Mapped %d of %d tests in %s (%d reused from the cache)\n", tm.Len(), done, tm.elapsed, reused)
 
 	return tm, nil
+}
+
+// scopePackages keeps the listed packages the map scope names. A scoped
+// package the listing lacks matches nothing either way, but it means the
+// diff's paths and the listing disagree on what a package is, so it is named.
+func (c *Coverage) scopePackages(pkgs []testPackage) []testPackage {
+	want := make(map[string]bool, len(c.scope))
+	for _, p := range c.scope {
+		want[p] = true
+	}
+	var scoped []testPackage
+	for _, pkg := range pkgs {
+		if want[pkg.importPath] {
+			scoped = append(scoped, pkg)
+			delete(want, pkg.importPath)
+		}
+	}
+	if len(want) > 0 {
+		missing := make([]string, 0, len(want))
+		for p := range want {
+			missing = append(missing, p)
+		}
+		sort.Strings(missing)
+		log.Infof("The diff names packages the module listing lacks, so none of them is mapped: %s\n", strings.Join(missing, ", "))
+	}
+	log.Infof("Mapping %d of %d packages: the rest hold no mutant in scope\n", len(scoped), len(pkgs))
+
+	return scoped
 }
 
 // mapResult says what became of one package: how many tests it had, how many of

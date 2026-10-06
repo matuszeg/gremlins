@@ -53,7 +53,7 @@ type Coverage struct {
 	buildTags       string
 	coverPkg        string
 	cacheDir        string
-	inScope         func(importPath string) bool
+	scope           []string
 	crossPackage    bool
 	integrationMode bool
 
@@ -97,13 +97,13 @@ func WithTestMapCacheDir(dir string) Option {
 	}
 }
 
-// WithMapScope limits the test map to the packages inScope accepts. A --diff
+// WithMapScope limits the test map to the packages importPaths names. A --diff
 // run has mutants only in the packages its changed files belong to, and
 // mapping the rest compiles and runs tests no mutant will read. A package left
 // out is unmapped, so a mutant there falls back to its whole suite.
-func WithMapScope(inScope func(importPath string) bool) Option {
+func WithMapScope(importPaths []string) Option {
 	return func(c *Coverage) *Coverage {
-		c.inScope = inScope
+		c.scope = importPaths
 
 		return c
 	}
