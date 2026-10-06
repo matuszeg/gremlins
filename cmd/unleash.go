@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -179,8 +180,9 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 
 	// Which packages a mutation could break is a question about imports, so it
 	// costs one `go list` and no test runs at all.
+	var graph *deps.Graph
 	if configuration.Get[bool](configuration.UnleashCrossPackageKey) {
-		graph, err := deps.New(exec.Command, c.ScanPath())
+		graph, err = deps.New(exec.Command, c.ScanPath())
 		if err != nil {
 			return report.Results{}, fmt.Errorf("failed to resolve the module's dependents: %w", err)
 		}
@@ -190,8 +192,14 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	// Which tests within those packages execute the mutated line is a question
 	// about coverage, and that is the expensive one. With selection the map
 	// that answers it is built inside Gather, and stands in for the coverage
-	// gather wherever it can.
+	// gather wherever it can. The map scope is set first: a package outside it
+	// holds no mutant in this run, so it is neither mapped nor gathered.
 	selection := testSelectionRequested()
+	if selection {
+		if inScope := mapScope(mod, fDiff, graph.Dependents); inScope != nil {
+			coverage.WithMapScope(inScope)(c)
+		}
+	}
 	cProfile, testMap, err := c.Gather(selection)
 	if err != nil {
 		return report.Results{}, err
@@ -216,6 +224,36 @@ func run(ctx context.Context, mod gomodule.GoModule, workDir string) (report.Res
 	results := mut.Run(ctx)
 
 	return results, nil
+}
+
+// mapScope is the test map's scope for a --diff run: the packages of the
+// changed production files, which are the only ones that hold mutants, and,
+// through dependents, the packages whose tests --cross-package selects for
+// them. Without a diff every package can hold a mutant, so there is no scope.
+// The diff's paths are relative to the calling directory, as mutant positions
+// are, and a file's import path is its directory under the module, whatever
+// its package clause says.
+func mapScope(mod gomodule.GoModule, changes diff.Diff, dependents func(string) []string) func(importPath string) bool {
+	if len(changes) == 0 {
+		return nil
+	}
+	in := map[string]bool{}
+	for file := range changes {
+		name := string(file)
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		pkg := mod.Name
+		if dir := filepath.Dir(filepath.Join(mod.CallingDir, name)); dir != "." {
+			pkg += "/" + filepath.ToSlash(dir)
+		}
+		in[pkg] = true
+		for _, dep := range dependents(pkg) {
+			in[dep] = true
+		}
+	}
+
+	return func(importPath string) bool { return in[importPath] }
 }
 
 // testSelectionRequested reports whether to build the test map.

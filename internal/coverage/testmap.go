@@ -191,6 +191,17 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 		callingDir: c.mod.CallingDir,
 	}
 
+	if c.inScope != nil {
+		var scoped []testPackage
+		for _, pkg := range pkgs {
+			if c.inScope(pkg.importPath) {
+				scoped = append(scoped, pkg)
+			}
+		}
+		log.Infof("Mapping %d of %d packages: the rest hold no mutant in scope\n", len(scoped), len(pkgs))
+		pkgs = scoped
+	}
+
 	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))
 
 	done, reused := 0, 0
