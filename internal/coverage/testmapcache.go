@@ -99,13 +99,17 @@ const cacheVersion = 12
 // ImportPath is stored as well as hashed into the file name, so that a file
 // found under the wrong name is a miss rather than another package's answer.
 type cachedPackage struct {
-	Tests       map[string]Profile       `json:"tests"`
-	Deps        map[string][]string      `json:"deps,omitempty"`
-	Durations   map[string]time.Duration `json:"durations,omitempty"`
-	ImportPath  string                   `json:"import_path"`
-	BuildID     string                   `json:"build_id"`
-	Fingerprint fingerprint              `json:"fingerprint"`
-	Version     int                      `json:"version"`
+	Tests     map[string]Profile       `json:"tests"`
+	Deps      map[string][]string      `json:"deps,omitempty"`
+	Durations map[string]time.Duration `json:"durations,omitempty"`
+	// Compiled is how long the package's test binary took to compile when it
+	// was mapped. A hit that skips the compile reports it in its place, so the
+	// package stays in the suite baseline; an entry without one is compiled.
+	Compiled    time.Duration `json:"compiled,omitempty"`
+	ImportPath  string        `json:"import_path"`
+	BuildID     string        `json:"build_id"`
+	Fingerprint fingerprint   `json:"fingerprint"`
+	Version     int           `json:"version"`
 }
 
 // cacheKey covers what changes the meaning of every entry at once rather than

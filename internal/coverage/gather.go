@@ -121,7 +121,9 @@ func (c *Coverage) runFromTestMap(tm *TestMap) (Result, error) {
 //
 //	compile(p) + Σ duration(t) for every test t of p
 //
-// where compile(p) is how long this run's `go test -c` of p took, and
+// where compile(p) is how long this run's `go test -c` of p took, or, for a
+// package served unchanged from the cache without compiling, how long the
+// compile took when its entry was mapped; and
 // duration(t) is the wall time of the process that ran t alone during
 // mapping — start, package initialisation, TestMain and the test, to exit.
 //
@@ -131,7 +133,10 @@ func (c *Coverage) runFromTestMap(tm *TestMap) (Result, error) {
 //   - The gather builds each package's test binary; compile(p) is the same
 //     build, instrumented for at least as much (p and its in-module
 //     dependencies, against -cover's p), measured cold in the same place in
-//     the run: the first build of p after the module download.
+//     the run: the first build of p after the module download. A recorded
+//     compile(p) was measured that way on the run that mapped p, possibly on
+//     another machine; the timeout it feeds bounds only the test run, so a
+//     difference moves padding, not a verdict.
 //   - The gather runs each package's suite once, in one process, sharing
 //     initialisation and TestMain across its tests and overlapping its
 //     t.Parallel ones. Σ duration(t) runs the same tests one per process and
@@ -140,13 +145,15 @@ func (c *Coverage) runFromTestMap(tm *TestMap) (Result, error) {
 //     its wall time shorter than the sum of the packages' work; the baseline
 //     takes the sum.
 //
-// A package is returned to be gathered instead when it is unmapped, when this
-// run did not compile it, or when any of its tests has no recorded duration:
-// a missing term is never read as zero.
+// A package is returned to be gathered instead when it is unmapped, when it
+// has no compile time (neither this run's nor one its cache entry recorded),
+// or when any of its tests has no recorded duration: a missing term is never
+// read as zero.
 //
 // What the sum cannot see is a machine slower, or busier, than the one that
-// recorded a reused duration; compile(p) is always measured afresh, and the
-// slack in the per-process overheads is what covers the rest.
+// recorded a reused duration or compile time. A package served unchanged from
+// the cache is not compiled at all, so its compile(p) is the recorded one too;
+// the slack in the per-process overheads is what covers the rest.
 func (t *TestMap) SuiteBaseline() (time.Duration, []string) {
 	perPkg := make(map[string]time.Duration, len(t.withTests))
 	untimed := make(map[string]bool)
