@@ -119,6 +119,41 @@ func TestGatherGathersAnUnmappedPackageAlone(t *testing.T) {
 	}
 }
 
+// A --diff run maps only the packages that can hold its mutants. A package
+// outside that scope holds none, so it needs no coverage at all: it is not
+// gathered for being unmapped. One inside it that the map failed on is
+// gathered, alone.
+func TestGatherComposesWithTheMapScope(t *testing.T) {
+	t.Run("an out-of-scope package is not gathered", func(t *testing.T) {
+		h := newCacheHarness(t)
+		// The root package's tests cannot be mapped, but it is not in scope.
+		h.scope = []string{"example.com/vm", "example.com/calc"}
+
+		_, tm := gather(t, h.coverage("TestTestMapHelperProcessFailingTest", "", ""), true)
+
+		if tm.Mapped("example.com") {
+			t.Fatal("an out-of-scope package should be left unmapped")
+		}
+		if got := h.gathers(); len(got) != 0 {
+			t.Errorf("want nothing gathered, got %v", got)
+		}
+	})
+
+	t.Run("an in-scope package the map failed on is gathered alone", func(t *testing.T) {
+		h := newCacheHarness(t)
+		h.scope = []string{"example.com", "example.com/vm"}
+
+		_, tm := gather(t, h.coverage("TestTestMapHelperProcessFailingTest", "", ""), true)
+
+		if tm.Mapped("example.com/calc") {
+			t.Fatal("an out-of-scope package should be left unmapped")
+		}
+		if diff := cmp.Diff([]string{"example.com"}, h.gathers()); diff != "" {
+			t.Errorf("want only the in-scope unmapped package gathered (-want +got):\n%s", diff)
+		}
+	})
+}
+
 // A map entry with no durations cannot give a baseline, so its package is
 // gathered rather than timed at zero.
 func TestGatherGathersAPackageWhoseDurationsAreMissing(t *testing.T) {
