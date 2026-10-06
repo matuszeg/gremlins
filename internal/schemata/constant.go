@@ -389,9 +389,9 @@ func operationOperand(info *types.Info, e ast.Expr) ast.Expr {
 		}
 		lt, rt := info.Types[e.X].Type, info.Types[e.Y].Type
 		switch {
-		case !untyped(lt):
+		case !writtenUntyped(info, e.X):
 			return e.X
-		case !untyped(rt):
+		case !writtenUntyped(info, e.Y):
 			return e.Y
 		case basicKind(rt) > basicKind(lt):
 			return e.Y
@@ -401,6 +401,41 @@ func operationOperand(info *types.Info, e ast.Expr) ast.Expr {
 	}
 
 	return e
+}
+
+// writtenUntyped reports whether e is an untyped constant as written: a
+// literal, an untyped named constant, or an operation of only those. Its
+// recorded type cannot tell: go/types records an untyped operand with the
+// type it is converted to, so the 200 in 200*time.Millisecond is recorded as
+// time.Duration. Taken as the typed operand, the literal was spelled as the
+// carrier of the constant's type, (200)*0, which is untyped again: under :=
+// the constant then defaulted to int and the package stopped compiling.
+func writtenUntyped(info *types.Info, e ast.Expr) bool {
+	switch e := ast.Unparen(e).(type) {
+	case *ast.BasicLit:
+		return true
+	case *ast.Ident:
+		return untypedConst(info.Uses[e])
+	case *ast.SelectorExpr:
+		return untypedConst(info.Uses[e.Sel])
+	case *ast.UnaryExpr:
+		return writtenUntyped(info, e.X)
+	case *ast.BinaryExpr:
+		if e.Op == token.SHL || e.Op == token.SHR {
+			return writtenUntyped(info, e.X)
+		}
+
+		return writtenUntyped(info, e.X) && writtenUntyped(info, e.Y)
+	}
+
+	return false
+}
+
+// untypedConst reports whether obj is a constant declared without a type.
+func untypedConst(obj types.Object) bool {
+	c, ok := obj.(*types.Const)
+
+	return ok && untyped(c.Type())
 }
 
 // basicKind is t's kind if t is a basic type, else Invalid.
