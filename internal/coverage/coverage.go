@@ -177,6 +177,12 @@ func (c *Coverage) downloadModules() error {
 }
 
 func (c *Coverage) executeCoverage() (time.Duration, error) {
+	return c.executeCoverageOf(c.scanPath())
+}
+
+// executeCoverageOf gathers coverage over the given package patterns into
+// filePath, and reports how long it took.
+func (c *Coverage) executeCoverageOf(targets ...string) (time.Duration, error) {
 	args := []string{"test"}
 	if c.buildTags != "" {
 		args = append(args, "-tags", c.buildTags)
@@ -185,7 +191,8 @@ func (c *Coverage) executeCoverage() (time.Duration, error) {
 		args = append(args, "-coverpkg", c.coverPkg)
 	}
 
-	args = append(args, "-cover", "-coverprofile", c.filePath(), c.scanPath())
+	args = append(args, "-cover", "-coverprofile", c.filePath())
+	args = append(args, targets...)
 	cmd := c.cmdContext("go", args...)
 
 	start := time.Now()

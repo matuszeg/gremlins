@@ -60,6 +60,18 @@ type TestMap struct {
 	mapped   map[string]struct{}
 	elapsed  time.Duration
 
+	// durations is how long each test's own mapping run took, measured when
+	// the mapping was made — this run, or the run that wrote the cache entry
+	// it was reused from. compiled is how long each mapped package's test
+	// binary took to compile in THIS run, which every run pays. withTests is
+	// every package the builder set out to map that has test files, mapped or
+	// not: the packages in scope, and so the only ones a run can need coverage
+	// of. Together they
+	// are what SuiteBaseline times the scope from.
+	durations map[TestID]time.Duration
+	compiled  map[string]time.Duration
+	withTests []string
+
 	// callingDir is what a caller's positions are relative to. The profiles are
 	// relative to the module root, so that a mapping means the same thing in a
 	// scoped run and a whole-module one — and so that one can read the other's
@@ -174,6 +186,8 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	tm := &TestMap{
 		profiles:   make(map[TestID]Profile),
 		mapped:     make(map[string]struct{}),
+		durations:  make(map[TestID]time.Duration),
+		compiled:   make(map[string]time.Duration),
 		callingDir: c.mod.CallingDir,
 	}
 
@@ -189,6 +203,7 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 
 			continue
 		}
+		tm.withTests = append(tm.withTests, pkg.importPath)
 		res := c.mapPackage(&pkg, tm, cacheDir)
 		done += res.tests
 		reused += res.reused
@@ -218,7 +233,9 @@ type mapResult struct {
 // cacheDir is empty when the cache is unusable, in which case the mapping is
 // still made and simply not remembered.
 func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) mapResult {
+	compileStart := time.Now()
 	binary, err := c.compileTests(pkg)
+	compiled := time.Since(compileStart)
 	if err != nil {
 		log.Errorf("cannot compile the tests of %s, so it will run its whole suite: %v\n", pkg.importPath, err)
 
@@ -245,8 +262,13 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		// A hit writes nothing back. The file is already the answer, which is
 		// what makes it impossible for this run to evict another package's.
 		for name, profile := range cached.Tests {
-			tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
+			id := TestID{Pkg: pkg.importPath, Name: name}
+			tm.profiles[id] = profile
+			if d, ok := cached.Durations[name]; ok {
+				tm.durations[id] = d
+			}
 		}
+		tm.compiled[pkg.importPath] = compiled
 
 		return mapResult{tests: len(cached.Tests), reused: len(cached.Tests), mapped: true}
 	}
@@ -262,10 +284,17 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 
 	complete, attributable, reused := true, true, 0
 	mapped := make(map[string]Profile, len(names))
+	durations := make(map[string]time.Duration, len(names))
 	deps := map[string][]string{}
 	for _, name := range names {
-		if profile, keep := n.reuse[name]; keep {
+		// A mapping is reused with the duration it was recorded with, since
+		// this run never times the test; one recorded without a duration is
+		// re-made rather than reused, so the entry written below has one for
+		// every test.
+		recorded, timed := cached.Durations[name]
+		if profile, keep := n.reuse[name]; keep && timed {
 			mapped[name] = profile
+			durations[name] = recorded
 			if keys := cached.Deps[name]; len(keys) > 0 {
 				deps[name] = keys
 			}
@@ -273,7 +302,9 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 
 			continue
 		}
+		runStart := time.Now()
 		got, err := c.profileForTest(pkg, name, n.sources)
+		ran := time.Since(runStart)
 		if err != nil {
 			log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n",
 				pkg.importPath, name, pkg.importPath, err)
@@ -282,6 +313,7 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 			continue
 		}
 		mapped[name] = got.profile
+		durations[name] = ran
 		if len(got.deps) > 0 {
 			deps[name] = got.deps
 		}
@@ -295,8 +327,11 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 		return mapResult{tests: len(names)}
 	}
 	for name, profile := range mapped {
-		tm.profiles[TestID{Pkg: pkg.importPath, Name: name}] = profile
+		id := TestID{Pkg: pkg.importPath, Name: name}
+		tm.profiles[id] = profile
+		tm.durations[id] = durations[name]
 	}
+	tm.compiled[pkg.importPath] = compiled
 	// A block that could not be placed means some test's record of what it
 	// executed is incomplete, and narrowing from it next time could keep a
 	// mapping the change reached. The mappings themselves are still right, so
@@ -311,7 +346,7 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	if id != "" && cacheDir != "" {
 		entry := cachedPackage{
 			Version: cacheVersion, ImportPath: pkg.importPath, BuildID: id,
-			Fingerprint: fp, Tests: mapped, Deps: deps,
+			Fingerprint: fp, Tests: mapped, Deps: deps, Durations: durations,
 		}
 		if err := entry.save(cacheDir); err != nil {
 			log.Errorf("cannot write the test map cache for %s: %v\n", pkg.importPath, err)

@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/spf13/viper"
@@ -83,6 +84,15 @@ const notMainEnv = "GREMLINS_TEST_NOT_MAIN"
 // writes, after dropping what the binary did not instrument: a block of a name
 // no package claims, as a //line directive can produce.
 const extraProfileEnv = "GREMLINS_TEST_EXTRA_PROFILE"
+
+// compileDelayEnv and runDelayEnv make the fake go's test-binary compile and
+// each test run take at least that long, as Go durations, so that a test can
+// reason about the times the map records. A fake coverage gather pays both, per
+// package it gathers: one compile, and one run of each of its tests.
+const (
+	compileDelayEnv = "GREMLINS_TEST_COMPILE_DELAY"
+	runDelayEnv     = "GREMLINS_TEST_RUN_DELAY"
+)
 
 // The fixture has real sources as well as real directories, because the map
 // cache reads them: what a package's source looked like when its map was made
@@ -479,7 +489,20 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
+	// A coverage gather: `go test ... -cover -coverprofile <file>
+	// <pkgs>`. It names the packages it gathered in the log, which is how a
+	// test sees whether one was issued and what for.
+	if cmd == "go" && hasFlag(os.Args, "mod") && hasFlag(os.Args, "download") {
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
+	if cmd == "go" && hasFlag(os.Args, "-cover") {
+		gatherAsGo(os.Args)
+		os.Exit(0) // skipcq: RVV-A0003
+	}
+
 	if cmd == "go" && hasFlag(os.Args, "-c") {
+		sleepFor(compileDelayEnv, 1)
 		out := flagValue(os.Args, "-o")
 		if uncompilablePkg != "" && strings.HasSuffix(out, binaryName(uncompilablePkg)) {
 			fmt.Fprintln(os.Stderr, "build failed")
@@ -505,6 +528,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 
 	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
 	recordInvocation("run " + run)
+	sleepFor(runDelayEnv, 1)
 	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)
 		os.Exit(1) // skipcq: RVV-A0003
@@ -523,6 +547,64 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	}
 	writeOrDie(flagValue(os.Args, "-test.coverprofile"), instrumentedOnly(cmd, profile))
 	os.Exit(0) // skipcq: RVV-A0003
+}
+
+// gatherAsGo answers a coverage gather over the packages named after the
+// profile path: it waits gatherDelayEnv once per package, and writes a profile
+// holding every block their tests execute.
+func gatherAsGo(args []string) {
+	file := flagValue(args, "-coverprofile")
+	var pkgs []string
+	for i, a := range args {
+		if a == "-coverprofile" {
+			pkgs = args[i+2:]
+
+			break
+		}
+	}
+	recordInvocation("gather " + strings.Join(pkgs, " "))
+	byPkg := map[string][]string{
+		"example.com":      {profileRangeDescending, profileRangeAscending},
+		"example.com/vm":   {profileSizeAscending},
+		"example.com/calc": {profileDouble, profileTriple},
+	}
+	out := "mode: set\n"
+	for _, p := range expandPatterns(pkgs) {
+		// A gather compiles the package's tests and runs its suite once.
+		sleepFor(compileDelayEnv, 1)
+		sleepFor(runDelayEnv, len(byPkg[p]))
+		for _, profile := range byPkg[p] {
+			out += strings.TrimPrefix(profile, "mode: set\n")
+		}
+	}
+	writeOrDie(file, out)
+}
+
+// expandPatterns turns the package patterns a gather names — "./...",
+// "./calc/..." or an import path — into the fixture's import paths.
+func expandPatterns(patterns []string) []string {
+	var pkgs []string
+	for _, p := range patterns {
+		switch {
+		case p == "./...":
+			pkgs = append(pkgs, "example.com", "example.com/vm", "example.com/calc")
+		case strings.HasPrefix(p, "./"):
+			pkgs = append(pkgs, "example.com/"+strings.TrimSuffix(strings.TrimPrefix(p, "./"), "/..."))
+		default:
+			pkgs = append(pkgs, p)
+		}
+	}
+
+	return pkgs
+}
+
+// sleepFor waits n times the duration the environment variable holds, if any.
+func sleepFor(env string, n int) {
+	d, err := time.ParseDuration(os.Getenv(env))
+	if err != nil {
+		return
+	}
+	time.Sleep(time.Duration(n) * d)
 }
 
 // instrumentedOnly drops the blocks of every package the binary was not
