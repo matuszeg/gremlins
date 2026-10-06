@@ -260,7 +260,7 @@ func (mu *Engine) prepareSchemata(ctx context.Context, d *MutantExecutorDealer, 
 		return plan, nil
 	}
 
-	plan, err := mu.prepare(ctx, mod, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance,
+	plan, err := mu.prepare(ctx, mod, workDir, d.buildTags, runnable, targets.testPkgs, d.compileAllowance, d.schemataBuildTimeout,
 		d.schemaNullRun(ctx, workDir, targets))
 	if err != nil {
 		return plan, err

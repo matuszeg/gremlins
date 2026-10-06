@@ -48,12 +48,14 @@ const (
 	UnleashTestSelectionKey      = "unleash.test-selection"
 	UnleashCrossPackageKey       = "unleash.cross-package"
 	UnleashSchemataKey           = "unleash.schemata"
-	UnleashExcludeFiles          = "unleash.exclude-files"
-	UnleashDiffRef               = "unleash.diff"
-	UnleashThresholdEfficacyKey  = "unleash.threshold.efficacy"
-	UnleashThresholdMCoverageKey = "unleash.threshold.mutant-coverage"
-	UnleashOutputDiffStatusesKey = "unleash.output-diff-statuses"
-	UnleashOnShutdownStatusKey   = "unleash.on-shutdown-status"
+	// UnleashSchemataBuildTimeoutKey bounds the whole schema build of a run.
+	UnleashSchemataBuildTimeoutKey = "unleash.schemata-build-timeout"
+	UnleashExcludeFiles            = "unleash.exclude-files"
+	UnleashDiffRef                 = "unleash.diff"
+	UnleashThresholdEfficacyKey    = "unleash.threshold.efficacy"
+	UnleashThresholdMCoverageKey   = "unleash.threshold.mutant-coverage"
+	UnleashOutputDiffStatusesKey   = "unleash.output-diff-statuses"
+	UnleashOnShutdownStatusKey     = "unleash.on-shutdown-status"
 )
 
 const (

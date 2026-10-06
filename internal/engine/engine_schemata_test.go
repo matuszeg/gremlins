@@ -193,11 +193,11 @@ func runParityWith(t *testing.T, mod gomodule.GoModule, prof coverage.Profile, w
 	d := engine.NewExecutorDealer(mod, wdd, time.Second, opts...)
 	var calls atomic.Int32
 	prepare := func(ctx context.Context, m gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
-		testPkgs func(string) []string, allowance time.Duration, nullRun schemata.NullRunFunc,
+		testPkgs func(string) []string, allowance, buildTimeout time.Duration, nullRun schemata.NullRunFunc,
 	) (schemata.Plan, error) {
 		calls.Add(1)
 
-		return schemata.Prepare(ctx, m, workDir, tags, runnable, testPkgs, allowance, nullRun)
+		return schemata.Prepare(ctx, m, workDir, tags, runnable, testPkgs, allowance, buildTimeout, nullRun)
 	}
 	eng := engine.New(mod, engine.CodeData{Cov: prof}, d, engine.WithPrepare(prepare))
 	res := eng.Run(context.Background())
@@ -473,5 +473,64 @@ func TestSchemataParityRelativeTarget(t *testing.T) {
 	}
 	if want := (report.SchemataSummary{Placed: runnable, PerMutant: 0}); *res.Schemata != want {
 		t.Errorf("schemata summary = %+v, want %+v", *res.Schemata, want)
+	}
+}
+
+// TestSchemataBuildTimeoutReachesPrepare runs --schemata with and without
+// --schemata-build-timeout and requires Prepare handed the configured bound,
+// zero (derive it) when it is unset or invalid, and the per-mutant compile
+// allowance unchanged beside it.
+//
+// It is not parallel: it sets the process-wide configuration.
+func TestSchemataBuildTimeoutReachesPrepare(t *testing.T) {
+	modRoot, err := filepath.Abs("testdata/parity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := gomodule.GoModule{Name: "parity", Root: modRoot, CallingDir: "."}
+	prof := parityProfile(t, mod)
+	testCases := map[string]struct {
+		settings                 map[string]any
+		wantAllowance, wantBuild time.Duration
+	}{
+		"unset":     {settings: map[string]any{}, wantAllowance: engine.DefaultCompileAllowance},
+		"set":       {settings: map[string]any{configuration.UnleashSchemataBuildTimeoutKey: "7m"}, wantAllowance: engine.DefaultCompileAllowance, wantBuild: 7 * time.Minute},
+		"malformed": {settings: map[string]any{configuration.UnleashSchemataBuildTimeoutKey: "soon"}, wantAllowance: engine.DefaultCompileAllowance},
+		"with_compile_allowance": {
+			settings:      map[string]any{configuration.UnleashCompileAllowanceKey: "3m", configuration.UnleashSchemataBuildTimeoutKey: "1h"},
+			wantAllowance: 3 * time.Minute, wantBuild: time.Hour,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			settings := map[string]any{
+				configuration.UnleashSchemataKey:   true,
+				configuration.UnleashTimeoutMaxKey: "1s",
+			}
+			maps.Copy(settings, tc.settings)
+			viperSet(settings)
+			defer viperReset()
+			wdd := workdir.NewCachedDealer(t.TempDir(), mod.Root)
+			defer wdd.Clean()
+			d := engine.NewExecutorDealer(mod, wdd, time.Second)
+			var gotAllowance, gotBuild time.Duration
+			calls := 0
+			prepare := func(ctx context.Context, m gomodule.GoModule, workDir, tags string, runnable []mutator.Mutator,
+				testPkgs func(string) []string, allowance, buildTimeout time.Duration, nullRun schemata.NullRunFunc,
+			) (schemata.Plan, error) {
+				calls++
+				gotAllowance, gotBuild = allowance, buildTimeout
+
+				return schemata.Prepare(ctx, m, workDir, tags, runnable, testPkgs, allowance, buildTimeout, nullRun)
+			}
+			eng := engine.New(mod, engine.CodeData{Cov: prof}, d, engine.WithPrepare(prepare))
+			eng.Run(context.Background())
+			if calls != 1 {
+				t.Fatalf("Prepare called %d times, want once", calls)
+			}
+			if gotAllowance != tc.wantAllowance || gotBuild != tc.wantBuild {
+				t.Errorf("Prepare got allowance %s, build timeout %s; want %s, %s", gotAllowance, gotBuild, tc.wantAllowance, tc.wantBuild)
+			}
+		})
 	}
 }

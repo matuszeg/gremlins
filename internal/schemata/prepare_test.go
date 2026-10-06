@@ -243,7 +243,7 @@ func TestPrepare(t *testing.T) {
 	log.Init(&out, &eOut)
 	defer log.Reset()
 
-	plan, err := schemata.Prepare(context.Background(), mod, workDir, "", in, ownPackage, 2*time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), mod, workDir, "", in, ownPackage, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestPrepareNets(t *testing.T) {
 				testPkgs = ownPackage
 			}
 			runs := &nullRuns{}
-			plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", kept, testPkgs, 2*time.Minute, runs.run)
+			plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", kept, testPkgs, 2*time.Minute, 0, runs.run)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -466,7 +466,7 @@ func TestPrepareNets(t *testing.T) {
 func TestPrepareWithNothingToPlace(t *testing.T) {
 	t.Parallel()
 	runs := &nullRuns{}
-	plan, err := schemata.Prepare(context.Background(), prepareModule(t), t.TempDir(), "", nil, ownPackage, time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), prepareModule(t), t.TempDir(), "", nil, ownPackage, time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +481,7 @@ func TestPrepareStopsWhenCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	runs := &nullRuns{}
-	if _, err := schemata.Prepare(ctx, mod, t.TempDir(), "", streamMutants(t, mod), ownPackage, time.Minute, runs.run); !errors.Is(err, context.Canceled) {
+	if _, err := schemata.Prepare(ctx, mod, t.TempDir(), "", streamMutants(t, mod), ownPackage, time.Minute, 0, runs.run); !errors.Is(err, context.Canceled) {
 		t.Errorf("Prepare on a cancelled context: err = %v, want context.Canceled", err)
 	}
 }
@@ -511,7 +511,7 @@ func TestPrepareBuildSet(t *testing.T) {
 		}
 	}
 	runs := &nullRuns{}
-	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +545,7 @@ func TestPrepareBuildSet(t *testing.T) {
 			onlyB = append(onlyB, m)
 		}
 	}
-	plan, err = schemata.Prepare(context.Background(), mod, t.TempDir(), "", onlyB, testPkgs, 2*time.Minute, runs.run)
+	plan, err = schemata.Prepare(context.Background(), mod, t.TempDir(), "", onlyB, testPkgs, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +589,7 @@ func TestPrepareLogsShortReasons(t *testing.T) {
 	var out, eOut bytes.Buffer
 	log.Init(&out, &eOut)
 	defer log.Reset()
-	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, testPkgs, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,7 +645,7 @@ func TestPrepareStopsLoadingWhenCancelled(t *testing.T) {
 	time.AfterFunc(100*time.Millisecond, cancel)
 	start := time.Now()
 	runs := &nullRuns{}
-	_, err := schemata.Prepare(ctx, mod, t.TempDir(), "", in, ownPackage, time.Minute, runs.run)
+	_, err := schemata.Prepare(ctx, mod, t.TempDir(), "", in, ownPackage, time.Minute, 0, runs.run)
 	if el := time.Since(start); !errors.Is(err, context.Canceled) || el > 2*time.Second {
 		t.Errorf("Prepare cancelled during its loads: err = %v after %s, want context.Canceled within 2s", err, el)
 	}
@@ -734,7 +734,7 @@ func TestPrepareLineDirective(t *testing.T) {
 	}
 
 	runs := &nullRuns{}
-	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -762,7 +762,7 @@ func TestPrepareRelativeRoot(t *testing.T) {
 	mod := gomodule.GoModule{Name: prepareMod, Root: ".", CallingDir: "."}
 	in := streamMutants(t, mod)
 	runs := &nullRuns{}
-	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, runs.run)
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, 0, runs.run)
 	if err != nil {
 		t.Fatal(err)
 	}

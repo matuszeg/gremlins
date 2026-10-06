@@ -49,24 +49,25 @@ type unleashCmd struct {
 const (
 	commandName = "unleash"
 
-	paramDiff               = "diff"
-	paramBuildTags          = "tags"
-	paramCoverPackages      = "coverpkg"
-	paramDryRun             = "dry-run"
-	paramOutputStatuses     = "output-statuses"
-	paramOutputDiffStatuses = "output-diff-statuses"
-	paramOutput             = "output"
-	paramIntegrationMode    = "integration"
-	paramExcludeFiles       = "exclude-files"
-	paramTestCPU            = "test-cpu"
-	paramWorkers            = "workers"
-	paramTimeoutCoefficient = "timeout-coefficient"
-	paramTestSelection      = "test-selection"
-	paramCrossPackage       = "cross-package"
-	paramSchemata           = "schemata"
-	paramTimeoutMax         = "timeout-max"
-	paramCompileAllowance   = "compile-allowance"
-	paramOnShutdownStatus   = "on-shutdown-status"
+	paramDiff                 = "diff"
+	paramBuildTags            = "tags"
+	paramCoverPackages        = "coverpkg"
+	paramDryRun               = "dry-run"
+	paramOutputStatuses       = "output-statuses"
+	paramOutputDiffStatuses   = "output-diff-statuses"
+	paramOutput               = "output"
+	paramIntegrationMode      = "integration"
+	paramExcludeFiles         = "exclude-files"
+	paramTestCPU              = "test-cpu"
+	paramWorkers              = "workers"
+	paramTimeoutCoefficient   = "timeout-coefficient"
+	paramTestSelection        = "test-selection"
+	paramCrossPackage         = "cross-package"
+	paramSchemata             = "schemata"
+	paramTimeoutMax           = "timeout-max"
+	paramCompileAllowance     = "compile-allowance"
+	paramSchemataBuildTimeout = "schemata-build-timeout"
+	paramOnShutdownStatus     = "on-shutdown-status"
 
 	// Thresholds.
 	paramThresholdEfficacy  = "threshold-efficacy"
@@ -279,6 +280,7 @@ func setFlagsOnCmd(cmd *cobra.Command) error {
 		{Name: paramSchemata, CfgKey: configuration.UnleashSchemataKey, DefaultV: true, Usage: "compile every mutant into one set of test binaries and switch between them at run time; --schemata=false restores one build per mutant; set GREMLINS_SCHEMATA_KEEP=<dir> to keep the binaries, the rewritten source and an index of mutant ids in <dir>"},
 		{Name: paramTimeoutMax, CfgKey: configuration.UnleashTimeoutMaxKey, DefaultV: "", Usage: "absolute ceiling on a single mutant's test run, as a Go duration (e.g. '15s'); caps the coefficient-derived timeout so a non-terminating mutant cannot exhaust the machine. Empty means no ceiling"},
 		{Name: paramCompileAllowance, CfgKey: configuration.UnleashCompileAllowanceKey, DefaultV: "", Usage: "time a mutant is allowed to COMPILE, as a Go duration (e.g. '2m'), on top of the bound on its test run; the two together form the deadline that also bounds a compile that has hung. Empty uses the default"},
+		{Name: paramSchemataBuildTimeout, CfgKey: configuration.UnleashSchemataBuildTimeoutKey, DefaultV: "", Usage: "bound on the one schemata build of a whole run, as a Go duration (e.g. '30m'), separate from --compile-allowance, which bounds one mutant's compile; a build cut off by it, by a signal or by running out of memory is retried once at half the parallelism before its mutants take the per-mutant path. Empty derives it: the compile allowance times the number of test packages built, at least 10m"},
 		{Name: paramOnShutdownStatus, CfgKey: configuration.UnleashOnShutdownStatusKey, DefaultV: "not-run", Usage: "status to record for in-flight mutants when the run is cancelled (e.g. SIGTERM from a CI runner); one of 'not-run', 'timed-out', 'lived'"},
 	}
 

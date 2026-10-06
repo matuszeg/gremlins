@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,8 +79,9 @@ func processesUnder(dir string) []string {
 }
 
 // TestBuildAllKillsTheWholeBuildAtTheDeadline cancels a build while the
-// compiler is running and requires that no process of it survives and that
-// it leaves no go-build work directory behind.
+// compiler is running -- the first build and the retry a build cut off gets
+// -- and requires that no process of it survives and that it leaves no
+// go-build work directory behind.
 func TestBuildAllKillsTheWholeBuildAtTheDeadline(t *testing.T) {
 	t.Parallel()
 	modRoot := slowModule(t)
@@ -87,8 +89,8 @@ func TestBuildAllKillsTheWholeBuildAtTheDeadline(t *testing.T) {
 
 	start := time.Now()
 	_, errs := schemata.BuildAll(context.Background(), modRoot, workDir, "", nil, []string{"slow"}, time.Second)
-	if elapsed := time.Since(start); elapsed > 4*time.Second {
-		t.Errorf("BuildAll returned after %s with a 1s allowance", elapsed)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("BuildAll returned after %s with a 1s timeout and one retry", elapsed)
 	}
 	if !errors.Is(errs["slow"], context.DeadlineExceeded) {
 		t.Fatalf("error %v, want the deadline", errs["slow"])
@@ -119,5 +121,32 @@ func TestBuildAllKillsTheWholeBuildAtTheDeadline(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestBuildAllRetriesASignalledGoCommand fails a package's first build with
+// the exit of a process a signal killed, and requires it rebuilt once.
+func TestBuildAllRetriesASignalledGoCommand(t *testing.T) {
+	t.Parallel()
+	killed := exec.Command("sh", "-c", "kill -KILL $$").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(killed, &exitErr) || exitErr.ExitCode() != -1 {
+		t.Fatalf("the killed shell returned %v, want an exit by signal", killed)
+	}
+	mod := twoPkgsModule(t)
+	const pkg = "twopkgs/ok"
+	f := &fakeBuilds{realOnNil: true, answer: func(_ context.Context, _ string, call int) error {
+		if call == 1 {
+			return fmt.Errorf("schemata: build %s: %w", pkg, killed)
+		}
+
+		return nil
+	}}
+	b, errs := schemata.BuildAllWith(context.Background(), mod.Root, t.TempDir(), "", nil, []string{pkg}, time.Minute, f.build)
+	if errs[pkg] != nil || b.Binaries[pkg] == "" {
+		t.Errorf("binary %q, error %v; want the retry to build it", b.Binaries[pkg], errs[pkg])
+	}
+	if c := f.callsOf(pkg); c != 2 {
+		t.Errorf("built %d times, want 2", c)
 	}
 }

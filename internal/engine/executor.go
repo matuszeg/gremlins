@@ -115,8 +115,11 @@ type MutantExecutorDealer struct {
 	buildTags         string
 	testExecutionTime time.Duration
 	compileAllowance  time.Duration
-	dryRun            bool
-	testCPU           int
+	// schemataBuildTimeout bounds the whole schema build; zero derives the
+	// bound from compileAllowance and the number of packages built.
+	schemataBuildTimeout time.Duration
+	dryRun               bool
+	testCPU              int
 	// overlays is shared by every copy of the dealer, so each worker's
 	// overlay file for a schema build is written once per run, not once per
 	// mutant.
@@ -224,17 +227,18 @@ func NewExecutorDealer(mod gomodule.GoModule, wdd workdir.Dealer, elapsed time.D
 	}
 
 	jd := MutantExecutorDealer{
-		mod:               mod,
-		testSelection:     testSelection{crossPackage: crossPackage, integrationMode: integrationMode},
-		wdDealer:          wdd,
-		buildTags:         buildTags,
-		dryRun:            dryRun,
-		testCPU:           testCPU,
-		testExecutionTime: cappedExecutionTime(baseTime * time.Duration(coefficient)),
-		compileAllowance:  compileAllowance(),
-		execContext:       exec.CommandContext,
-		overlays:          newOverlayCache(),
-		schemaCounts:      &schemaCounts{},
+		mod:                  mod,
+		testSelection:        testSelection{crossPackage: crossPackage, integrationMode: integrationMode},
+		wdDealer:             wdd,
+		buildTags:            buildTags,
+		dryRun:               dryRun,
+		testCPU:              testCPU,
+		testExecutionTime:    cappedExecutionTime(baseTime * time.Duration(coefficient)),
+		compileAllowance:     compileAllowance(),
+		schemataBuildTimeout: schemataBuildTimeout(),
+		execContext:          exec.CommandContext,
+		overlays:             newOverlayCache(),
+		schemaCounts:         &schemaCounts{},
 	}
 
 	for _, opt := range opts {
@@ -286,6 +290,15 @@ func compileAllowance() time.Duration {
 	if !ok {
 		return DefaultCompileAllowance
 	}
+
+	return d
+}
+
+// schemataBuildTimeout returns the bound on the whole schema build of a run,
+// configured with --schemata-build-timeout; zero, when it is unset or
+// invalid, derives the bound in schemata.BuildTimeout.
+func schemataBuildTimeout() time.Duration {
+	d, _ := positiveDuration(configuration.UnleashSchemataBuildTimeoutKey, "deriving the schemata build timeout")
 
 	return d
 }
