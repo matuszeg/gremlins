@@ -222,7 +222,13 @@ func (mu *Engine) findMutations(fileName string, set *token.FileSet, file *ast.F
 		if !configuration.Get[bool](configuration.MutantTypeEnabledKey(mt)) {
 			continue
 		}
-		if !mu.viable(position, tok, mt) {
+		// Outside the diff a mutant is reported skipped whatever it would do,
+		// so whether it compiles is not asked: the check type-checks its
+		// whole package, which across a module is most of a small diff's
+		// run. Inside the diff a mutant that cannot compile is still dropped
+		// rather than counted, as before.
+		inDiff := mu.codeData.Diff.IsChanged(position)
+		if inDiff && !mu.viable(position, tok, mt) {
 			continue
 		}
 		mutantType := mt
