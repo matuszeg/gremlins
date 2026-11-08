@@ -23,8 +23,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sync"
 	"testing"
 	"testing/fstest"
+
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/go-gremlins/gremlins/internal/configuration"
 	"github.com/go-gremlins/gremlins/internal/coverage"
@@ -720,6 +723,66 @@ func TestSkipNotDiffMutants(t *testing.T) {
 		if mutant.Status() != mutator.Skipped {
 			t.Errorf("all mutants should be skipped")
 		}
+	}
+}
+
+// changedFile is the one file a diff names.
+const changedFile = "changed.go"
+
+// recordingViability answers every question with its viable field, and records which
+// files it was asked about.
+type recordingViability struct {
+	mu     sync.Mutex
+	asked  map[string]bool
+	viable bool
+}
+
+func (r *recordingViability) Viable(pos token.Position, _ token.Token) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.asked[pos.Filename] = true
+
+	return r.viable
+}
+
+// A --diff run skips every mutant outside the diff, so asking whether one
+// compiles is work the run throws away: the check type-checks the whole
+// package, and over a module it was most of a small diff's run (#1539 in
+// Plumage: 3m34s of type-checking for 2 mutants).
+func TestADiffRunAsksViabilityOnlyInsideTheDiff(t *testing.T) {
+	t.Parallel()
+	f, _ := os.Open("testdata/fixtures/geq_go")
+	file, _ := io.ReadAll(f)
+
+	sys := fstest.MapFS{
+		changedFile:    {Data: file},
+		"unchanged.go": {Data: file},
+	}
+	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
+	viperSet(map[string]any{configuration.UnleashDryRunKey: true})
+	defer viperReset()
+
+	codeData := engine.CodeData{Diff: diff.Diff{
+		changedFile: {{StartLine: 1, EndLine: 100}},
+	}}
+	via := &recordingViability{asked: map[string]bool{}}
+	mut := engine.New(mod, codeData, newJobDealerStub(t), engine.WithDirFs(sys), engine.WithViability(via))
+	res := mut.Run(context.Background())
+
+	if diff := cmp.Diff(map[string]bool{changedFile: true}, via.asked); diff != "" {
+		t.Errorf("want viability asked about the diff only (-want +got):\n%s", diff)
+	}
+	var skipped int
+	for _, m := range res.Mutants {
+		if m.Position().Filename == changedFile {
+			t.Errorf("want a non-viable mutant in the diff dropped, got %s at %s", m.Status(), m.Position())
+		}
+		if m.Status() == mutator.Skipped {
+			skipped++
+		}
+	}
+	if skipped == 0 {
+		t.Error("want the mutants outside the diff reported skipped")
 	}
 }
 
