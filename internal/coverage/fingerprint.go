@@ -93,6 +93,13 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 	if !ok {
 		return fingerprint{}, false
 	}
+	// Its own tests run in its directory, so any data beside its sources is
+	// a relative path away from them, embedded or not.
+	siblings, ok := hashSiblingData(pkg.dir)
+	if !ok {
+		return fingerprint{}, false
+	}
+	below = hashOf([]byte(below + "\x00siblings\x00" + siblings))
 
 	printed := c.printPackage(pkg.importPath, files, true, below, c.typedFacts(pkg.importPath, true))
 
@@ -109,13 +116,15 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 // files, so on its own that case ends in a whole re-map — but a run that has
 // already found a reason to narrow would never get that far.
 //
-// It is those and nothing else. Hashing every directory beside the sources
-// instead made a change to data the package never reads — sqlc's query files
-// beside a package that embeds only its migrations — re-map every package
-// that links it. And it still missed what the package does read when that
-// sits in a directory holding Go files: migrations/*.sql beside a migrations
-// package. A test that opens a sibling directory at run time is unseen either
-// way, as anything above the directory always was.
+// For a dependency it is those and nothing else. Its other directories can be
+// read only by its own tests, which no other package's binary links, or by a
+// path that resolves against the directory of the package under test, which
+// is not the dependency's. Hashing every directory beside its sources instead
+// made a change to data it never reads — sqlc's query files beside a package
+// that embeds only its migrations — re-map every package that links it. And
+// that walk missed what it does read when that sits in a directory holding Go
+// files: migrations/*.sql beside a migrations package. The package under test
+// adds hashSiblingData on top (see fingerprintOf).
 //
 // The patterns are read from every Go file of the directory, whichever a
 // build would select, and matched by the toolchain's own glob rules. That
@@ -147,6 +156,43 @@ func hashPackageData(dir string, files []goFile) (string, bool) {
 			return "", false
 		}
 		parts = append(parts, "embed\x00"+rel+"\x00"+sum)
+	}
+
+	return hashOf([]byte(strings.Join(parts, "\x00"))), true
+}
+
+// hashSiblingData hashes every directory below dir that holds no Go file, and
+// the same below each of them: what the package's own tests can open by a
+// relative path at run time without embedding it. A directory holding Go
+// files is a package of its own, which this one's tests reach, if at all,
+// through what it is built from.
+func hashSiblingData(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	var parts []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		sub := filepath.Join(dir, e.Name())
+		isPkg, ok := holdsGoFiles(sub)
+		if !ok {
+			return "", false
+		}
+		if isPkg {
+			continue
+		}
+		sum, subOK := hashDirectory(sub)
+		if !subOK {
+			return "", false
+		}
+		nested, nestedOK := hashSiblingData(sub)
+		if !nestedOK {
+			return "", false
+		}
+		parts = append(parts, e.Name()+"\x00"+sum+"\x00"+nested)
 	}
 
 	return hashOf([]byte(strings.Join(parts, "\x00"))), true

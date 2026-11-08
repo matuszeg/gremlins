@@ -314,8 +314,10 @@ func TestADependencyChangeReMapsOnlyWhatReachesIt(t *testing.T) {
 			want:   []string{"TestTriple"},
 		},
 		// A directory beside a dependency's sources that it neither embeds
-		// nor keeps as testdata is compiled into nothing (#1539 in Plumage:
-		// a sqlc query file beside a package that embeds only migrations).
+		// nor keeps as testdata is compiled into nothing, and no test of
+		// another package opens it by a relative path, which resolves in
+		// that package's directory (#1539 in Plumage: a sqlc query file
+		// beside a package that embeds only migrations).
 		"a data directory the dependency does not read": {
 			before: files{vmQuery: "select 1"},
 			after:  files{vmQuery: "select 2"},
@@ -330,6 +332,13 @@ func TestADependencyChangeReMapsOnlyWhatReachesIt(t *testing.T) {
 			},
 			after: files{vmQuery: "select 2"},
 			want:  []string{"TestDouble", "TestTriple"},
+		},
+		// The same directory beside the package under test is a relative
+		// path away from every one of its tests.
+		"a data directory beside the package under test": {
+			before: files{"calc/fixtures/case.json": `{"n":1}`},
+			after:  files{"calc/fixtures/case.json": `{"n":2}`},
+			want:   []string{"TestDouble", "TestTriple"},
 		},
 		"a dependency type nothing names": {
 			after: files{"vm/vm.go": vmSource + "\ntype box int\n\nfunc (b box) String() string {\n\treturn \"box\"\n}\n"},

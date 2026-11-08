@@ -105,6 +105,12 @@ func TestFingerprintWholeHoldsWhatNoEntityCarries(t *testing.T) {
 			{"a.go": plainSource, "testdata/golden/one.json": `{"n":1}`},
 			{"a.go": plainSource, "testdata/golden/one.json": `{"n":2}`},
 		},
+		// Its own tests run in its directory, so they can open any of it by a
+		// relative path without embedding it.
+		"a data directory beside the sources": {
+			{"a.go": plainSource, "fixtures/case.json": `{"n":1}`},
+			{"a.go": plainSource, "fixtures/case.json": `{"n":2}`},
+		},
 		// An embedded file is compiled in, whether or not the directory it
 		// sits in is a package of its own.
 		"a file embedded from a directory that holds a package": {
@@ -181,13 +187,6 @@ func TestFingerprintWholeIgnoresWhatAnEntityCarries(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string][2]map[string]string{
-		// A directory beside the sources that the package neither embeds nor
-		// keeps as testdata is not read by its build or, by convention, its
-		// tests: sqlc queries, a schema, docs.
-		"a data directory the package does not read": {
-			{"a.go": plainSource, "queries/q.sql": "select 1"},
-			{"a.go": plainSource, "queries/q.sql": "select 2"},
-		},
 		// In a directory that is a package of its own, only what a pattern
 		// matched is the embedding package's.
 		"a file beside an embedded one that no pattern names": {
