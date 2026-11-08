@@ -271,6 +271,8 @@ func TestAChangeBelowADependencyReMapsAllOfIt(t *testing.T) {
 		t.Fatalf("cannot create the fixture directory: %v", err)
 	}
 	writeFixture(t, asset, `{"max": 10}`)
+	writeFixture(t, filepath.Join(h.pkgRoot, "vm", "embed.go"),
+		"package vm\n\nimport \"embed\"\n\n//go:embed static\nvar static embed.FS\n")
 
 	h.buildCalc("")
 	writeFixture(t, asset, `{"max": 20}`)

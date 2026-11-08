@@ -359,7 +359,7 @@ func sortedKeys(set map[string]bool) []string {
 //
 // The data below it — testdata, and the trees an //go:embed pattern reaches
 // into — is read by the same rule the package's own fingerprint uses (see
-// hashDataSubtrees), because an embedded file is compiled into the dependency
+// hashPackageData), because an embedded file is compiled into the dependency
 // without a line of it changing. Leaving it out was once only a missed
 // re-map behind a moved build ID; now that an unchanged fingerprint and Inputs
 // reuse the whole map, it would be a kept mapping the change invalidated.
@@ -373,8 +373,12 @@ func (c *Coverage) hashDir(dir string) (string, bool) {
 	}
 	sum, ok := hashDirectory(dir)
 	if ok {
+		var files []goFile
+		files, ok = readPackageFiles(dir)
 		var below string
-		below, ok = hashDataSubtrees(dir)
+		if ok {
+			below, ok = hashPackageData(dir, files)
+		}
 		sum = hashOf([]byte(sum + "\x00subtrees\x00" + below))
 	}
 	if c.dirHashes == nil {

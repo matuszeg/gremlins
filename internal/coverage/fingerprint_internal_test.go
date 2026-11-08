@@ -74,6 +74,16 @@ func TestFingerprintOfFailsOnADirectoryItCannotRead(t *testing.T) {
 	}
 }
 
+// migration is a file embedded from a directory beside the package.
+const (
+	migration     = "migrations/1.sql"
+	migrationsPkg = "migrations/m.go"
+	// migrationsSource makes migrations/ a package of its own.
+	migrationsSource = "package migrations\n"
+	// embedsMigrations is a package embedding every migration.
+	embedsMigrations = "package pkg\n\nimport \"embed\"\n\n//go:embed migrations/*.sql\nvar data embed.FS\n"
+)
+
 const plainSource = "package pkg\n\nfunc F() int {\n\treturn 1\n}\n"
 
 // Whole is everything no entity can carry a change of. Each pair here differs
@@ -94,6 +104,26 @@ func TestFingerprintWholeHoldsWhatNoEntityCarries(t *testing.T) {
 		"data below the directory": {
 			{"a.go": plainSource, "testdata/golden/one.json": `{"n":1}`},
 			{"a.go": plainSource, "testdata/golden/one.json": `{"n":2}`},
+		},
+		// An embedded file is compiled in, whether or not the directory it
+		// sits in is a package of its own.
+		"a file embedded from a directory that holds a package": {
+			{"a.go": embedsMigrations, migrationsPkg: migrationsSource, migration: "one"},
+			{"a.go": embedsMigrations, migrationsPkg: migrationsSource, migration: "two"},
+		},
+		"a file inside an embedded directory": {
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed static\nvar data embed.FS\n", "static/css/site.css": "a{}"},
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed static\nvar data embed.FS\n", "static/css/site.css": "b{}"},
+		},
+		"a file a quoted embed pattern names": {
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed \"with space/x.txt\"\nvar data embed.FS\n", "with space/x.txt": "one"},
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed \"with space/x.txt\"\nvar data embed.FS\n", "with space/x.txt": "two"},
+		},
+		// all: keeps the dotfiles a plain directory pattern leaves out, and
+		// reading more than the build does only costs a re-map.
+		"a dotfile inside an all: embedded directory": {
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed all:static\nvar data embed.FS\n", "static/.keep": "one"},
+			{"a.go": "package pkg\n\nimport \"embed\"\n\n//go:embed all:static\nvar data embed.FS\n", "static/.keep": "two"},
 		},
 		"a build constraint": {
 			{"a.go": plainSource},
@@ -151,6 +181,19 @@ func TestFingerprintWholeIgnoresWhatAnEntityCarries(t *testing.T) {
 	t.Parallel()
 
 	testCases := map[string][2]map[string]string{
+		// A directory beside the sources that the package neither embeds nor
+		// keeps as testdata is not read by its build or, by convention, its
+		// tests: sqlc queries, a schema, docs.
+		"a data directory the package does not read": {
+			{"a.go": plainSource, "queries/q.sql": "select 1"},
+			{"a.go": plainSource, "queries/q.sql": "select 2"},
+		},
+		// In a directory that is a package of its own, only what a pattern
+		// matched is the embedding package's.
+		"a file beside an embedded one that no pattern names": {
+			{"a.go": embedsMigrations, migrationsPkg: migrationsSource, migration: "one", "migrations/README.md": "one"},
+			{"a.go": embedsMigrations, migrationsPkg: migrationsSource, migration: "one", "migrations/README.md": "two"},
+		},
 		"an added plain file": {
 			{"a.go": plainSource},
 			{"a.go": plainSource, "b.go": "package pkg\n\nconst limit = 3\n"},
@@ -710,6 +753,59 @@ func F() int {
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("vars that read another package (-want +got):\n%s", diff)
+	}
+}
+
+// A //go:embed directive the fingerprint cannot resolve is a failure to
+// fingerprint: guessing what it embeds could keep a mapping it invalidated.
+func TestFingerprintOfFailsOnAnEmbedPatternItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	for name, directive := range map[string]string{
+		"an unterminated interpreted string": `//go:embed "a.txt`,
+		"a bad escape":                       `//go:embed "a\q.txt"`,
+		"an unterminated raw string":         "//go:embed `a.txt",
+		"a malformed glob":                   "//go:embed [a.txt",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			src := "package pkg\n\nimport \"embed\"\n\n" + directive + "\nvar data embed.FS\n"
+			if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(src), 0o600); err != nil {
+				t.Fatalf("cannot write the source: %v", err)
+			}
+			c := &Coverage{mod: gomodule.GoModule{Name: "example.com", Root: dir, CallingDir: "."}}
+
+			if _, ok := c.fingerprintOf(&testPackage{importPath: "example.com/pkg", dir: dir}); ok {
+				t.Error("want a failure for a directive that cannot be resolved")
+			}
+		})
+	}
+}
+
+// Every way of writing a pattern names the same files the toolchain embeds.
+func TestEmbedPatternsSplitsAsTheToolchainDoes(t *testing.T) {
+	t.Parallel()
+
+	got, ok := embedPatterns(" a.txt\t\"b c.txt\" `d e.txt` all:static ")
+	if !ok {
+		t.Fatal("want the arguments read")
+	}
+	want := []string{"a.txt", "b c.txt", "d e.txt", "all:static"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("embedPatterns() mismatch (-want +got):\n%s", diff)
+	}
+	for line, want := range map[string]bool{
+		"//go:embed a.txt":   true,
+		"\t//go:embed a.txt": true,
+		"//go:embedded":      false,
+		"// go:embed a.txt":  false,
+		"//go:embed":         true,
+	} {
+		if _, got := embedDirective(line); got != want {
+			t.Errorf("embedDirective(%q) = %v, want %v", line, got, want)
+		}
 	}
 }
 

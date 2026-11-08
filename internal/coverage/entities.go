@@ -242,7 +242,7 @@ type printSet struct {
 // mapped, and never for a dependency, whose test files are not linked into
 // any other package's test binary.
 //
-// below is the hash of the data below the directory (see hashDataSubtrees),
+// below is the hash of the data below the directory (see hashPackageData),
 // which is part of Whole. facts is the package's type facts, nil when it
 // could not be type-checked; a print without them is never narrowed from.
 func (c *Coverage) printPackage(importPath string, files []goFile, withTests bool, below string, facts *typeFacts) pkgPrint {
