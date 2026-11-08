@@ -289,6 +289,9 @@ func TestATestFileChangeReMapsOnlyTheTestsThatNameIt(t *testing.T) {
 	})
 }
 
+// vmQuery is a data file beside vm's sources.
+const vmQuery = "vm/queries/q.sql"
+
 // A dependency's changes are attributed by the same rules as the package's:
 // a body to the tests that executed it, a name to whatever names it, across
 // the package boundary by its exported names.
@@ -309,6 +312,33 @@ func TestADependencyChangeReMapsOnlyWhatReachesIt(t *testing.T) {
 			before: files{"calc/calc.go": tripleUsesSize},
 			after:  files{"vm/vm.go": strings.Replace(vmSource, "Size(v []int) int", "Size(v []int) (n int)", 1)},
 			want:   []string{"TestTriple"},
+		},
+		// A directory beside a dependency's sources that it neither embeds
+		// nor keeps as testdata is compiled into nothing, and no test of
+		// another package opens it by a relative path, which resolves in
+		// that package's directory (#1539 in Plumage: a sqlc query file
+		// beside a package that embeds only migrations).
+		"a data directory the dependency does not read": {
+			before: files{vmQuery: "select 1"},
+			after:  files{vmQuery: "select 2"},
+		},
+		// What it does embed is compiled in, and every test that linked the
+		// dependency can have read it.
+		"a file the dependency embeds": {
+			before: files{
+				"calc/calc.go": calcWith(`import "example.com/vm"`, "return n * 2", "return n*3 + vm.Size(nil)"),
+				"vm/embed.go":  "package vm\n\nimport \"embed\"\n\n//go:embed queries/*.sql\nvar queries embed.FS\n",
+				vmQuery:        "select 1",
+			},
+			after: files{vmQuery: "select 2"},
+			want:  []string{"TestDouble", "TestTriple"},
+		},
+		// The same directory beside the package under test is a relative
+		// path away from every one of its tests.
+		"a data directory beside the package under test": {
+			before: files{"calc/fixtures/case.json": `{"n":1}`},
+			after:  files{"calc/fixtures/case.json": `{"n":2}`},
+			want:   []string{"TestDouble", "TestTriple"},
 		},
 		"a dependency type nothing names": {
 			after: files{"vm/vm.go": vmSource + "\ntype box int\n\nfunc (b box) String() string {\n\treturn \"box\"\n}\n"},

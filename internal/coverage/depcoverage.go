@@ -99,7 +99,7 @@ func (c *Coverage) readDepSource(dep dependency) *depSource {
 	if !ok {
 		return nil
 	}
-	below, ok := hashDataSubtrees(dep.dir)
+	below, ok := hashPackageData(dep.dir, files)
 	if !ok {
 		return nil
 	}

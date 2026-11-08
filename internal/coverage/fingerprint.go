@@ -19,12 +19,15 @@ package coverage
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -86,19 +89,26 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 	if !ok {
 		return fingerprint{}, false
 	}
-	below, ok := hashDataSubtrees(pkg.dir)
+	below, ok := hashPackageData(pkg.dir, files)
 	if !ok {
 		return fingerprint{}, false
 	}
+	// Its own tests run in its directory, so any data beside its sources is
+	// a relative path away from them, embedded or not.
+	siblings, ok := hashSiblingData(pkg.dir)
+	if !ok {
+		return fingerprint{}, false
+	}
+	below = hashOf([]byte(below + "\x00siblings\x00" + siblings))
 
 	printed := c.printPackage(pkg.importPath, files, true, below, c.typedFacts(pkg.importPath, true))
 
 	return fingerprint{pkgPrint: printed}, true
 }
 
-// hashDataSubtrees hashes what a package's directory holds below its top level
-// and does not compile: testdata, and the trees an //go:embed pattern reaches
-// into.
+// hashPackageData hashes what a package reads from below its own directory
+// without compiling it: its testdata tree, and every file or directory its
+// //go:embed directives name.
 //
 // They belong in Whole because a test can behave differently on new input
 // without a line of the package changing, which would leave a kept mapping
@@ -106,25 +116,67 @@ func (c *Coverage) fingerprintOf(pkg *testPackage) (fingerprint, bool) {
 // files, so on its own that case ends in a whole re-map — but a run that has
 // already found a reason to narrow would never get that far.
 //
-// Subdirectories holding Go files are skipped: those are packages of their own,
-// and a package this one imports is covered by what it is built from, while one
-// it does not import has no business dirtying it.
-func hashDataSubtrees(dir string) (string, bool) {
+// For a dependency it is those and nothing else. Its other directories can be
+// read only by its own tests, which no other package's binary links, or by a
+// path that resolves against the directory of the package under test, which
+// is not the dependency's. Hashing every directory beside its sources instead
+// made a change to data it never reads — sqlc's query files beside a package
+// that embeds only its migrations — re-map every package that links it. And
+// that walk missed what it does read when that sits in a directory holding Go
+// files: migrations/*.sql beside a migrations package. The package under test
+// adds hashSiblingData on top (see fingerprintOf).
+//
+// The patterns are read from every Go file of the directory, whichever a
+// build would select, and matched by the toolchain's own glob rules. That
+// reads more than the build embeds — a dotfile below a plain directory
+// pattern, a file a build tag leaves out — which costs a re-map and never a
+// wrong answer. A directive that does not parse, or a pattern that is not a
+// glob, is a failure to fingerprint.
+func hashPackageData(dir string, files []goFile) (string, bool) {
+	var parts []string
+	testdata := filepath.Join(dir, "testdata")
+	switch info, err := os.Stat(testdata); {
+	case err == nil && info.IsDir():
+		sum, ok := hashTree(testdata)
+		if !ok {
+			return "", false
+		}
+		parts = append(parts, "testdata\x00"+sum)
+	case err != nil && !errors.Is(err, fs.ErrNotExist):
+		return "", false
+	}
+
+	embedded, ok := embeddedPaths(dir, files)
+	if !ok {
+		return "", false
+	}
+	for _, rel := range embedded {
+		sum, pathOK := hashPath(filepath.Join(dir, filepath.FromSlash(rel)))
+		if !pathOK {
+			return "", false
+		}
+		parts = append(parts, "embed\x00"+rel+"\x00"+sum)
+	}
+
+	return hashOf([]byte(strings.Join(parts, "\x00"))), true
+}
+
+// hashSiblingData hashes every directory below dir that holds no Go file, and
+// the same below each of them: what the package's own tests can open by a
+// relative path at run time without embedding it. A directory holding Go
+// files is a package of its own, which this one's tests reach, if at all,
+// through what it is built from.
+func hashSiblingData(dir string) (string, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", false
 	}
-	var names []string
+	var parts []string
 	for _, e := range entries {
-		if e.IsDir() {
-			names = append(names, e.Name())
+		if !e.IsDir() {
+			continue
 		}
-	}
-	sort.Strings(names)
-
-	parts := make([]string, 0, len(names))
-	for _, name := range names {
-		sub := filepath.Join(dir, name)
+		sub := filepath.Join(dir, e.Name())
 		isPkg, ok := holdsGoFiles(sub)
 		if !ok {
 			return "", false
@@ -136,14 +188,91 @@ func hashDataSubtrees(dir string) (string, bool) {
 		if !subOK {
 			return "", false
 		}
-		nested, nestedOK := hashDataSubtrees(sub)
+		nested, nestedOK := hashSiblingData(sub)
 		if !nestedOK {
 			return "", false
 		}
-		parts = append(parts, name+"\x00"+sum+"\x00"+nested)
+		parts = append(parts, e.Name()+"\x00"+sum+"\x00"+nested)
 	}
 
 	return hashOf([]byte(strings.Join(parts, "\x00"))), true
+}
+
+// embeddedPaths is what below dir a //go:embed pattern of one of files
+// reaches, slash-separated and sorted.
+//
+// A top-level file a pattern names is left out: it is a file of the directory,
+// which the fingerprint hashes already. A top-level directory holding no Go
+// file stands whole for every match inside it, so a directive retargeted from
+// one of its files to another moves only the directive's own entity, as it
+// does for files of the directory itself. A directory that is a package of its
+// own contributes only what was matched in it.
+func embeddedPaths(dir string, files []goFile) ([]string, bool) {
+	matches, ok := embedMatches(dir, files)
+	if !ok {
+		return nil, false
+	}
+	reached := map[string]bool{}
+	isPkg := map[string]bool{}
+	for _, m := range matches {
+		top, below, nested := strings.Cut(m, "/")
+		if !nested {
+			info, err := os.Stat(filepath.Join(dir, top))
+			if err != nil {
+				return nil, false
+			}
+			if !info.IsDir() {
+				continue
+			}
+		}
+		pkg, seen := isPkg[top]
+		if !seen {
+			var listOK bool
+			pkg, listOK = holdsGoFiles(filepath.Join(dir, top))
+			if !listOK {
+				return nil, false
+			}
+			isPkg[top] = pkg
+		}
+		if pkg && below != "" {
+			reached[m] = true
+		} else {
+			reached[top] = true
+		}
+	}
+
+	return sortedKeys(reached), true
+}
+
+// embedMatches is every path below dir that a //go:embed pattern of one of
+// files matches.
+func embedMatches(dir string, files []goFile) ([]string, bool) {
+	var out []string
+	root := os.DirFS(dir)
+	for _, f := range files {
+		if !strings.HasSuffix(f.name, ".go") {
+			continue
+		}
+		for _, line := range strings.Split(string(f.data), "\n") {
+			args, isEmbed := embedDirective(line)
+			if !isEmbed {
+				continue
+			}
+			patterns, ok := embedPatterns(args)
+			if !ok {
+				return nil, false
+			}
+			for _, pattern := range patterns {
+				matches, err := fs.Glob(root, strings.TrimPrefix(pattern, "all:"))
+				if err != nil {
+					return nil, false
+				}
+				out = append(out, matches...)
+			}
+		}
+	}
+
+	return out, true
 }
 
 func holdsGoFiles(dir string) (bool, bool) {
@@ -158,6 +287,109 @@ func holdsGoFiles(dir string) (bool, bool) {
 	}
 
 	return false, true
+}
+
+// embedDirective reports whether line is a //go:embed directive, and what
+// follows the directive's name.
+func embedDirective(line string) (string, bool) {
+	const directive = "//go:embed"
+	rest, found := strings.CutPrefix(strings.TrimLeft(line, " \t"), directive)
+	if !found || (rest != "" && rest[0] != ' ' && rest[0] != '\t') {
+		return "", false
+	}
+
+	return strings.TrimRight(rest, "\r"), true
+}
+
+// embedPatterns splits a //go:embed directive's arguments the way the
+// toolchain does: on spaces, with a Go string literal, interpreted or raw,
+// standing for one pattern that may hold them.
+func embedPatterns(args string) ([]string, bool) {
+	var out []string
+	for {
+		args = strings.TrimLeft(args, " \t")
+		if args == "" {
+			return out, true
+		}
+		var pattern string
+		switch args[0] {
+		case '"':
+			end := 1
+			for end < len(args) && args[end] != '"' {
+				if args[end] == '\\' {
+					end++
+				}
+				end++
+			}
+			if end >= len(args) {
+				return nil, false
+			}
+			unquoted, err := strconv.Unquote(args[:end+1])
+			if err != nil {
+				return nil, false
+			}
+			pattern, args = unquoted, args[end+1:]
+		case '`':
+			end := strings.IndexByte(args[1:], '`')
+			if end < 0 {
+				return nil, false
+			}
+			pattern, args = args[1:1+end], args[2+end:]
+		default:
+			end := strings.IndexAny(args, " \t")
+			if end < 0 {
+				end = len(args)
+			}
+			pattern, args = args[:end], args[end:]
+		}
+		out = append(out, pattern)
+	}
+}
+
+// hashPath hashes one embedded path: a file's content, or a directory's whole
+// tree.
+func hashPath(path string) (string, bool) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	if info.IsDir() {
+		return hashTree(path)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // G304: a path a //go:embed pattern of the package matched
+	if err != nil {
+		return "", false
+	}
+
+	return hashOf(data), true
+}
+
+// hashTree hashes every regular file below dir, by path and content.
+func hashTree(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	parts := make([]string, 0, len(entries))
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		switch {
+		case e.IsDir():
+			sum, ok := hashTree(path)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, "dir\x00"+e.Name()+"\x00"+sum)
+		case e.Type().IsRegular():
+			data, err := os.ReadFile(path) //nolint:gosec // G304: below a directory `go list` reported
+			if err != nil {
+				return "", false
+			}
+			parts = append(parts, e.Name()+"\x00"+hashOf(data))
+		}
+	}
+
+	return hashOf([]byte(strings.Join(parts, "\x00"))), true
 }
 
 // readPackageFiles reads every regular file of a package directory, parsing the

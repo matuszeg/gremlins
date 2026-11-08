@@ -162,8 +162,8 @@ type span struct {
 //   - an init added, removed, changed, or mentioning an affected name; a var
 //     whose initialiser calls something at initialisation, on the same terms;
 //     TestMain on the same terms: each runs for every test;
-//   - anything in Whole: a non-Go file or data below the directory (an
-//     embedded file among them), a build constraint, a file named for a
+//   - anything in Whole: a non-Go file of the directory, its testdata, or
+//     anything below it a //go:embed pattern reaches, a build constraint, a file named for a
 //     platform, a blank or dot import, a cgo file, a directive outside every
 //     declaration, a file that does not parse;
 //   - a declaration with no name to pair it by — a blank var, a key two
@@ -380,7 +380,7 @@ func (cl *closure) remap(why string) {
 func wholeReason(was, now pkgPrint) string {
 	switch {
 	case was.Whole != now.Whole:
-		return "something outside every declaration changed (a non-Go file, data below the directory, " +
+		return "something outside every declaration changed (a non-Go file, testdata or an embedded file, " +
 			"a build constraint, a blank or dot import, a cgo file, a top-level directive, or a file that does not parse)"
 	case !was.Typed || !now.Typed:
 		return "the type-checker could not read it"
