@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/tools/cover"
@@ -198,6 +199,9 @@ func (c *Coverage) BuildTestMap() (*TestMap, error) {
 	}
 
 	log.Infof("Mapping the tests of %d packages to the code they execute...\n", len(pkgs))
+	if c.mapWorkers > 1 {
+		log.Infof("Running up to %d of a package's tests at a time\n", c.mapWorkers)
+	}
 
 	done, reused := 0, 0
 	for _, pkg := range pkgs {
@@ -377,6 +381,7 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	mapped := make(map[string]Profile, len(names))
 	durations := make(map[string]time.Duration, len(names))
 	deps := map[string][]string{}
+	var toRun []string
 	for _, name := range names {
 		// A mapping is reused with the duration it was recorded with, since
 		// this run never times the test; one recorded without a duration is
@@ -393,22 +398,39 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 
 			continue
 		}
-		runStart := time.Now()
-		got, err := c.profileForTest(pkg, name, n.sources)
-		ran := time.Since(runStart)
-		if err != nil {
+		toRun = append(toRun, name)
+	}
+	results := c.runTests(pkg, toRun, n.sources)
+	// Read in the listed order, never the order the runs finished in, so a
+	// package's log and entry do not depend on which test was quickest.
+	for _, name := range toRun {
+		r := results[name]
+		// It ran beside other tests, and may have failed or skipped only
+		// because of them: a database they shared, the memory, a deadline, a
+		// busy port. Only what it does alone is recorded, so a mapping never
+		// comes from a run the load bent (#1561). A package already lost is
+		// not worth the re-runs.
+		if (r.err != nil || r.skipped) && c.mapWorkers > 1 && complete {
+			what := "skipped"
+			if r.err != nil {
+				what = "failed"
+			}
+			log.Infof("re-running %s.%s alone: it %s beside other tests\n", pkg.importPath, name, what)
+			r = c.runTest(pkg, name, n.sources)
+		}
+		if r.err != nil {
 			log.Errorf("cannot map %s.%s, so %s will run its whole suite: %v\n",
-				pkg.importPath, name, pkg.importPath, err)
+				pkg.importPath, name, pkg.importPath, r.err)
 			complete = false
 
 			continue
 		}
-		mapped[name] = got.profile
-		durations[name] = ran
-		if len(got.deps) > 0 {
-			deps[name] = got.deps
+		mapped[name] = r.got.profile
+		durations[name] = r.ran
+		if len(r.got.deps) > 0 {
+			deps[name] = r.got.deps
 		}
-		attributable = attributable && got.attributable
+		attributable = attributable && r.got.attributable
 	}
 	// A partial package is discarded rather than kept, so that "the map has no
 	// test here" always means "no test covers this line", never "we did not
@@ -445,6 +467,50 @@ func (c *Coverage) mapPackage(pkg *testPackage, tm *TestMap, cacheDir string) ma
 	}
 
 	return mapResult{tests: len(names), reused: reused, mapped: true}
+}
+
+// testRun is one test's mapping run: what it executed, how long it took, or
+// why it could not be mapped.
+type testRun struct {
+	got testCoverage
+	ran time.Duration
+	err error
+	// skipped says the run reported a skip, the test's or a subtest's; known
+	// only beside other tests, where the run is verbose.
+	skipped bool
+}
+
+func (c *Coverage) runTest(pkg *testPackage, name string, sources map[string]*depSource) testRun {
+	start := time.Now()
+	got, skipped, err := c.profileForTest(pkg, name, sources)
+
+	return testRun{got: got, ran: time.Since(start), err: err, skipped: skipped}
+}
+
+// runTests maps the named tests, at most --map-workers at a time. Each still
+// runs in its own process with its own profile, so a test's mapping is what it
+// executes alone; only the wall clock is shared. With one worker they run one
+// after another in the listed order, as they always did.
+func (c *Coverage) runTests(pkg *testPackage, names []string, sources map[string]*depSource) map[string]testRun {
+	results := make(map[string]testRun, len(names))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	slots := make(chan struct{}, c.mapWorkers)
+	for _, name := range names {
+		slots <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := c.runTest(pkg, name, sources)
+			mu.Lock()
+			results[name] = r
+			mu.Unlock()
+			<-slots
+		}()
+	}
+	wg.Wait()
+
+	return results
 }
 
 // narrowing is what a package's mapping run starts from: the fingerprint the
@@ -663,7 +729,12 @@ const testTimeout = 10 * time.Minute
 // profileForTest runs one test and records what it executed: its own
 // package's lines, and the dependency entities it reached (see
 // splitCoverage).
-func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[string]*depSource) (testCoverage, error) {
+//
+// It also says whether the run reported a skip. That is asked only when tests
+// run beside each other (--map-workers above 1), where a skip may be the load's
+// doing; the testing package reports one only under -test.v, so one worker runs
+// exactly the command it always did.
+func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[string]*depSource) (testCoverage, bool, error) {
 	// Each test writes its own profile, never a shared name: tests can run
 	// beside each other (--map-workers), and one reading another's profile
 	// would map the wrong lines without a word (#1561). It lives in Gremlins'
@@ -674,11 +745,11 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[str
 	// absolute.
 	dir, err := filepath.Abs(c.workDir)
 	if err != nil {
-		return testCoverage{}, err
+		return testCoverage{}, false, err
 	}
 	tmp, err := os.CreateTemp(dir, "testmap-*.cov")
 	if err != nil {
-		return testCoverage{}, err
+		return testCoverage{}, false, err
 	}
 	file := tmp.Name()
 	_ = tmp.Close()
@@ -686,19 +757,26 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[str
 		_ = os.Remove(file)
 	}()
 
-	cmd := c.cmdContext(pkg.binary,
-		"-test.run", "^"+regexp.QuoteMeta(name)+"$",
+	args := []string{
+		"-test.run", "^" + regexp.QuoteMeta(name) + "$",
 		"-test.timeout", testTimeout.String(),
-		"-test.coverprofile", file)
+		"-test.coverprofile", file,
+	}
+	if c.mapWorkers > 1 {
+		args = append(args, "-test.v")
+	}
+	cmd := c.cmdContext(pkg.binary, args...)
 	cmd.Dir = pkg.dir
 
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return testCoverage{}, fmt.Errorf("%w\n%s", err, out)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return testCoverage{}, false, fmt.Errorf("%w\n%s", err, out)
 	}
+	skipped := bytes.Contains(out, []byte("--- SKIP: "))
 
 	f, err := os.Open(file) //nolint:gosec // G304: the path is Gremlins' own working directory
 	if err != nil {
-		return testCoverage{}, err
+		return testCoverage{}, false, err
 	}
 	defer func(f *os.File) {
 		_ = f.Close()
@@ -706,10 +784,10 @@ func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[str
 
 	profiles, err := cover.ParseProfilesFromReader(f)
 	if err != nil {
-		return testCoverage{}, err
+		return testCoverage{}, false, err
 	}
 
-	return c.splitCoverage(pkg, profiles, sources), nil
+	return c.splitCoverage(pkg, profiles, sources), skipped, nil
 }
 
 // testMapCoverPkg is the coverage scope a package's tests are mapped under.

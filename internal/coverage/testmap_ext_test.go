@@ -85,6 +85,20 @@ const notMainEnv = "GREMLINS_TEST_NOT_MAIN"
 // no package claims, as a //line directive can produce.
 const extraProfileEnv = "GREMLINS_TEST_EXTRA_PROFILE"
 
+// concurrencyDirEnv names a directory a test run marks itself running in for
+// a moment, appending how many runs it saw at once to <dir>/peaks; failOnceEnv
+// names a test whose first run fails and whose later ones pass, as a test that
+// failed only because others ran beside it would (#1561).
+// skipOnceEnv names a test whose first run skips, as one that found a shared
+// resource busy would, and whose later runs execute; extraTestEnv adds a third
+// test to the root package, so a package can hold more tests than workers.
+const (
+	concurrencyDirEnv = "GREMLINS_TEST_CONCURRENCY_DIR"
+	failOnceEnv       = "GREMLINS_TEST_FAIL_ONCE"
+	skipOnceEnv       = "GREMLINS_TEST_SKIP_ONCE"
+	extraTestEnv      = "GREMLINS_TEST_EXTRA_TEST"
+)
+
 // compileDelayEnv and runDelayEnv make the fake go's test-binary compile and
 // each test run take at least that long, as Go durations, so that a test can
 // reason about the times the map records. A fake coverage gather pays both, per
@@ -622,6 +636,9 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 			fmt.Fprint(os.Stdout, "TestDouble\nTestTriple\n")
 		default:
 			fmt.Fprint(os.Stdout, "TestRangeDescending\nTestRangeAscending\n")
+			if os.Getenv(extraTestEnv) != "" {
+				fmt.Fprint(os.Stdout, "TestRangeExtra\n")
+			}
 		}
 		os.Exit(0) // skipcq: RVV-A0003
 	}
@@ -630,6 +647,29 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	recordInvocation("run " + run)
 	recordInvocation("profile " + flagValue(os.Args, "-test.coverprofile"))
 	sleepFor(runDelayEnv, 1)
+	markRunning(run)
+	if run != "" && run == os.Getenv(failOnceEnv) {
+		marker := filepath.Join(root, ".failed-once-"+run)
+		// #nosec G703 - the path is this test's own fixture root
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			writeOrDie(marker, "")
+			fmt.Fprintln(os.Stderr, "--- FAIL: "+run+" (once)")
+			os.Exit(1) // skipcq: RVV-A0003
+		}
+	}
+	if run != "" && run == os.Getenv(skipOnceEnv) {
+		marker := filepath.Join(root, ".skipped-once-"+run)
+		// #nosec G703 - the path is this test's own fixture root
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			writeOrDie(marker, "")
+			// As the testing package reports a skip: only under -test.v.
+			if hasFlag(os.Args, "-test.v") {
+				fmt.Fprintln(os.Stdout, "--- SKIP: "+run+" (0.00s)")
+			}
+			writeOrDie(flagValue(os.Args, "-test.coverprofile"), "mode: set\n")
+			os.Exit(0) // skipcq: RVV-A0003
+		}
+	}
 	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)
 		os.Exit(1) // skipcq: RVV-A0003
@@ -640,6 +680,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		"TestSizeAscending":   profileSizeAscending,
 		"TestDouble":          profileDouble,
 		"TestTriple":          profileTriple,
+		"TestRangeExtra":      profileRangeAscending,
 	}
 	profile, ok := profiles[run]
 	if !ok {
@@ -850,6 +891,32 @@ func buildIDFor(binary string) string {
 	}
 
 	return "buildid-of-" + filepath.Base(binary)
+}
+
+// markRunning holds a marker for this run in the concurrency directory long
+// enough for runs beside it to see it, and records how many it saw.
+func markRunning(run string) {
+	dir := os.Getenv(concurrencyDirEnv)
+	if dir == "" {
+		return
+	}
+	mine := filepath.Join(dir, run+".running")
+	writeOrDie(mine, "")
+	// Held for a second and sampled through it, so runs that start a little
+	// apart on a loaded machine still see each other.
+	seen := 0
+	for range 20 {
+		running, _ := filepath.Glob(filepath.Join(dir, "*.running"))
+		seen = max(seen, len(running))
+		time.Sleep(50 * time.Millisecond)
+	}
+	// #nosec G304 G703 - the path comes from the environment this test process was given
+	f, err := os.OpenFile(filepath.Join(dir, "peaks"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err == nil {
+		fmt.Fprintln(f, seen)
+		_ = f.Close()
+	}
+	_ = os.Remove(mine) // #nosec G703 - the marker this process wrote above
 }
 
 // recordInvocation appends to the file a test is watching, if it asked for one.
