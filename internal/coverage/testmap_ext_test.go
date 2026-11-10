@@ -245,6 +245,14 @@ func writeFixture(t *testing.T, path, content string) {
 func buildMap(t *testing.T, helper string, opts ...coverage.Option) *coverage.TestMap {
 	t.Helper()
 
+	return buildMapEnv(t, helper, "", nil, opts...)
+}
+
+// buildMapEnv is buildMap with an invocation log and extra environment for the
+// fake go and the test binaries it stands in for.
+func buildMapEnv(t *testing.T, helper, logPath string, env []string, opts ...coverage.Option) *coverage.TestMap {
+	t.Helper()
+
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	t.Cleanup(log.Reset)
 
@@ -258,7 +266,7 @@ func buildMap(t *testing.T, helper string, opts ...coverage.Option) *coverage.Te
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
 	// Every test gets its own cache directory: the real one belongs to whoever
 	// is running the suite, and a shared one would let one test answer another.
-	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
+	cov := coverage.NewWithCmd(fakeGoCommandWith(helper, root, "", logPath, "", "", "", "", env...), t.TempDir(), mod,
 		append([]coverage.Option{coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes()}, opts...)...)
 
 	tm, err := cov.BuildTestMap()
@@ -336,6 +344,52 @@ const scoped = "example.com/vm"
 // with no tests", so a mutant there still falls back to its package's whole
 // suite (TestSelectionFallsBackToTheWholeSuite, "when the mutated package could
 // not be mapped") rather than running nothing.
+// logLines is the invocation log, a line per entry.
+func logLines(t *testing.T, path string) []string {
+	t.Helper()
+
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the test's own temp file
+	if err != nil {
+		t.Fatalf("cannot read the invocation log: %v", err)
+	}
+
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l != "" {
+			lines = append(lines, l)
+		}
+	}
+
+	return lines
+}
+
+// Two tests running at once must never share a profile file (#1561): one would
+// read the other's coverage, and the map would attribute it silently.
+func TestEveryMappedTestWritesItsOwnProfile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "invocations")
+	tm := buildMapEnv(t, "TestTestMapHelperProcess", logPath, nil)
+	if tm.Len() != 5 {
+		t.Fatalf("want 5 tests mapped, got %d", tm.Len())
+	}
+	seen := map[string]bool{}
+	for _, line := range logLines(t, logPath) {
+		p, ok := strings.CutPrefix(line, "profile ")
+		if !ok {
+			continue
+		}
+		if seen[p] {
+			t.Errorf("profile path %s used by two tests", p)
+		}
+		seen[p] = true
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("profile %s was left behind", p)
+		}
+	}
+	if len(seen) != 5 {
+		t.Errorf("want 5 distinct profile paths, got %d", len(seen))
+	}
+}
+
 func TestBuildTestMapMapsOnlyThePackagesInScope(t *testing.T) {
 	tm := buildMap(t, "TestTestMapHelperProcess", coverage.WithMapScope([]string{scoped}))
 
@@ -439,7 +493,7 @@ func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) 
 	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string, extraEnv ...string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -464,6 +518,7 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notM
 			notMainEnv + "=" + notMain,
 			extraProfileEnv + "=" + extraProfile,
 		}
+		cmd.Env = append(cmd.Env, extraEnv...)
 
 		return cmd
 	}
@@ -573,6 +628,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 
 	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
 	recordInvocation("run " + run)
+	recordInvocation("profile " + flagValue(os.Args, "-test.coverprofile"))
 	sleepFor(runDelayEnv, 1)
 	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)

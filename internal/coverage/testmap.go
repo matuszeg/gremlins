@@ -664,13 +664,27 @@ const testTimeout = 10 * time.Minute
 // package's lines, and the dependency entities it reached (see
 // splitCoverage).
 func (c *Coverage) profileForTest(pkg *testPackage, name string, sources map[string]*depSource) (testCoverage, error) {
+	// Each test writes its own profile, never a shared name: tests can run
+	// beside each other (--map-workers), and one reading another's profile
+	// would map the wrong lines without a word (#1561). It lives in Gremlins'
+	// working directory and goes when the test has been read.
+	//
 	// The binary runs in the package directory, as `go test` runs it, so a test
 	// reading testdata still finds it. That makes the profile path have to be
 	// absolute.
-	file, err := filepath.Abs(filepath.Join(c.workDir, "testmap.cov"))
+	dir, err := filepath.Abs(c.workDir)
 	if err != nil {
 		return testCoverage{}, err
 	}
+	tmp, err := os.CreateTemp(dir, "testmap-*.cov")
+	if err != nil {
+		return testCoverage{}, err
+	}
+	file := tmp.Name()
+	_ = tmp.Close()
+	defer func() {
+		_ = os.Remove(file)
+	}()
 
 	cmd := c.cmdContext(pkg.binary,
 		"-test.run", "^"+regexp.QuoteMeta(name)+"$",
