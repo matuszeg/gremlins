@@ -144,11 +144,15 @@ func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, al
 	for _, p := range plan.Placed {
 		ids[p.Mutator] = p.ID
 	}
+	noVerdict := noVerdict(plan)
 	build := &plan.Build
 	judged, fell := d.schemaCounts.judged.Load(), d.schemaCounts.fallbacks.Load()
 	res := mu.execute(ctx, feed(all), func(mut mutator.Mutator, outCh chan<- mutator.Mutator, wg *sync.WaitGroup) workerpool.Executor {
 		if id, ok := ids[mut]; ok {
 			return d.NewSchemaExecutor(mut, id, build, outCh, wg)
+		}
+		if noVerdict[mut] {
+			return erroredExecutor{mutant: mut, outCh: outCh, wg: wg}
 		}
 
 		return d.NewExecutor(mut, outCh, wg)
@@ -164,10 +168,46 @@ func (mu *Engine) executePlaced(ctx context.Context, d *MutantExecutorDealer, al
 	// once its executor has judged it against the binaries.
 	res.Schemata = &report.SchemataSummary{
 		Placed:    int(d.schemaCounts.judged.Load() - judged),
-		PerMutant: len(plan.Netted) + int(d.schemaCounts.fallbacks.Load()-fell),
+		PerMutant: len(plan.Netted) - len(noVerdict) + int(d.schemaCounts.fallbacks.Load()-fell),
+		NoVerdict: len(noVerdict),
 	}
 
 	return res
+}
+
+// noVerdict is the netted mutants of plan that can reach no verdict: a
+// package they select has tests that fail with no mutant switched on, so on
+// the per-mutant path such a test would "kill" them, a detection that never
+// happened (#1397 in matuszeg/plumage).
+//
+// Every one of them, not only those whose own selection runs a failing test:
+// which tests failed is not known whole (the null run stops at the first
+// failure), and the run fails as soon as one mutant is ERRORED, which the
+// mutant selecting the failing test always is. What would be kept is verdicts
+// in a run that has already failed.
+func noVerdict(plan schemata.Plan) map[mutator.Mutator]bool {
+	out := map[mutator.Mutator]bool{}
+	for _, e := range plan.Netted {
+		if e.Red != "" {
+			out[e.Mutator] = true
+		}
+	}
+
+	return out
+}
+
+// erroredExecutor records its mutant as ERRORED without running anything: a
+// verdict on it was impossible before it started.
+type erroredExecutor struct {
+	mutant mutator.Mutator
+	outCh  chan<- mutator.Mutator
+	wg     *sync.WaitGroup
+}
+
+func (e erroredExecutor) Start(_ *workerpool.Worker) {
+	defer e.wg.Done()
+	e.mutant.SetStatus(mutator.Errored)
+	e.outCh <- e.mutant
 }
 
 // SchemataKeepEnv names the environment variable that keeps a --schemata
@@ -399,13 +439,14 @@ func (m MutantExecutorDealer) schemaNullRun(ctx context.Context, tmpDir string, 
 	}
 
 	return func(b *schemata.Build, bin, pkgDir string) error {
+		// Failures before the binary runs say nothing about its tests.
 		dir, root, err := m.nullRunDir(pkgDir)
 		if err != nil {
-			return fmt.Errorf("%s in %s: %w", filepath.Base(bin), pkgDir, err)
+			return fmt.Errorf("%s in %s: %w: %w", filepath.Base(bin), pkgDir, schemata.ErrNoNullRun, err)
 		}
 		overlay, err := overlays.get(b, root, tmpDir)
 		if err != nil {
-			return fmt.Errorf("%s in %s: %w", filepath.Base(bin), dir, err)
+			return fmt.Errorf("%s in %s: %w: %w", filepath.Base(bin), dir, schemata.ErrNoNullRun, err)
 		}
 
 		return m.nullRun(ctx, bin, dir, overlay, targets.testsAt(pkgDir))

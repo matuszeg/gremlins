@@ -18,6 +18,7 @@ package schemata
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -47,6 +48,9 @@ type Placed struct {
 type NetEntry struct {
 	Mutator mutator.Mutator
 	Reason  string
+	// Red is the package whose tests failed with no mutant switched on, when
+	// that is why the mutant was netted (NoVerdict(Reason) holds), else "".
+	Red string
 }
 
 // Plan is how a run's mutants execute: the schema build, the mutants placed
@@ -68,6 +72,21 @@ type NullRunFunc func(b *Build, bin, pkgDir string) error
 
 // nullFailed prefixes the reason of a mutant netted by a failing null run.
 const nullFailed = "null-mutant run failed: "
+
+// ErrNoNullRun marks a NullRunFunc error from before the binary ran: no copy
+// to run it in, no overlay. It says nothing about the tests, so the package's
+// mutants take the per-mutant path rather than being read as having red tests.
+var ErrNoNullRun = errors.New("no null run")
+
+// NoVerdict reports whether reason nets a mutant because a package it selects
+// has tests that fail with no mutant switched on. Such a mutant has no verdict
+// to reach anywhere: on the per-mutant path the failing test would "kill" it,
+// a detection that never happened (#1397 in matuszeg/plumage). The engine
+// records it as ERRORED, which fails the run as any mutant without a verdict
+// does, and NetEntry.Red names the package.
+func NoVerdict(reason string) bool {
+	return strings.HasPrefix(reason, nullFailed)
+}
 
 // Prepare places the run's mutants in one schema build of mod.
 //
@@ -112,7 +131,7 @@ func prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 	if root, err := filepath.Abs(mod.Root); err == nil {
 		mod.Root = root
 	}
-	p := &preparer{mod: mod, muts: runnable, reasons: make([]string, len(runnable))}
+	p := &preparer{mod: mod, muts: runnable, reasons: make([]string, len(runnable)), red: make([]string, len(runnable))}
 	if len(runnable) == 0 {
 		return Plan{}, nil
 	}
@@ -143,10 +162,11 @@ func prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 		for pkg, err := range errs {
 			failed[pkg] = err.Error()
 		}
-		if err := p.nullCheck(ctx, &b, failed, nullRun); err != nil {
+		red := map[string]bool{}
+		if err := p.nullCheck(ctx, &b, failed, red, nullRun); err != nil {
 			return Plan{}, err
 		}
-		p.netFailed(need, failed)
+		p.netFailed(need, failed, red)
 		plan.Build = b
 	}
 
@@ -154,12 +174,17 @@ func prepare(ctx context.Context, mod gomodule.GoModule, workDir, tags string, r
 	fullLogged := map[pkgReason]bool{}
 	for i, m := range runnable {
 		if r := p.reasons[i]; r != "" {
-			plan.Netted = append(plan.Netted, NetEntry{Mutator: m, Reason: r})
+			plan.Netted = append(plan.Netted, NetEntry{Mutator: m, Reason: r, Red: p.red[i]})
 			short := shortReason(r)
-			log.Errorf("schemata: %s at %s goes through the per-mutant path: %s\n", m.Type(), m.Position(), short)
+			if NoVerdict(r) {
+				log.Errorf("schemata: %s at %s reaches no verdict: the tests of %s it selects fail with no mutant: %s\n",
+					m.Type(), m.Position(), p.red[i], strings.TrimPrefix(short, nullFailed))
+			} else {
+				log.Errorf("schemata: %s at %s goes through the per-mutant path: %s\n", m.Type(), m.Position(), short)
+			}
 			if k := (pkgReason{m.Pkg(), r}); short != r && !fullLogged[k] {
 				fullLogged[k] = true
-				log.Errorf("schemata: per-mutant path for %s: %s\n", m.Pkg(), r)
+				log.Errorf("schemata: in full, for %s: %s\n", m.Pkg(), r)
 			}
 
 			continue
@@ -178,6 +203,8 @@ type preparer struct {
 	mod     gomodule.GoModule
 	muts    []mutator.Mutator
 	reasons []string
+	// red is, per mutant, the package whose failed null run netted it.
+	red []string
 	// pkgOf is the import path of each mutant's package, for netFailed.
 	pkgOf []string
 }
@@ -351,8 +378,9 @@ func (p *preparer) sites(lp *packages.Package, idx []int) []Site {
 }
 
 // nullCheck runs every built binary once with no mutant selected, and once
-// more on failure; a second failure marks the package failed.
-func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]string, nullRun NullRunFunc) error {
+// more on failure; a second failure marks the package failed, and red unless
+// the run could not start (ErrNoNullRun).
+func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]string, red map[string]bool, nullRun NullRunFunc) error {
 	for _, pkg := range slices.Sorted(maps.Keys(b.Binaries)) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -368,7 +396,13 @@ func (p *preparer) nullCheck(ctx context.Context, b *Build, failed map[string]st
 			continue
 		}
 		if err := nullRun(b, bin, dir); err != nil {
+			if errors.Is(err, ErrNoNullRun) {
+				failed[pkg] = "schemata: " + firstLine(err)
+
+				continue
+			}
 			failed[pkg] = nullFailed + firstLine(err)
+			red[pkg] = true
 		}
 	}
 
@@ -389,17 +423,30 @@ func (p *preparer) netUnselected(need map[string][]string) {
 	}
 }
 
-// netFailed nets every still-placed mutant whose own package, or a package
-// need lists for it, failed. The own package counts even when need does not
-// list it: BuildAll records a failure to write a package's rewritten files
-// under that package, and then no binary compiles its mutants in.
-func (p *preparer) netFailed(need map[string][]string, failed map[string]string) {
+// netFailed nets every mutant whose own package, or a package need lists for
+// it, failed. The own package counts even when need does not list it:
+// BuildAll records a failure to write a package's rewritten files under that
+// package, and then no binary compiles its mutants in.
+//
+// A red package (one whose tests failed with no mutant) wins over every other
+// reason, an earlier one included: the per-mutant path that other reasons lead
+// to would run the red test too, and "kill" the mutant with it (#1397 in
+// matuszeg/plumage). Otherwise the first failed package's reason nets a mutant
+// that has none yet.
+func (p *preparer) netFailed(need map[string][]string, failed map[string]string, red map[string]bool) {
 	for i := range p.muts {
-		if p.reasons[i] != "" {
+		own := p.pkgOf[i]
+		if own == "" {
 			continue
 		}
-		own := p.pkgOf[i]
-		for _, pkg := range append([]string{own}, need[own]...) {
+		pkgs := append([]string{own}, need[own]...)
+		if k := slices.IndexFunc(pkgs, func(pkg string) bool { return red[pkg] }); k >= 0 {
+			p.reasons[i] = failed[pkgs[k]]
+			p.red[i] = pkgs[k]
+
+			continue
+		}
+		for _, pkg := range pkgs {
 			if r, ok := failed[pkg]; ok {
 				p.net(i, r)
 

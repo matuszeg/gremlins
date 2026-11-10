@@ -221,6 +221,18 @@ func byPkg(plan schemata.Plan) planByPkg {
 	return g
 }
 
+// nettedLine is the error line Prepare logs for netted mutant n with its
+// reason's short form: no verdict for a red package, named; the per-mutant
+// path for any other reason.
+func nettedLine(n schemata.NetEntry, short string) string {
+	if schemata.NoVerdict(n.Reason) {
+		return fmt.Sprintf("schemata: %s at %s reaches no verdict: the tests of %s it selects fail with no mutant: %s\n",
+			n.Mutator.Type(), n.Mutator.Position(), n.Red, strings.TrimPrefix(short, "null-mutant run failed: "))
+	}
+
+	return fmt.Sprintf("schemata: %s at %s goes through the per-mutant path: %s\n", n.Mutator.Type(), n.Mutator.Position(), short)
+}
+
 // TestPrepare is not parallel: it captures the process-wide log.
 func TestPrepare(t *testing.T) {
 	mod := prepareModule(t)
@@ -310,7 +322,7 @@ func TestPrepare(t *testing.T) {
 	}
 	checkPlacedLogged(t, out.String(), plan)
 	for _, n := range plan.Netted {
-		line := fmt.Sprintf("schemata: %s at %s goes through the per-mutant path: %s\n", n.Mutator.Type(), n.Mutator.Position(), n.Reason)
+		line := nettedLine(n, n.Reason)
 		if !strings.Contains(eOut.String(), line) {
 			t.Errorf("error log lacks %q", line)
 		}
@@ -615,13 +627,13 @@ func TestPrepareLogsShortReasons(t *testing.T) {
 				short = short[:len(short)-1]
 			}
 		}
-		line := fmt.Sprintf("schemata: %s at %s goes through the per-mutant path: %s\n", n.Mutator.Type(), n.Mutator.Position(), short)
+		line := nettedLine(n, short)
 		if !strings.Contains(logged, line) {
 			t.Errorf("error log lacks %q", line)
 		}
 	}
 	for _, p := range []string{bad, ok} {
-		full := fmt.Sprintf("schemata: per-mutant path for %s: %s\n", p, g.reasons[p][0])
+		full := fmt.Sprintf("schemata: in full, for %s: %s\n", p, g.reasons[p][0])
 		if c := strings.Count(logged, full); c != 1 {
 			t.Errorf("full reason of %s logged %d times, want once:\n%s", p, c, logged)
 		}
@@ -779,5 +791,92 @@ func TestPrepareRelativeRoot(t *testing.T) {
 		if !filepath.IsAbs(bin) || !filepath.IsAbs(dir) {
 			t.Errorf("null run of %s in %s: want absolute paths", bin, dir)
 		}
+	}
+}
+
+// TestARedNullRunNamesItsTestsAndOverridesOtherReasons fails a's null run every
+// time, as a test red with no mutant does. Every mutant of a is then netted for
+// that, including the two += mutants that would otherwise go to the
+// per-mutant path as unsupported sites, where the red test would "kill" them
+// (#1397 in matuszeg/plumage); each entry names the red package, and the log
+// names the failing test.
+//
+// It is not parallel: it captures the process-wide log.
+func TestARedNullRunNamesItsTestsAndOverridesOtherReasons(t *testing.T) {
+	mod := prepareModule(t)
+	in := streamMutants(t, mod)
+	runs := &nullRuns{fail: func(pkgDir string, _ int) error {
+		if filepath.Base(pkgDir) == "a" {
+			return errors.New("a.test in a: exit status 1: --- FAIL: TestAdd (0.00s)\n" +
+				"--- FAIL: TestAdd (0.00s)\n    --- FAIL: TestAdd/sub (0.00s)\n--- FAIL: TestOther (0.00s)\nFAIL\n")
+		}
+
+		return nil
+	}}
+	var out, eOut bytes.Buffer
+	log.Init(&out, &eOut)
+	defer log.Reset()
+
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, 0, 0, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkAccounting(t, in, plan)
+	a := prepareMod + "/a"
+	n := 0
+	for _, e := range plan.Netted {
+		if e.Mutator.Pkg() != a {
+			continue
+		}
+		n++
+		if !schemata.NoVerdict(e.Reason) || e.Red != a {
+			t.Errorf("%s at %s: reason %q, red %q; want a null-run reason naming %s",
+				e.Mutator.Type(), e.Mutator.Position(), e.Reason, e.Red, a)
+		}
+	}
+	if n != 3 {
+		t.Errorf("netted %d of a's mutants, want all 3", n)
+	}
+	if !strings.Contains(eOut.String(), "--- FAIL: TestAdd") {
+		t.Errorf("the log does not name the failing test:\n%s", eOut.String())
+	}
+}
+
+// TestANullRunThatCouldNotStartIsNotARedTest fails b's null run before its
+// binary ran, as a broken copy or overlay does: nothing is known about b's
+// tests, so its mutants take the per-mutant path, never a no-verdict reason.
+//
+// It is not parallel: it captures the process-wide log.
+func TestANullRunThatCouldNotStartIsNotARedTest(t *testing.T) {
+	mod := prepareModule(t)
+	in := streamMutants(t, mod)
+	runs := &nullRuns{fail: func(pkgDir string, _ int) error {
+		if filepath.Base(pkgDir) == "b" {
+			return fmt.Errorf("b.test in b: %w: overlay: disk full", schemata.ErrNoNullRun)
+		}
+
+		return nil
+	}}
+	var out, eOut bytes.Buffer
+	log.Init(&out, &eOut)
+	defer log.Reset()
+
+	plan, err := schemata.Prepare(context.Background(), mod, t.TempDir(), "", in, ownPackage, 2*time.Minute, 0, 0, runs.run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := prepareMod + "/b"
+	n := 0
+	for _, e := range plan.Netted {
+		if e.Mutator.Pkg() != b {
+			continue
+		}
+		n++
+		if schemata.NoVerdict(e.Reason) || e.Red != "" || !strings.Contains(e.Reason, "disk full") {
+			t.Errorf("%s: reason %q, red %q; want the setup failure, not a red test", e.Mutator.Type(), e.Reason, e.Red)
+		}
+	}
+	if n == 0 {
+		t.Error("b's mutants were not netted")
 	}
 }

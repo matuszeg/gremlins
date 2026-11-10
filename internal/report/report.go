@@ -59,6 +59,10 @@ type Results struct {
 type SchemataSummary struct {
 	Placed    int
 	PerMutant int
+	// NoVerdict is the mutants that ran nowhere: a test their own selection
+	// runs fails with no mutant switched on, so any verdict would be the
+	// failing test's, not theirs. They are reported ERRORED.
+	NoVerdict int
 	// NotUsed says why no schema build was made although schemata is on
 	// and there were runnable mutants: "dry run", or "integration mode".
 	// Placed is 0 then.
@@ -187,7 +191,11 @@ func (r *reportStatus) reportFindings() {
 		if r.schemata.NotUsed != "" {
 			log.Infof("Schemata: not used (%s), per-mutant path %d\n", r.schemata.NotUsed, r.schemata.PerMutant)
 		} else {
-			log.Infof("Schemata: placed %d, per-mutant path %d\n", r.schemata.Placed, r.schemata.PerMutant)
+			noVerdict := ""
+			if r.schemata.NoVerdict > 0 {
+				noVerdict = fmt.Sprintf(", no verdict %d", r.schemata.NoVerdict)
+			}
+			log.Infof("Schemata: placed %d, per-mutant path %d%s\n", r.schemata.Placed, r.schemata.PerMutant, noVerdict)
 		}
 	}
 	r.fileReport()
