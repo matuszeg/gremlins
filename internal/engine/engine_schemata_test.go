@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -39,6 +40,7 @@ import (
 	"github.com/go-gremlins/gremlins/internal/deps"
 	"github.com/go-gremlins/gremlins/internal/engine"
 	"github.com/go-gremlins/gremlins/internal/engine/workdir"
+	"github.com/go-gremlins/gremlins/internal/execution"
 	"github.com/go-gremlins/gremlins/internal/gomodule"
 	"github.com/go-gremlins/gremlins/internal/log"
 	"github.com/go-gremlins/gremlins/internal/memlimit"
@@ -122,6 +124,64 @@ func TestSchemataParity(t *testing.T) {
 	_ = report.Do(res)
 	if want := fmt.Sprintf("Schemata: placed %d, per-mutant path 0\n", runnable); !strings.Contains(out.String(), want) {
 		t.Errorf("report does not contain %q:\n%s", want, out.String())
+	}
+}
+
+// TestARedTestIsNoKill runs --schemata over testdata/redbaseline. Sum's
+// mutant is covered only by tests that cannot tell it from the original, one
+// of which, TestBroken, fails with no mutant at all wherever gremlins runs it.
+// A test that fails unmutated proves nothing about a mutant, so no mutant of
+// the package may be KILLED by it: each is ERRORED, Mul's too, although its
+// own TestMul passes (the run fails either way, and which tests failed is not
+// known whole), the run fails as an errored run does, and the log names the
+// package and the test (#1397 in matuszeg/plumage).
+//
+// It is not parallel: it captures the global log.
+func TestARedTestIsNoKill(t *testing.T) {
+	modRoot, err := filepath.Abs("testdata/redbaseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mod := gomodule.GoModule{Name: "redbaseline", Root: modRoot, CallingDir: "."}
+	selection := map[string]any{
+		configuration.UnleashCrossPackageKey:  true,
+		configuration.UnleashTestSelectionKey: true,
+	}
+	prof, opts := paritySelection(t, mod, selection)
+
+	out := &bytes.Buffer{}
+	log.Init(out, out)
+	defer log.Reset()
+	got, res, _ := runParityWith(t, mod, prof, true, selection, opts...)
+	want := map[string]mutator.Status{
+		"red/red.go:8:35 ARITHMETIC_BASE":  mutator.Errored,
+		"red/red.go:12:35 ARITHMETIC_BASE": mutator.Errored,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("statuses = %v, want %v", got, want)
+	}
+	// The package and the test, so a flaky test that fails a whole run can be
+	// found from the log alone.
+	for _, want := range []string{"redbaseline/red", "TestBroken"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the log does not name %s:\n%s", want, out.String())
+		}
+	}
+	if res.Schemata == nil {
+		t.Fatal("no schemata summary")
+	}
+	if want := (report.SchemataSummary{Placed: 0, PerMutant: 0, NoVerdict: 2}); *res.Schemata != want {
+		t.Errorf("schemata summary = %+v, want %+v", *res.Schemata, want)
+	}
+	rep := &bytes.Buffer{}
+	log.Reset()
+	log.Init(rep, rep)
+	var exitErr *execution.ExitError
+	if err := report.Do(res); !errors.As(err, &exitErr) || exitErr.ExitCode() != execution.NewExitErr(execution.ErroredMutants).ExitCode() {
+		t.Errorf("report.Do = %v, want the errored-mutants exit", err)
+	}
+	if want := "Schemata: placed 0, per-mutant path 0, no verdict 2\n"; !strings.Contains(rep.String(), want) {
+		t.Errorf("report does not contain %q:\n%s", want, rep.String())
 	}
 }
 
