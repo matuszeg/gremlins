@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -262,5 +263,35 @@ func TestNoMoreRerunsOnceThePackageIsLost(t *testing.T) {
 	// is then not re-run.
 	if n := countRuns(t, logPath, "TestRangeExtra"); n != 1 {
 		t.Errorf("want TestRangeExtra run once, got %d", n)
+	}
+}
+
+// verboseRuns counts the runs that were asked for -test.v.
+func verboseRuns(t *testing.T, logPath string) int {
+	t.Helper()
+
+	n := 0
+	for _, l := range logLines(t, logPath) {
+		if strings.HasPrefix(l, "verbose ") {
+			n++
+		}
+	}
+
+	return n
+}
+
+// One worker runs the command it always ran: -test.v flips testing.Verbose()
+// and prints every passing test's log, so it is asked for only where a skip
+// has to be seen, beside other tests.
+func TestOnlyConcurrentMappingRunsVerbose(t *testing.T) {
+	serial := filepath.Join(t.TempDir(), "invocations")
+	buildMapEnv(t, "TestTestMapHelperProcess", serial, nil)
+	if n := verboseRuns(t, serial); n != 0 {
+		t.Errorf("one worker: want no run with -test.v, got %d", n)
+	}
+	concurrent := filepath.Join(t.TempDir(), "invocations")
+	buildMapEnv(t, "TestTestMapHelperProcess", concurrent, nil, coverage.WithMapWorkers(2))
+	if n := verboseRuns(t, concurrent); n != 5 {
+		t.Errorf("two workers: want every run with -test.v, got %d", n)
 	}
 }

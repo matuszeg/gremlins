@@ -646,6 +646,9 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
 	recordInvocation("run " + run)
 	recordInvocation("profile " + flagValue(os.Args, "-test.coverprofile"))
+	if hasFlag(os.Args, "-test.v") {
+		recordInvocation("verbose " + run)
+	}
 	sleepFor(runDelayEnv, 1)
 	markRunning(run)
 	if run != "" && run == os.Getenv(failOnceEnv) {
