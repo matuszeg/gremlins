@@ -162,6 +162,11 @@ func TestUnleash(t *testing.T) {
 			defValue:  "",
 		},
 		{
+			name:     "map-workers",
+			flagType: "int",
+			defValue: "1",
+		},
+		{
 			name:     "test-cpu",
 			flagType: "int",
 			defValue: "0",

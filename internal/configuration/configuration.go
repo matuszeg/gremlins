@@ -63,6 +63,7 @@ const (
 	UnleashOutputDiffStatusesKey   = "unleash.output-diff-statuses"
 	UnleashOnShutdownStatusKey     = "unleash.on-shutdown-status"
 	UnleashTestMemoryLimitKey      = "unleash.test-memory-limit"
+	UnleashMapWorkersKey           = "unleash.map-workers"
 )
 
 const (

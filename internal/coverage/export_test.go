@@ -38,3 +38,6 @@ func WithStubTypes() Option {
 		return c
 	}
 }
+
+// MapWorkersOf is how many tests c's cold map runs at once.
+func MapWorkersOf(c *Coverage) int { return c.mapWorkers }
