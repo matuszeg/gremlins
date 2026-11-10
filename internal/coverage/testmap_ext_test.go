@@ -85,6 +85,20 @@ const notMainEnv = "GREMLINS_TEST_NOT_MAIN"
 // no package claims, as a //line directive can produce.
 const extraProfileEnv = "GREMLINS_TEST_EXTRA_PROFILE"
 
+// concurrencyDirEnv names a directory a test run marks itself running in for
+// a moment, appending how many runs it saw at once to <dir>/peaks; failOnceEnv
+// names a test whose first run fails and whose later ones pass, as a test that
+// failed only because others ran beside it would (#1561).
+// skipOnceEnv names a test whose first run skips, as one that found a shared
+// resource busy would, and whose later runs execute; extraTestEnv adds a third
+// test to the root package, so a package can hold more tests than workers.
+const (
+	concurrencyDirEnv = "GREMLINS_TEST_CONCURRENCY_DIR"
+	failOnceEnv       = "GREMLINS_TEST_FAIL_ONCE"
+	skipOnceEnv       = "GREMLINS_TEST_SKIP_ONCE"
+	extraTestEnv      = "GREMLINS_TEST_EXTRA_TEST"
+)
+
 // compileDelayEnv and runDelayEnv make the fake go's test-binary compile and
 // each test run take at least that long, as Go durations, so that a test can
 // reason about the times the map records. A fake coverage gather pays both, per
@@ -245,6 +259,14 @@ func writeFixture(t *testing.T, path, content string) {
 func buildMap(t *testing.T, helper string, opts ...coverage.Option) *coverage.TestMap {
 	t.Helper()
 
+	return buildMapEnv(t, helper, "", nil, opts...)
+}
+
+// buildMapEnv is buildMap with an invocation log and extra environment for the
+// fake go and the test binaries it stands in for.
+func buildMapEnv(t *testing.T, helper, logPath string, env []string, opts ...coverage.Option) *coverage.TestMap {
+	t.Helper()
+
 	log.Init(&bytes.Buffer{}, &bytes.Buffer{})
 	t.Cleanup(log.Reset)
 
@@ -258,7 +280,7 @@ func buildMap(t *testing.T, helper string, opts ...coverage.Option) *coverage.Te
 	mod := gomodule.GoModule{Name: "example.com", Root: ".", CallingDir: "."}
 	// Every test gets its own cache directory: the real one belongs to whoever
 	// is running the suite, and a shared one would let one test answer another.
-	cov := coverage.NewWithCmd(fakeGoCommand(helper, root), t.TempDir(), mod,
+	cov := coverage.NewWithCmd(fakeGoCommandWith(helper, root, "", logPath, "", "", "", "", env...), t.TempDir(), mod,
 		append([]coverage.Option{coverage.WithTestMapCacheDir(t.TempDir()), coverage.WithStubTypes()}, opts...)...)
 
 	tm, err := cov.BuildTestMap()
@@ -336,6 +358,52 @@ const scoped = "example.com/vm"
 // with no tests", so a mutant there still falls back to its package's whole
 // suite (TestSelectionFallsBackToTheWholeSuite, "when the mutated package could
 // not be mapped") rather than running nothing.
+// logLines is the invocation log, a line per entry.
+func logLines(t *testing.T, path string) []string {
+	t.Helper()
+
+	data, err := os.ReadFile(path) //nolint:gosec // G304: the test's own temp file
+	if err != nil {
+		t.Fatalf("cannot read the invocation log: %v", err)
+	}
+
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l != "" {
+			lines = append(lines, l)
+		}
+	}
+
+	return lines
+}
+
+// Two tests running at once must never share a profile file (#1561): one would
+// read the other's coverage, and the map would attribute it silently.
+func TestEveryMappedTestWritesItsOwnProfile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "invocations")
+	tm := buildMapEnv(t, "TestTestMapHelperProcess", logPath, nil)
+	if tm.Len() != 5 {
+		t.Fatalf("want 5 tests mapped, got %d", tm.Len())
+	}
+	seen := map[string]bool{}
+	for _, line := range logLines(t, logPath) {
+		p, ok := strings.CutPrefix(line, "profile ")
+		if !ok {
+			continue
+		}
+		if seen[p] {
+			t.Errorf("profile path %s used by two tests", p)
+		}
+		seen[p] = true
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("profile %s was left behind", p)
+		}
+	}
+	if len(seen) != 5 {
+		t.Errorf("want 5 distinct profile paths, got %d", len(seen))
+	}
+}
+
 func TestBuildTestMapMapsOnlyThePackagesInScope(t *testing.T) {
 	tm := buildMap(t, "TestTestMapHelperProcess", coverage.WithMapScope([]string{scoped}))
 
@@ -439,7 +507,7 @@ func fakeGoCommand(helper, pkgRoot string) func(command string, args ...string) 
 	return fakeGoCommandWith(helper, pkgRoot, "", "", "", "", "", "")
 }
 
-func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string) func(command string, args ...string) *exec.Cmd {
+func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notMain, extraProfile string, extraEnv ...string) func(command string, args ...string) *exec.Cmd {
 	return func(command string, args ...string) *exec.Cmd {
 		cs := []string{"-test.run=" + helper, "--", command}
 		cs = append(cs, args...)
@@ -464,6 +532,7 @@ func fakeGoCommandWith(helper, pkgRoot, buildIDs, logPath, listOnly, goEnv, notM
 			notMainEnv + "=" + notMain,
 			extraProfileEnv + "=" + extraProfile,
 		}
+		cmd.Env = append(cmd.Env, extraEnv...)
 
 		return cmd
 	}
@@ -567,13 +636,43 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 			fmt.Fprint(os.Stdout, "TestDouble\nTestTriple\n")
 		default:
 			fmt.Fprint(os.Stdout, "TestRangeDescending\nTestRangeAscending\n")
+			if os.Getenv(extraTestEnv) != "" {
+				fmt.Fprint(os.Stdout, "TestRangeExtra\n")
+			}
 		}
 		os.Exit(0) // skipcq: RVV-A0003
 	}
 
 	run := strings.Trim(flagValue(os.Args, "-test.run"), "^$")
 	recordInvocation("run " + run)
+	recordInvocation("profile " + flagValue(os.Args, "-test.coverprofile"))
+	if hasFlag(os.Args, "-test.v") {
+		recordInvocation("verbose " + run)
+	}
 	sleepFor(runDelayEnv, 1)
+	markRunning(run)
+	if run != "" && run == os.Getenv(failOnceEnv) {
+		marker := filepath.Join(root, ".failed-once-"+run)
+		// #nosec G703 - the path is this test's own fixture root
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			writeOrDie(marker, "")
+			fmt.Fprintln(os.Stderr, "--- FAIL: "+run+" (once)")
+			os.Exit(1) // skipcq: RVV-A0003
+		}
+	}
+	if run != "" && run == os.Getenv(skipOnceEnv) {
+		marker := filepath.Join(root, ".skipped-once-"+run)
+		// #nosec G703 - the path is this test's own fixture root
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			writeOrDie(marker, "")
+			// As the testing package reports a skip: only under -test.v.
+			if hasFlag(os.Args, "-test.v") {
+				fmt.Fprintln(os.Stdout, "--- SKIP: "+run+" (0.00s)")
+			}
+			writeOrDie(flagValue(os.Args, "-test.coverprofile"), "mode: set\n")
+			os.Exit(0) // skipcq: RVV-A0003
+		}
+	}
 	if run == failingTest {
 		fmt.Fprintln(os.Stderr, "--- FAIL: "+run)
 		os.Exit(1) // skipcq: RVV-A0003
@@ -584,6 +683,7 @@ func respondAsGo(t *testing.T, failingTest, uncompilablePkg string) {
 		"TestSizeAscending":   profileSizeAscending,
 		"TestDouble":          profileDouble,
 		"TestTriple":          profileTriple,
+		"TestRangeExtra":      profileRangeAscending,
 	}
 	profile, ok := profiles[run]
 	if !ok {
@@ -794,6 +894,32 @@ func buildIDFor(binary string) string {
 	}
 
 	return "buildid-of-" + filepath.Base(binary)
+}
+
+// markRunning holds a marker for this run in the concurrency directory long
+// enough for runs beside it to see it, and records how many it saw.
+func markRunning(run string) {
+	dir := os.Getenv(concurrencyDirEnv)
+	if dir == "" {
+		return
+	}
+	mine := filepath.Join(dir, run+".running")
+	writeOrDie(mine, "")
+	// Held for a second and sampled through it, so runs that start a little
+	// apart on a loaded machine still see each other.
+	seen := 0
+	for range 20 {
+		running, _ := filepath.Glob(filepath.Join(dir, "*.running"))
+		seen = max(seen, len(running))
+		time.Sleep(50 * time.Millisecond)
+	}
+	// #nosec G304 G703 - the path comes from the environment this test process was given
+	f, err := os.OpenFile(filepath.Join(dir, "peaks"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err == nil {
+		fmt.Fprintln(f, seen)
+		_ = f.Close()
+	}
+	_ = os.Remove(mine) // #nosec G703 - the marker this process wrote above
 }
 
 // recordInvocation appends to the file a test is watching, if it asked for one.

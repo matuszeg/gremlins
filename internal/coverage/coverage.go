@@ -56,6 +56,9 @@ type Coverage struct {
 	scope           []string
 	crossPackage    bool
 	integrationMode bool
+	// mapWorkers is how many of a test binary's tests a cold map runs at
+	// once, never less than 1 (--map-workers).
+	mapWorkers int
 
 	// Read once per run and shared by every package the map builder visits:
 	// what the toolchain is, what each dependency directory hashes to, what
@@ -97,6 +100,16 @@ func WithTestMapCacheDir(dir string) Option {
 	}
 }
 
+// WithMapWorkers sets how many tests a cold map runs at once, never less than
+// one.
+func WithMapWorkers(n int) Option {
+	return func(c *Coverage) *Coverage {
+		c.mapWorkers = max(n, 1)
+
+		return c
+	}
+}
+
 // WithMapScope limits the test map to the packages importPaths names. A --diff
 // run has mutants only in the packages its changed files belong to, and
 // mapping the rest compiles and runs tests no mutant will read. A package left
@@ -125,6 +138,8 @@ func NewWithCmd(cmdContext execContext, workdir string, mod gomodule.GoModule, o
 	crossPackage := configuration.Get[bool](configuration.UnleashCrossPackageKey)
 	profilePath := configuration.Get[string](configuration.UnleashCoverageProfileKey)
 	profileElapsed := configuration.Get[string](configuration.UnleashCoverageElapsedKey)
+	// Zero or less is one: a cold map is never unbounded.
+	mapWorkers := max(configuration.Get[int](configuration.UnleashMapWorkersKey), 1)
 
 	c := &Coverage{
 		cmdContext:      cmdContext,
@@ -138,6 +153,7 @@ func NewWithCmd(cmdContext execContext, workdir string, mod gomodule.GoModule, o
 		integrationMode: integrationMode,
 		profilePath:     profilePath,
 		profileElapsed:  profileElapsed,
+		mapWorkers:      mapWorkers,
 	}
 	for _, opt := range opts {
 		c = opt(c)

@@ -162,6 +162,11 @@ func TestUnleash(t *testing.T) {
 			defValue:  "",
 		},
 		{
+			name:     "map-workers",
+			flagType: "int", //nolint:goconst // the table's other rows spell their types out too
+			defValue: "1",
+		},
+		{
 			name:     "test-cpu",
 			flagType: "int",
 			defValue: "0",

@@ -126,8 +126,10 @@ func (c *Coverage) runFromTestMap(tm *TestMap) (Result, error) {
 // where compile(p) is how long this run's `go test -c` of p took, or, for a
 // package served unchanged from the cache without compiling, how long the
 // compile took when its entry was mapped; and
-// duration(t) is the wall time of the process that ran t alone during
-// mapping — start, package initialisation, TestMain and the test, to exit.
+// duration(t) is the wall time of the process that ran t during mapping —
+// start, package initialisation, TestMain and the test, to exit. With
+// --map-workers above 1 that process may have run beside others of its
+// package, which can only have made it slower: the term grows, never shrinks.
 //
 // It must never come out below what the gather it replaces measures — the
 // wall time of `go test -count=1 -cover` over the same packages — because a
@@ -142,7 +144,8 @@ func (c *Coverage) runFromTestMap(tm *TestMap) (Result, error) {
 //   - The gather runs each package's suite once, in one process, sharing
 //     initialisation and TestMain across its tests and overlapping its
 //     t.Parallel ones. Σ duration(t) runs the same tests one per process and
-//     never overlaps them, so it pays every shared cost once per test.
+//     sums them even where --map-workers overlapped them, so it pays every
+//     shared cost once per test.
 //   - The gather builds and runs packages concurrently, which can only make
 //     its wall time shorter than the sum of the packages' work; the baseline
 //     takes the sum.
